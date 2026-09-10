@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
-import { collectionPath, sha256, sourceId } from "./identity";
+import { collectionPath, notePath, sha256, sourceId } from "./identity";
 import { ObsidianCli } from "./ObsidianCli";
 import type { CliResult, SourceDocument } from "./types";
 import { VaultPublisher } from "./VaultPublisher";
@@ -50,8 +50,10 @@ function makeDocument(overrides: Partial<SourceDocument> = {}): SourceDocument {
 class FakeObsidianCliProcess {
   readonly invocations: { args: string[]; stdin: string | null }[] = [];
   readonly notes = new Map<string, string>();
-  /** Notes whose headings should be treated as setext, forcing exit 4. */
+  /** Notes whose headings should be treated as setext. */
   readonly setextNotes = new Set<string>();
+  /** Folders that exist without holding a note directly. */
+  readonly folders = new Set<string>();
 
   run = async (args: string[], stdin: string | null): Promise<CliResult> => {
     this.invocations.push({ args, stdin });
@@ -88,7 +90,12 @@ class FakeObsidianCliProcess {
         return { code: 1, stdout: "", stderr: `obsidian-cli: not a file: ${notePath}` };
       }
       if (this.setextNotes.has(notePath)) {
-        return { code: 4, stdout: "", stderr: "setext headings are not supported" };
+        // The installed CLI reports this as exit 1, not exit 4.
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `obsidian-cli: setext heading layout in ${notePath} (a line underlined by === or ---): section-insert only supports ATX (#) headings`,
+        };
       }
       const lines = existing.split("\n");
       const headingIndex = lines.indexOf(heading);
@@ -106,6 +113,21 @@ class FakeObsidianCliProcess {
         stdout: `inserted under "${heading}" -> ${notePath}`,
         stderr: "",
       };
+    }
+
+    if (command === "list") {
+      const dir = notePath.replace(/\/$/, "");
+      const entries = new Set<string>();
+      for (const candidate of [...this.notes.keys(), ...this.folders]) {
+        if (!candidate.startsWith(`${dir}/`)) continue;
+        const rest = candidate.slice(dir.length + 1);
+        const head = rest.split("/")[0];
+        if (head) entries.add(`${dir}/${head}`);
+      }
+      if (entries.size === 0 && !this.folders.has(dir)) {
+        return { code: 1, stdout: "", stderr: `obsidian-cli: not a directory: ${dir}` };
+      }
+      return { code: 0, stdout: `${[...entries].sort().join("\n")}\n`, stderr: "" };
     }
 
     return { code: 2, stdout: "", stderr: `unknown subcommand: ${command}` };
@@ -323,5 +345,204 @@ describe("VaultPublisher", () => {
 
     expect(links).toHaveLength(1);
     expect([first.status, second.status].sort()).toEqual(["published", "unchanged"]);
+  });
+});
+
+// Regressions for the 2026-09-10 Codex review of commit 72a6407.
+describe("VaultPublisher review regressions", () => {
+  let cli: FakeObsidianCliProcess;
+  let publisher: VaultPublisher;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+    publisher = new VaultPublisher(new ObsidianCli(cli.run));
+  });
+
+  describe("filename budget", () => {
+    it("uses a short hash prefix rather than the full source id", async () => {
+      const publication = await publisher.publish(makeDocument());
+      const basename = publication.path.split("/").pop() ?? "";
+
+      expect(basename).toContain(sourceId(makeDocument()).slice(0, 12));
+      expect(basename).not.toContain(sourceId(makeDocument()));
+    });
+
+    it("keeps the basename inside the 255-byte filesystem limit for CJK titles", async () => {
+      const publication = await publisher.publish(
+        makeDocument({ title: "日本語".repeat(200) }),
+      );
+      const basename = publication.path.split("/").pop() ?? "";
+
+      expect(Buffer.byteLength(basename, "utf8")).toBeLessThanOrEqual(255);
+    });
+
+    it("never truncates an astral character into a lone surrogate", async () => {
+      const publication = await publisher.publish(
+        makeDocument({ title: "𝔘".repeat(300) }),
+      );
+      const basename = publication.path.split("/").pop() ?? "";
+
+      // Valid astral characters are surrogate PAIRS; only an unpaired half is a defect.
+      expect(basename).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+      );
+      expect(Buffer.byteLength(basename, "utf8")).toBeLessThanOrEqual(255);
+    });
+
+    it("falls back to the full identity when a different source holds the short path", async () => {
+      const shortPath = notePath(makeDocument());
+      // A different source already occupies the short filename.
+      cli.notes.set(
+        shortPath,
+        '---\ntype: source\nsource_url: https://example.invalid/other\nsource_id: 0000000000000000000000000000000000000000000000000000000000000000\nversion: ""\nsource_content_type: text/html\n---\nsomething else\n',
+      );
+
+      const publication = await publisher.publish(makeDocument());
+
+      expect(publication.status).toBe("published");
+      expect(publication.path).not.toBe(shortPath);
+      expect(publication.path).toContain(sourceId(makeDocument()));
+      // The other source's note is untouched.
+      expect(cli.notes.get(shortPath)).toContain("something else");
+    });
+  });
+
+  describe("MOC link detection", () => {
+    it("recognizes an existing link a human stripped the alias from", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(indexPath, `# Source Captures\n\n## Sources\n- [[${target}]]\n`);
+
+      await publisher.publish(makeDocument());
+
+      const links = (cli.notes.get(indexPath) ?? "")
+        .split("\n")
+        .filter((line) => line.includes(target));
+      expect(links).toHaveLength(1);
+    });
+
+    it("does not count a link inside a fenced code block as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n\`\`\`\n- [[${target}]]\n\`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      const index = cli.notes.get(indexPath) ?? "";
+      const liveLinks = index
+        .split("```")
+        .filter((_, i) => i % 2 === 0)
+        .join("")
+        .split("\n")
+        .filter((line) => line.includes(target));
+      expect(liveLinks).toHaveLength(1);
+    });
+
+    it("cannot be made to inject a second link through a hostile title", async () => {
+      const publication = await publisher.publish(
+        makeDocument({ title: "Innocent]]\n- [[Evil Injected Note|pwned" }),
+      );
+
+      const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
+      const wikilinks = index.match(/\[\[/g) ?? [];
+
+      expect(publication.moc).toBe("linked");
+      // The hostile text survives as inert display text, never as a second link.
+      expect(wikilinks).toHaveLength(1);
+      expect(index).not.toContain("[[Evil Injected Note");
+      const sourcesSection = index.split("## Sources")[1] ?? "";
+      expect(sourcesSection.trim().split("\n")).toHaveLength(1);
+    });
+  });
+
+  describe("collection folder resolution", () => {
+    it("reuses an existing folder's established spelling for a case variant", async () => {
+      cli.folders.add("30 Tools-Models/Doc Sets/SpotOn Restaurant API");
+
+      const publication = await publisher.publish(
+        makeDocument({ collection: "spoton restaurant api" }),
+      );
+
+      expect(
+        publication.path.startsWith("30 Tools-Models/Doc Sets/SpotOn Restaurant API/"),
+      ).toBe(true);
+    });
+
+    it("refuses to publish when two folders claim one collection identity", async () => {
+      cli.folders.add("30 Tools-Models/Doc Sets/SpotOn Restaurant API");
+      cli.folders.add("30 Tools-Models/Doc Sets/spoton restaurant api");
+
+      await expect(
+        publisher.publish(makeDocument({ collection: "SpotOn Restaurant API" })),
+      ).rejects.toThrow(/ambiguous/i);
+    });
+  });
+
+  describe("semantic comparison", () => {
+    it("treats a quoted scalar containing an escape sequence as changed, not unchanged", async () => {
+      const document = makeDocument({ requestedUrl: "https://example.invalid/a\\nb" });
+      const first = await publisher.publish(document);
+
+      // A human re-quotes the scalar so YAML now decodes it as a real newline.
+      const rewritten = (cli.notes.get(first.path) ?? "").replace(
+        /^requested_url:.*$/m,
+        'requested_url: "https://example.invalid/a\\nb"',
+      );
+      cli.notes.set(first.path, rewritten);
+
+      const second = await publisher.publish(document);
+
+      expect(second.status).toBe("conflict");
+      expect(cli.notes.get(first.path)).toBe(rewritten);
+    });
+
+    it("republishes an unchanged multiline version without reporting a conflict", async () => {
+      const document = makeDocument({ version: "release\nnotes" });
+      await publisher.publish(document);
+
+      const second = await publisher.publish(document);
+
+      expect(second.status).toBe("unchanged");
+    });
+
+    it("treats an unparseable frontmatter block as a conflict", async () => {
+      const first = await publisher.publish(makeDocument());
+      cli.notes.set(first.path, "---\n:\n  - [unclosed\n---\nbody\n");
+
+      const second = await publisher.publish(makeDocument());
+
+      expect(second.status).toBe("conflict");
+      expect(cli.notes.get(first.path)).toContain("unclosed");
+    });
+  });
+
+  it("links exactly once when another writer creates the index first", async () => {
+    const indexPath = "00 Inbox/Source Captures/index.md";
+    const realRun = cli.run;
+    let intercepted = false;
+
+    // Another process creates the index between our read and our create.
+    const racingCli = new ObsidianCli(async (args, stdin) => {
+      if (!intercepted && args[0] === "create" && args[1] === indexPath) {
+        intercepted = true;
+        cli.notes.set(indexPath, "# Source Captures\n\n## Sources\n");
+      }
+      return realRun(args, stdin);
+    });
+
+    const racingPublisher = new VaultPublisher(racingCli);
+    const publication = await racingPublisher.publish(makeDocument());
+
+    expect(publication.moc).toBe("linked");
+    const links = (cli.notes.get(indexPath) ?? "")
+      .split("\n")
+      .filter((line) => line.includes(publication.path.replace(/\.md$/, "")));
+    expect(links).toHaveLength(1);
   });
 });

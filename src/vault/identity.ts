@@ -24,6 +24,18 @@ export const SOURCES_HEADING = "## Sources";
 /** Longest title fragment kept in a filename, in characters. */
 const MAX_TITLE_SEGMENT = 80;
 
+/**
+ * Longest basename most filesystems accept, in bytes. The character cap above
+ * does not bound this on its own: 80 CJK characters are 240 bytes.
+ */
+const MAX_BASENAME_BYTES = 255;
+
+/**
+ * Hash characters kept in a filename. The full identity stays in frontmatter;
+ * a colliding prefix is resolved by falling back to the full hash.
+ */
+export const SHORT_HASH_LENGTH = 12;
+
 /** Control characters, which must never reach a filename. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/g;
@@ -91,13 +103,71 @@ export const collectionIndexPath = (collection: string): string =>
   `${collectionPath(collection)}/index.md`;
 
 /**
+ * Truncates at code-point boundaries so a UTF-8 budget is respected without
+ * splitting a multibyte character or an astral pair into a lone surrogate.
+ */
+function truncateToBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+
+  let result = "";
+  let bytes = 0;
+  for (const codePoint of value) {
+    const size = Buffer.byteLength(codePoint, "utf8");
+    if (bytes + size > maxBytes) break;
+    result += codePoint;
+    bytes += size;
+  }
+  return result;
+}
+
+/**
+ * Builds the filename for a source document.
+ *
+ * @param input The source document.
+ * @param hashLength Identity characters to embed; the caller widens this to a
+ *   full hash when a different source already holds the shorter name.
+ * @returns A basename within the filesystem's byte limit.
+ */
+export function noteFilename(
+  input: SourceDocument,
+  hashLength: number = SHORT_HASH_LENGTH,
+): string {
+  const suffix = ` ${sourceId(input).slice(0, hashLength)}.md`;
+  const budget = MAX_BASENAME_BYTES - Buffer.byteLength(suffix, "utf8");
+  const title = truncateToBytes(sanitizeSegment(input.title), budget).trimEnd();
+
+  return `${title.length > 0 ? title : "untitled"}${suffix}`;
+}
+
+/**
  * Computes the vault path for a source document.
  *
- * The filename pairs a safe title fragment with the full source identity hash,
- * so two sources that share a title and version cannot collide.
+ * @param input The source document.
+ * @param options.folder Resolved collection folder; defaults to the derived one.
+ * @param options.hashLength Identity characters to embed in the filename.
  */
-export function notePath(input: SourceDocument): string {
-  return `${collectionPath(input.collection)}/${sanitizeSegment(input.title)} ${sourceId(input)}.md`;
+export function notePath(
+  input: SourceDocument,
+  options: { folder?: string; hashLength?: number } = {},
+): string {
+  const folder = options.folder ?? collectionPath(input.collection);
+  return `${folder}/${noteFilename(input, options.hashLength ?? SHORT_HASH_LENGTH)}`;
+}
+
+/**
+ * Reduces a title to a single-line wikilink display label.
+ *
+ * A filename-safe segment is not enough here: `]]`, `|` and newlines are
+ * meaningful in the link context and would let a title inject extra entries
+ * into a collection index.
+ */
+export function sanitizeLinkAlias(title: string): string {
+  const cleaned = title
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[[\]|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 0 ? cleaned : "untitled";
 }
 
 /**

@@ -37,6 +37,25 @@ immich upload --recursive ./photos
 Literal, never expanded: \`$(rm -rf /)\` and \${HOME}.
 `;
 
+/**
+ * Reports whether the CLI at `cliPath` actually operates on `vaultPath` when
+ * `OBSIDIAN_VAULT` names it.
+ *
+ * `status` is read-only, so this can be checked before any mutation. A CLI
+ * that ignores the override — or fails to run at all — reports false.
+ */
+function honoursVaultOverride(cliPath: string, vaultPath: string): boolean {
+  try {
+    const status = execFileSync(cliPath, ["status"], {
+      encoding: "utf8",
+      env: { ...process.env, OBSIDIAN_VAULT: vaultPath },
+    });
+    return status.includes(`vault: ok (${vaultPath})`);
+  } catch {
+    return false;
+  }
+}
+
 const document: SourceDocument = {
   sourceUrl: "https://docs.immich.app/features/command-line-interface/",
   requestedUrl: "https://docs.immich.app/features/command-line-interface/",
@@ -55,6 +74,17 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
   beforeAll(() => {
     sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-vault-"));
     fs.mkdirSync(path.join(sandbox, "00 Inbox"), { recursive: true });
+
+    // GATE. This runs before the publisher exists, so nothing in this file can
+    // mutate a vault until the override is proven — including when a single
+    // test is selected by name, because beforeAll always runs.
+    if (!honoursVaultOverride(cliPath, sandbox)) {
+      throw new Error(
+        `REFUSING TO RUN: obsidian-cli did not report the sandbox vault ${sandbox}. ` +
+          "Publishing now could mutate the operator's live vault.",
+      );
+    }
+
     publisher = new VaultPublisher(
       new ObsidianCli(createObsidianCliRunner({ vaultPath: sandbox })),
       { publisherVersion: "0.0.0-test" },
@@ -65,16 +95,20 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it("honours the OBSIDIAN_VAULT override before anything is mutated", () => {
-    const status = execFileSync(cliPath, ["status"], {
-      encoding: "utf8",
-      env: { ...process.env, OBSIDIAN_VAULT: sandbox },
-    });
+  it("ran the override gate before constructing the publisher", () => {
+    // The gate itself lives in beforeAll; this documents it and re-asserts.
+    expect(honoursVaultOverride(cliPath, sandbox)).toBe(true);
+  });
 
-    // `status` reports the vault it would operate on. If this is not the
-    // sandbox, the rest of this suite must not run.
-    expect(status).toContain(`vault: ok (${sandbox})`);
-    expect(status).not.toContain(`vault: ok (${LIVE_VAULT})`);
+  it("detects a CLI that ignores the override", () => {
+    const stub = path.join(sandbox, "lying-cli.mjs");
+    fs.writeFileSync(
+      stub,
+      `#!/usr/bin/env node\nconsole.log("vault: ok (${LIVE_VAULT})");\n`,
+      { mode: 0o755 },
+    );
+
+    expect(honoursVaultOverride(stub, sandbox)).toBe(false);
   });
 
   it("writes the note bytes the publisher reported", async () => {
