@@ -3,23 +3,31 @@ import path from 'path';
 import fs from 'fs';
 import packageJson from "./package.json";
 
+// Entry chunks that ship as executables and therefore need a shebang and the
+// executable bit: the upstream server CLI and this fork's vault-only CLI.
+const executableChunks = ['index.js', 'vault-cli.js'];
+
 export default defineConfig({
   plugins: [
-    // Plugin to preserve shebang in the built file
+    // Plugin to preserve shebang in the built files
     {
       name: 'preserve-shebang',
       generateBundle(options, bundle) {
-        const indexBundle = bundle['index.js'];
-        if (indexBundle && indexBundle.type === 'chunk' && indexBundle.code) {
-          // Add shebang to the beginning of the file
-          indexBundle.code = '#!/usr/bin/env node\n' + indexBundle.code;
+        for (const fileName of executableChunks) {
+          const entryBundle = bundle[fileName];
+          if (entryBundle && entryBundle.type === 'chunk' && entryBundle.code) {
+            // Add shebang to the beginning of the file
+            entryBundle.code = '#!/usr/bin/env node\n' + entryBundle.code;
+          }
         }
       },
       writeBundle(options) {
-        // Make the index.js file executable after writing
-        const indexPath = path.join(options.dir || 'dist', 'index.js');
-        if (fs.existsSync(indexPath)) {
-          fs.chmodSync(indexPath, 0o755);
+        // Make the executable entry files executable after writing
+        for (const fileName of executableChunks) {
+          const entryPath = path.join(options.dir || 'dist', fileName);
+          if (fs.existsSync(entryPath)) {
+            fs.chmodSync(entryPath, 0o755);
+          }
         }
       }
     }
@@ -44,6 +52,8 @@ export default defineConfig({
       // Define entry points using path.resolve for robustness
       entry: {
         index: path.resolve(__dirname, 'src/index.ts'),
+        // Fork addition: CLI-only vault capture entry, built to dist/vault-cli.js
+        'vault-cli': path.resolve(__dirname, 'src/vault-cli/main.ts'),
       },
       formats: ['es'], // Output ESM format only
       // Output filename will be based on the entry key (index.js)

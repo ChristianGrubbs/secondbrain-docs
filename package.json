@@ -4,7 +4,8 @@
   "description": "MCP server for fetching and searching documentation",
   "type": "module",
   "bin": {
-    "docs-mcp-server": "dist/index.js"
+    "docs-mcp-server": "dist/index.js",
+    "sb-docs": "dist/vault-cli.js"
   },
   "license": "MIT",
   "author": "grounded.tools",
