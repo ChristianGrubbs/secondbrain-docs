@@ -3,9 +3,11 @@
  *
  * Every call passes an argument array with no shell, and note bytes travel on
  * stdin, so Markdown containing backticks or `$(...)` can never be expanded.
- * Exit codes follow the CLI's documented contract: 3 is a compare-and-swap
- * conflict (including a create-only collision) and 4 is a fail-closed refusal
- * to touch a note that uses setext headings.
+ *
+ * Failures are classified by the CLI's *observed* behaviour rather than by its
+ * help text: exit 3 is a compare-and-swap conflict, including a create-only
+ * collision, while a missing note, a missing heading and a setext refusal all
+ * arrive as exit 1 and are told apart by their diagnostics.
  */
 
 import { spawn } from "node:child_process";
@@ -34,18 +36,23 @@ export class CasConflictError extends ObsidianCliError {
   }
 }
 
-/** Exit 4: the note uses setext headings and was left untouched. */
+/**
+ * The note uses setext headings and was left untouched.
+ *
+ * The exit code is carried rather than assumed: the installed CLI reports this
+ * as exit 1 even though its help text documents exit 4.
+ */
 export class HeadingFormatError extends ObsidianCliError {
-  constructor(message: string, stderr: string) {
-    super(message, 4, stderr);
+  constructor(message: string, exitCode: number, stderr: string) {
+    super(message, exitCode, stderr);
     this.name = "HeadingFormatError";
   }
 }
 
-/** Exit 1 with a "heading not found" diagnostic. */
+/** The target heading is absent from an otherwise editable note. */
 export class HeadingNotFoundError extends ObsidianCliError {
-  constructor(message: string, stderr: string) {
-    super(message, 1, stderr);
+  constructor(message: string, exitCode: number, stderr: string) {
+    super(message, exitCode, stderr);
     this.name = "HeadingNotFoundError";
   }
 }
@@ -55,6 +62,14 @@ const isNotFound = (stderr: string): boolean => /not a file:/.test(stderr);
 
 /** Recognizes the CLI's missing-heading diagnostic. */
 const isHeadingNotFound = (stderr: string): boolean => /heading not found/.test(stderr);
+
+/**
+ * Recognizes the CLI's setext-heading refusal.
+ *
+ * The installed CLI reports this as exit 1 even though its help text implies
+ * exit 4, so the diagnostic — not the exit code alone — is authoritative.
+ */
+const isSetextRefusal = (stderr: string): boolean => /setext heading/.test(stderr);
 
 /**
  * Builds a runner that executes `obsidian-cli` as a real subprocess.
@@ -83,14 +98,35 @@ export function createObsidianCliRunner(
 
       let stdout = "";
       let stderr = "";
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString();
+      let settled = false;
+
+      // setEncoding decodes through a StringDecoder, which holds back the tail
+      // of a multibyte character split across chunks. Decoding each chunk
+      // independently would corrupt any note containing non-ASCII text.
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
       });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
       });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+
+      const settle = (outcome: () => void) => {
+        if (settled) return;
+        settled = true;
+        outcome();
+      };
+
+      child.on("error", (error) => settle(() => reject(error)));
+      child.on("close", (code) =>
+        settle(() => resolve({ code: code ?? 1, stdout, stderr })),
+      );
+
+      // A child that refuses input and exits leaves stdin broken. That is the
+      // CLI reporting a failure, not a host crash: swallow the write error and
+      // let the close handler settle with the real exit code and diagnostic.
+      child.stdin.on("error", () => undefined);
 
       if (stdin !== null) child.stdin.end(stdin);
       else child.stdin.end();
@@ -110,9 +146,11 @@ function assertVaultRelative(path: string): void {
 function toError(action: string, path: string, result: CliResult): ObsidianCliError {
   const message = `${action} failed for ${path} (exit ${result.code}): ${result.stderr.trim()}`;
   if (result.code === 3) return new CasConflictError(message, result.stderr);
-  if (result.code === 4) return new HeadingFormatError(message, result.stderr);
-  if (result.code === 1 && isHeadingNotFound(result.stderr)) {
-    return new HeadingNotFoundError(message, result.stderr);
+  if (result.code === 4 || isSetextRefusal(result.stderr)) {
+    return new HeadingFormatError(message, result.code, result.stderr);
+  }
+  if (isHeadingNotFound(result.stderr)) {
+    return new HeadingNotFoundError(message, result.code, result.stderr);
   }
   return new ObsidianCliError(message, result.code, result.stderr);
 }
@@ -145,6 +183,19 @@ export class ObsidianCli {
     if (result.code === 0) return result.stdout;
     if (result.code === 1 && isNotFound(result.stderr)) return null;
     throw toError("read", path, result);
+  }
+
+  /**
+   * Lists one directory level.
+   *
+   * @returns Vault-relative entry paths, or null when the directory is absent.
+   */
+  async listDirectory(path: string): Promise<string[] | null> {
+    assertVaultRelative(path);
+    const result = await this.run(["list", path], null);
+    if (result.code === 0) return result.stdout.split("\n").filter(Boolean);
+    if (/not a directory/.test(result.stderr)) return null;
+    throw toError("list", path, result);
   }
 
   /**
