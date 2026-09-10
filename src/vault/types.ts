@@ -1,0 +1,55 @@
+/**
+ * Shared types for vault publication.
+ *
+ * The vault is the authoritative store for captured sources; the SQLite index
+ * added by a later task is derived, disposable state.
+ */
+
+/** One converted source document, ready to be published as a vault note. */
+export type SourceDocument = {
+  /** Final canonical URL the content was fetched from. */
+  sourceUrl: string;
+  /** URL or path the operator originally asked for, kept as provenance. */
+  requestedUrl: string;
+  /** Collection identifier; `inbox` is reserved for generic captures. */
+  collection: string;
+  /** Version label, empty when the source is unversioned. */
+  version: string;
+  title: string;
+  /** Full converted Markdown, published unchanged. */
+  markdown: string;
+  sourceContentType: string;
+  /** ISO 8601 capture timestamp. */
+  capturedAt: string;
+};
+
+/** Outcome of publishing one source document. */
+export type Publication = {
+  status: "published" | "unchanged" | "conflict";
+  /** Vault-relative path of the note. */
+  path: string;
+  /** Exact bytes of the note as it now stands in the vault. */
+  markdown: string;
+  /** SHA-256 of those whole-note bytes. */
+  digest: string;
+  moc: "linked" | "pending";
+};
+
+export interface Publisher {
+  publish(input: SourceDocument): Promise<Publication>;
+}
+
+/** Result of one `obsidian-cli` process invocation. */
+export interface CliResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Runs one `obsidian-cli` invocation.
+ *
+ * Arguments are passed as an array and note bytes on stdin, never through a
+ * shell, so Markdown containing backticks or `$(...)` is never expanded.
+ */
+export type CliRunner = (args: string[], stdin: string | null) => Promise<CliResult>;
