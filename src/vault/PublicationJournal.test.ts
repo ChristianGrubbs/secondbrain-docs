@@ -15,6 +15,8 @@ import {
   LockTimeoutError,
   PublicationJournal,
   resolveStateDir,
+  STATE_LAYOUT_VERSION,
+  StateLayoutError,
   StatePathError,
 } from "./PublicationJournal";
 
@@ -717,6 +719,70 @@ describe("PublicationJournal durability", () => {
   });
 });
 
+describe("PublicationJournal state layout", () => {
+  it("stamps a fresh state directory with the current layout version", () => {
+    const journal = makeJournal();
+
+    const marker = JSON.parse(
+      fs.readFileSync(path.join(journal.stateDir, "layout.json"), "utf8"),
+    );
+    expect(marker.version).toBe(STATE_LAYOUT_VERSION);
+  });
+
+  it("initializes a state directory that has a marker but no entries", () => {
+    fs.rmSync(path.join(stateDir, "layout.json"), { force: true });
+
+    expect(() => makeJournal()).not.toThrow();
+    expect(fs.existsSync(path.join(stateDir, "layout.json"))).toBe(true);
+  });
+
+  it("refuses a state directory whose layout version does not match", () => {
+    makeJournal().prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+    fs.writeFileSync(
+      path.join(stateDir, "layout.json"),
+      JSON.stringify({ version: STATE_LAYOUT_VERSION + 1 }),
+    );
+
+    expect(() => makeJournal()).toThrow(StateLayoutError);
+    // The diagnostic names the path and both versions, because the operator
+    // has to be able to act on it.
+    expect(() => makeJournal()).toThrow(new RegExp(String(STATE_LAYOUT_VERSION + 1)));
+    expect(() => makeJournal()).toThrow(new RegExp(String(STATE_LAYOUT_VERSION)));
+  });
+
+  it("refuses an unmarked state directory that already holds entries", () => {
+    makeJournal().prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+    fs.rmSync(path.join(stateDir, "layout.json"), { force: true });
+
+    // Unmarked state with content predates the marker, so its layout is
+    // unknown: refusing loudly beats reading it as if it were current.
+    expect(() => makeJournal()).toThrow(StateLayoutError);
+  });
+
+  it("refuses an unmarked state directory that holds ownership records", () => {
+    makeJournal().writeOwnership({
+      sourceId: "abc123",
+      path: "note.md",
+      digest: sha256(NOTE),
+    });
+    fs.rmSync(path.join(stateDir, "layout.json"), { force: true });
+
+    expect(() => makeJournal()).toThrow(StateLayoutError);
+  });
+});
+
 describe("PublicationJournal multiprocess lock", () => {
   const viteNode = path.join(process.cwd(), "node_modules", ".bin", "vite-node");
   const fixture = path.join(process.cwd(), "test", "fixtures", "vault", "lock-holder.ts");
@@ -762,6 +828,59 @@ describe("PublicationJournal multiprocess lock", () => {
       });
       child.on("close", () => reject(new Error(`child exited before acquiring: ${out}`)));
     });
+  }
+
+  const reclaimerFixture = path.join(
+    process.cwd(),
+    "test",
+    "fixtures",
+    "vault",
+    "lock-reclaimer.ts",
+  );
+
+  const lockDirFor = (id: string) => path.join(stateDir, "locks", `${id}.lock`);
+
+  /** Spawns the reclaimer fixture, which can pause or die mid-protocol. */
+  function spawnReclaimer(env: Record<string, string>): LockHolderProcess {
+    return spawn(viteNode, [reclaimerFixture], {
+      env: {
+        ...process.env,
+        STATE_DIR: stateDir,
+        VAULT_PATH: vaultDir,
+        SOURCE_ID: "contended",
+        ...env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  /** Alias used by the reclaim tests, which read lines rather than wait. */
+  const collectLines = collect;
+
+  /** Plants a lock whose owning process provably does not exist. */
+  function plantDeadLock(id: string): string {
+    const lockDir = lockDirFor(id);
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(lockDir, "owner.json"),
+      JSON.stringify({
+        // Chosen by the test, not observed: a pid no live process holds.
+        pid: 2_147_483_646,
+        host: os.hostname(),
+        token: "dead-owners-token",
+        acquiredAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+      }),
+    );
+    return lockDir;
+  }
+
+  /** Waits until a file appears, which is how the fixtures signal a barrier. */
+  async function waitForFile(file: string): Promise<void> {
+    for (let tick = 0; tick < 2000 && !fs.existsSync(file); tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!fs.existsSync(file)) throw new Error(`barrier file never appeared: ${file}`);
   }
 
   it("serializes two real processes over one state directory", async () => {
@@ -833,8 +952,10 @@ describe("PublicationJournal multiprocess lock", () => {
           STATE_DIR: stateDir,
           VAULT_PATH: vaultDir,
           SOURCE_ID: "contended",
+          MODE: "pause-before-reclaim",
           PAUSED_FILE: pausedFile,
           GO_FILE: goFile,
+          WITNESS_FILE: path.join(stateDir, "witness-before"),
           TIMEOUT_MS: "400",
           HOLD_MS: "20",
         },
@@ -888,6 +1009,96 @@ describe("PublicationJournal multiprocess lock", () => {
       if (!fs.existsSync(goFile)) fs.writeFileSync(goFile, "go");
       await closed;
     }
+  }, 60_000);
+
+  it("keeps a fresh acquirer out and stays out itself while paused mid-reclaim", async () => {
+    // The reclaimer has already renamed the dead lock aside and is paused. The
+    // canonical path is momentarily free, so a fresh acquirer may take it —
+    // and once it has, the paused reclaimer must NOT also get in.
+    const files = {
+      paused: path.join(stateDir, "paused"),
+      go: path.join(stateDir, "go"),
+      witness: path.join(stateDir, "witness"),
+      entries: path.join(stateDir, "entries"),
+    };
+    plantDeadLock("contended");
+
+    const reclaimer = spawnReclaimer({
+      MODE: "pause-after-rename",
+      PAUSED_FILE: files.paused,
+      GO_FILE: files.go,
+      WITNESS_FILE: files.witness,
+      ENTRIES_FILE: files.entries,
+      TIMEOUT_MS: "1500",
+      HOLD_MS: "40",
+    });
+    const reclaimerLines = collectLines(reclaimer);
+
+    await waitForFile(files.paused);
+
+    // A third process acquires while the reclaimer is paused mid-protocol.
+    const acquirer = spawnReclaimer({
+      MODE: "acquire",
+      WITNESS_FILE: files.witness,
+      ENTRIES_FILE: files.entries,
+      TIMEOUT_MS: "1500",
+      HOLD_MS: "150",
+    });
+    const acquirerLines = collectLines(acquirer);
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    fs.writeFileSync(files.go, "go");
+
+    const [fromReclaimer, fromAcquirer] = await Promise.all([
+      reclaimerLines,
+      acquirerLines,
+    ]);
+
+    // The witness is an exclusive create, so an overlap is a recorded fact.
+    expect(fromReclaimer.some((line) => line.event === "overlap")).toBe(false);
+    expect(fromAcquirer.some((line) => line.event === "overlap")).toBe(false);
+    expect(fromAcquirer.some((line) => line.event === "acquired")).toBe(true);
+
+    // Whoever entered, they entered one at a time.
+    const entries = fs.existsSync(files.entries)
+      ? fs.readFileSync(files.entries, "utf8").trim().split("\n").filter(Boolean)
+      : [];
+    expect(entries.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(entries).size).toBe(entries.length);
+  }, 60_000);
+
+  it("survives a reclaimer killed immediately after it renamed the dead lock", async () => {
+    const witness = path.join(stateDir, "witness");
+    plantDeadLock("contended");
+
+    const dying = spawnReclaimer({
+      MODE: "die-after-rename",
+      WITNESS_FILE: witness,
+      TIMEOUT_MS: "1500",
+      HOLD_MS: "10",
+    });
+    const dyingLines = await collectLines(dying);
+    expect(dyingLines.some((line) => line.event === "dying")).toBe(true);
+    expect(dyingLines.some((line) => line.event === "acquired")).toBe(false);
+
+    // The dead reclaimer left its guard, and a retired directory, behind.
+    const journal = makeJournal({ lock: { timeoutMs: 5000, pollMs: 10 } });
+    let observedToken = "";
+    await expect(
+      journal.withLock("contended", async () => {
+        observedToken = JSON.parse(
+          fs.readFileSync(path.join(lockDirFor("contended"), "owner.json"), "utf8"),
+        ).token;
+        return "ok";
+      }),
+    ).resolves.toBe("ok");
+
+    expect(observedToken).not.toBe("dead-owners-token");
+    // Eventual cleanup: nothing retired is left lying around afterwards.
+    const leftovers = fs
+      .readdirSync(path.join(stateDir, "locks"))
+      .filter((name) => name.includes(".retired-"));
+    expect(leftovers).toEqual([]);
   }, 60_000);
 
   it("reclaims the lock of a process that was killed while holding it", async () => {

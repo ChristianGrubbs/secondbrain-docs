@@ -146,6 +146,30 @@ export class LockTimeoutError extends Error {
 }
 
 /**
+ * Layout version of the runtime state directory.
+ *
+ * Version 1 — proposals stored flat as `journal/proposals/<digest>.md` — never
+ * shipped: it existed only on an unmerged branch, so no operator state
+ * directory was ever written in that shape and there is nothing to migrate.
+ * The marker exists so that if the layout ever does change under a released
+ * build, the mismatch is refused loudly instead of read as if it were current.
+ */
+export const STATE_LAYOUT_VERSION = 2;
+
+/** The state directory was written by a different layout than this build reads. */
+export class StateLayoutError extends Error {
+  constructor(
+    message: string,
+    readonly stateDir: string,
+    readonly found: number | null,
+    readonly expected: number,
+  ) {
+    super(message);
+    this.name = "StateLayoutError";
+  }
+}
+
+/**
  * Canonicalizes a path that may not exist yet.
  *
  * Only existing ancestors can be resolved through symlinks, so the deepest
@@ -333,6 +357,62 @@ export class PublicationJournal {
         options.lock?.heartbeatMs ?? Math.max(50, Math.floor(staleAfterMs / 3)),
     };
     fs.mkdirSync(this.stateDir, { recursive: true });
+    this.ensureLayout();
+  }
+
+  /**
+   * Stamps a new state directory with its layout version, and refuses one whose
+   * layout this build cannot read.
+   *
+   * An empty directory is initialized. A directory that already holds entries
+   * or ownership records but carries no marker predates the marker, so its
+   * layout is unknown — and reading unknown state as if it were current is how
+   * a journal ends up pointing at bytes that are not there.
+   *
+   * @throws StateLayoutError when the marker is missing beside existing state,
+   *   or names a version this build does not implement.
+   */
+  private ensureLayout(): void {
+    const markerFile = path.join(this.stateDir, "layout.json");
+    const marker = readJson<{ version?: unknown }>(markerFile);
+    const found = typeof marker?.version === "number" ? marker.version : null;
+
+    if (found === STATE_LAYOUT_VERSION) return;
+
+    if (found !== null) {
+      throw new StateLayoutError(
+        `state directory ${this.stateDir} has layout version ${found}, but this build reads version ${STATE_LAYOUT_VERSION}`,
+        this.stateDir,
+        found,
+        STATE_LAYOUT_VERSION,
+      );
+    }
+
+    if (this.hasExistingState()) {
+      throw new StateLayoutError(
+        `state directory ${this.stateDir} holds state with no layout marker; this build reads version ${STATE_LAYOUT_VERSION} and will not guess which version wrote it`,
+        this.stateDir,
+        null,
+        STATE_LAYOUT_VERSION,
+      );
+    }
+
+    writeFileAtomic(
+      markerFile,
+      JSON.stringify({ version: STATE_LAYOUT_VERSION }, null, 2),
+    );
+  }
+
+  /** Reports whether anything durable has already been written here. */
+  private hasExistingState(): boolean {
+    for (const directory of ["journal", "ownership", "candidates"]) {
+      try {
+        if (fs.readdirSync(path.join(this.stateDir, directory)).length > 0) return true;
+      } catch {
+        // Absent directory: nothing written yet.
+      }
+    }
+    return false;
   }
 
   /**
@@ -633,7 +713,11 @@ export class PublicationJournal {
    * takes longer than the staleness window is slow, not dead — and a held lock
    * refreshes its heartbeat so a peer that cannot check the pid (another host)
    * sees the same thing. Only a provably dead local owner, or a lock whose
-   * heartbeat has stopped, is reclaimed.
+   * heartbeat has stopped, is reclaimed, and reclaiming goes through the guard
+   * described on {@link reclaimAbandoned}.
+   *
+   * The invariant both paths keep: **a live lock is never moved, and the
+   * canonical path is never exposed as free while a live owner holds it.**
    *
    * @throws LockTimeoutError when the holder outlives the wait.
    */
@@ -644,12 +728,15 @@ export class PublicationJournal {
     const deadline = Date.now() + this.lockOptions.timeoutMs;
     let token: string | null = null;
     for (;;) {
+      // A fresh acquirer never needs the guard: the canonical directory is
+      // free, and `mkdir` is the whole handshake.
       token = this.tryAcquire(lockDir);
       if (token !== null) break;
 
       if (this.looksAbandoned(lockDir)) {
         await this.beforeReclaim(sourceId);
-        if (this.reclaimIfAbandoned(lockDir, sourceId)) continue;
+        token = await this.reclaimAbandoned(lockDir, sourceId);
+        if (token !== null) break;
       }
 
       if (Date.now() >= deadline) {
@@ -659,6 +746,10 @@ export class PublicationJournal {
       }
       await new Promise((resolve) => setTimeout(resolve, this.lockOptions.pollMs));
     }
+
+    // We hold the lock, so anything retired beside it is the residue of a
+    // reclaimer that died mid-protocol: unreachable by name, and garbage.
+    this.sweepRetired(lockDir);
 
     const heartbeat = setInterval(
       () => this.beat(lockDir, token),
@@ -741,66 +832,42 @@ export class PublicationJournal {
       });
       return;
     }
-    this.capture(lockDir, (retired) => {
-      fs.rmSync(retired, { recursive: true, force: true });
-      return true;
-    });
+    this.retire(lockDir);
   }
 
   /**
-   * Takes exclusive possession of the lock directory, then hands it to
-   * `decide`.
+   * Moves a directory aside under a name only this call knows, then deletes it.
    *
-   * The rename is the whole point: it is atomic, so out of any number of
-   * concurrent callers exactly one moves the directory and the rest fail. From
-   * that moment the caller is judging and disposing of the directory it
-   * actually holds, never a pathname that something else may have replaced in
-   * the meantime.
-   *
-   * @param decide Receives the retired path. Returning false puts the directory
-   *   back, because it turned out not to be the caller's to remove.
-   * @returns Whether the directory was captured and disposed of.
+   * Callers must already have established that the directory is theirs to
+   * remove — a dead owner's lock they hold the guard for, or their own live
+   * lock. The rename makes the deletion act on a path nothing else can reach.
    */
-  private capture(lockDir: string, decide: (retired: string) => boolean): boolean {
-    const retired = `${lockDir}.retired-${randomUUID()}`;
+  private retire(directory: string): boolean {
+    const retired = `${directory}.retired-${randomUUID()}`;
     try {
-      fs.renameSync(lockDir, retired);
+      fs.renameSync(directory, retired);
     } catch {
-      // Somebody else captured it first, or it is already gone.
+      // Already gone, or somebody else retired it first.
       return false;
     }
-
-    if (decide(retired)) {
-      fsyncDir(path.dirname(lockDir));
-      return true;
-    }
-
-    this.restore(retired, lockDir);
-    return false;
-  }
-
-  /** Puts a captured directory back after deciding it was not ours to take. */
-  private restore(retired: string, lockDir: string): void {
-    try {
-      fs.renameSync(retired, lockDir);
-      return;
-    } catch {
-      // The path was taken while we held the directory aside.
-    }
-
-    this.logger({
-      level: "error",
-      event: "lock.restore_failed",
-      loc: "PublicationJournal.restore",
-      ctx: { lockDir, retired },
-    });
+    fs.rmSync(retired, { recursive: true, force: true });
+    fsyncDir(path.dirname(directory));
+    return true;
   }
 
   /**
-   * Test seam: awaited after a lock is judged abandoned and before it is
-   * captured, so a fixture can let a peer reclaim it in that window.
+   * Test seam: awaited after a lock is judged abandoned and before the reclaim
+   * guard is taken, so a fixture can let a peer reclaim it in that window.
    */
   protected async beforeReclaim(_sourceId: string): Promise<void> {
+    return undefined;
+  }
+
+  /**
+   * Test seam: awaited after an abandoned lock has been renamed aside and
+   * before the reclaimer takes the canonical path for itself.
+   */
+  protected async afterReclaimRename(_sourceId: string): Promise<void> {
     return undefined;
   }
 
@@ -828,40 +895,131 @@ export class PublicationJournal {
   }
 
   /**
-   * Reclaims an abandoned lock.
+   * Reclaims an abandoned lock, through a guard that serializes reclaimers.
    *
-   * The directory is captured first and judged second. Judging first and
-   * deleting second would delete a pathname rather than the directory that was
-   * judged — and between those two steps another reclaimer can retire the same
-   * lock and acquire a live replacement at that pathname, which the first
-   * reclaimer would then destroy. Capturing first means the owner we validate
-   * is, by construction, the owner of the directory we are holding.
+   * Reclaiming is the only operation that moves somebody else's directory, so
+   * it is the only one that can strip a live holder of its mutual exclusion.
+   * The guard is what makes that impossible: it is a separate mkdir-atomic
+   * directory, every reclaimer must hold it, and the canonical owner is
+   * validated *while it is held*. Because no second reclaimer can replace the
+   * canonical directory in that window, the directory being renamed is provably
+   * the dead one — never a live replacement — so there is no "put back a live
+   * lock I should not have taken" case to get wrong.
    *
-   * @returns true when the lock was reclaimed and acquisition should be retried.
+   * After the rename the canonical path is briefly free, which is correct: its
+   * owner was dead, so no live holder exists to be displaced. A fresh acquirer
+   * may win that path, and if it does, this reclaimer simply has not acquired
+   * anything and never touches the newcomer's directory.
+   *
+   * @returns The acquisition token when the lock was reclaimed AND taken, or
+   *   null when it was not — in which case nothing was acquired.
    */
-  private reclaimIfAbandoned(lockDir: string, sourceId: string): boolean {
-    return this.capture(lockDir, (retired) => {
-      // Re-judge what we actually captured. Still abandoned means it is the
-      // lock we set out to reclaim; anything else is a replacement that has to
-      // go straight back.
-      if (!this.looksAbandoned(retired)) {
+  private async reclaimAbandoned(
+    lockDir: string,
+    sourceId: string,
+  ): Promise<string | null> {
+    const guardDir = `${lockDir}.reclaim`;
+    const guardToken = this.acquireGuard(guardDir);
+    if (guardToken === null) return null;
+
+    let retired: string | null = null;
+    try {
+      // Validated under the guard: this verdict cannot be invalidated by
+      // another reclaimer, because they would need this guard to change it.
+      if (fs.existsSync(lockDir)) {
+        if (!this.looksAbandoned(lockDir)) return null;
+
+        retired = `${lockDir}.retired-${randomUUID()}`;
+        try {
+          fs.renameSync(lockDir, retired);
+        } catch {
+          // Vanished under us; the next pass sees a free path.
+          retired = null;
+          return null;
+        }
         this.logger({
           level: "warn",
-          event: "lock.reclaim_abandoned",
-          loc: "PublicationJournal.reclaimIfAbandoned",
-          ctx: { sourceId, reason: "captured-a-live-replacement" },
+          event: "lock.reclaimed",
+          loc: "PublicationJournal.reclaimAbandoned",
+          ctx: { sourceId },
         });
-        return false;
+        await this.afterReclaimRename(sourceId);
       }
 
-      this.logger({
-        level: "warn",
-        event: "lock.reclaimed",
-        loc: "PublicationJournal.reclaimIfAbandoned",
-        ctx: { sourceId },
-      });
-      fs.rmSync(retired, { recursive: true, force: true });
-      return true;
+      // Take the canonical path for ourselves. EEXIST means a fresh acquirer
+      // got in while we were reclaiming: they hold the lock, we do not, and
+      // their directory is none of our business.
+      const token = this.tryAcquire(lockDir);
+      if (token === null) {
+        this.logger({
+          level: "warn",
+          event: "lock.reclaim_lost",
+          loc: "PublicationJournal.reclaimAbandoned",
+          ctx: { sourceId },
+        });
+      }
+      return token;
+    } finally {
+      // Only ever the directory this call renamed: its name is unique to this
+      // call, so nothing else can have taken it over.
+      if (retired !== null) fs.rmSync(retired, { recursive: true, force: true });
+      this.releaseGuard(guardDir, guardToken);
+    }
+  }
+
+  /**
+   * Takes the reclaim guard.
+   *
+   * A guard whose owner is gone is reclaimed by the same rename-first move.
+   * That is safe here in a way it is not for the lock itself: guard holders do
+   * no vault work and never run user code, so a guard is held for microseconds
+   * and a dead guard owner is genuinely dead.
+   *
+   * @returns The guard token, or null when another reclaimer holds it.
+   */
+  private acquireGuard(guardDir: string): string | null {
+    const token = this.tryAcquire(guardDir);
+    if (token !== null) return token;
+
+    if (!this.looksAbandoned(guardDir)) return null;
+
+    this.logger({
+      level: "warn",
+      event: "lock.guard_reclaimed",
+      loc: "PublicationJournal.acquireGuard",
+      ctx: { guardDir },
     });
+    this.retire(guardDir);
+    return this.tryAcquire(guardDir);
+  }
+
+  /** Releases the reclaim guard, and only when it is still ours. */
+  private releaseGuard(guardDir: string, token: string): void {
+    const owner = readJson<LockOwner>(path.join(guardDir, "owner.json"));
+    if (owner === null || owner.token !== token) return;
+    this.retire(guardDir);
+  }
+
+  /**
+   * Removes retired lock directories left behind by a reclaimer that died
+   * before it could clean up its own.
+   *
+   * A retired directory is unreachable by name — nothing acquires it, nothing
+   * validates it — so it is garbage by construction, and a double delete
+   * between two sweepers is harmless. This only ever runs once the caller holds
+   * the lock itself.
+   */
+  private sweepRetired(lockDir: string): void {
+    const directory = path.dirname(lockDir);
+    const prefix = `${path.basename(lockDir)}.retired-`;
+    try {
+      for (const name of fs.readdirSync(directory)) {
+        if (name.startsWith(prefix)) {
+          fs.rmSync(path.join(directory, name), { recursive: true, force: true });
+        }
+      }
+    } catch {
+      // Nothing to sweep.
+    }
   }
 }
