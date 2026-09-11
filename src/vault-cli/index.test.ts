@@ -28,4 +28,15 @@ describe("createVaultCli", () => {
       expect(help).not.toContain(`sb-docs ${serverCommand}`);
     }
   });
+
+  it("registers the doctor command", async () => {
+    const help = await createVaultCli([]).getHelp();
+    expect(help).toContain("doctor");
+  });
+
+  it("rejects an unknown command instead of exiting zero doing nothing", async () => {
+    // `.strict()` can only reject a stray positional once a real command is
+    // registered, which `doctor` now is.
+    await expect(parseVaultCli(["bogus"])).rejects.toThrow(/Unknown argument: bogus/);
+  });
 });

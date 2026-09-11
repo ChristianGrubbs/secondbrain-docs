@@ -17,11 +17,19 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 
 | Path | Role |
 | --- | --- |
-| `src/vault-cli/index.ts` | `createVaultCli(argv): Argv` — the restricted yargs program |
+| `src/vault-cli/index.ts` | `createVaultCli(argv, deps): Argv` — the restricted yargs program |
+| `src/vault-cli/commands/doctor.ts` | `sb-docs doctor` — capture state report and `--adopt` |
+| `src/vault-cli/commands/doctor.test.ts` | Unit contract for the doctor command |
+| `src/vault/PublicationJournal.ts` | Journal, ownership records, per-source lock, JSONL logger |
+| `src/vault/PublicationJournal.test.ts` | Unit contract for that durable state |
+| `src/vault/discovery.ts` | `discoverSources` — recursive `source_id` scan that freezes note paths |
+| `src/vault/discovery.test.ts` | Unit contract for discovery |
 | `src/vault-cli/main.ts` | Executable entry, built to `dist/vault-cli.js` |
 | `src/vault-cli/index.test.ts` | Unit contract for the program shape |
 | `test/vault-cli-e2e.test.ts` | Process-level checks against the built executable |
 | `test/fixtures/vault-cli/no-listen-guard.mjs` | `net.Server.prototype.listen` recorder used by that suite |
+| `test/fixtures/vault/lock-holder.ts` | Child process that holds a real per-source lock (multiprocess lock tests) |
+| `test/fixtures/vault/publish-crash.ts` | Child process that publishes and SIGKILLs itself at a chosen journal phase |
 | `docs/fork-boundary.md` | This file |
 
 Upstream files changed, and nothing else:

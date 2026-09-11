@@ -23,9 +23,29 @@ export type SourceDocument = {
   capturedAt: string;
 };
 
+/**
+ * What a capture did to the vault.
+ *
+ * `replaced` is only ever reached for a note whose current bytes match the
+ * ownership record this publisher wrote, so a human edit downgrades it to
+ * `conflict` rather than being overwritten.
+ */
+export type PublicationStatus = "published" | "unchanged" | "replaced" | "conflict";
+
+/** Why a capture refused to touch the note it found. */
+export type ConflictReason =
+  /** The note exists but was never written by this publisher. */
+  | "user-owned"
+  /** The note's bytes changed since this publisher last wrote them. */
+  | "manual-edit"
+  /** The preserved incoming candidate no longer matches its own content address. */
+  | "candidate-modified"
+  /** Two notes claim one `source_id`. */
+  | "identity-conflict";
+
 /** Outcome of publishing one source document. */
 export type Publication = {
-  status: "published" | "unchanged" | "conflict";
+  status: PublicationStatus;
   /** Vault-relative path of the note. */
   path: string;
   /** Exact bytes of the note as it now stands in the vault. */
@@ -33,6 +53,10 @@ export type Publication = {
   /** SHA-256 of those whole-note bytes. */
   digest: string;
   moc: "linked" | "pending";
+  /** Preserved incoming note written beside a conflict, when one was written. */
+  candidatePath?: string;
+  /** Set whenever `status` is `conflict`. */
+  conflictReason?: ConflictReason;
 };
 
 export interface Publisher {
