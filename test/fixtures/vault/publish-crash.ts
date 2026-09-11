@@ -40,6 +40,13 @@ class CrashingJournal extends PublicationJournal {
     return entry;
   }
 
+  override writeCandidate(input: Parameters<PublicationJournal["writeCandidate"]>[0]) {
+    // `candidate-record` is the window between the candidate note existing in
+    // the vault and its baseline being confirmed in durable state.
+    if (crashAt === "candidate-record" && input.verified === true) die();
+    return super.writeCandidate(input);
+  }
+
   override complete(sourceId: string): void {
     if (crashAt === "before-prune") {
       // Reach the `complete` phase on disk, then die before the prune.

@@ -1175,34 +1175,72 @@ describe("VaultPublisher identity refresh", () => {
     expect(notes).toHaveLength(2);
   });
 
-  it("re-reads only the entries it has not seen before", async () => {
-    const neighbours = Array.from(
-      { length: 6 },
-      (_, index) => `00 Inbox/Source Captures/neighbour ${index}.md`,
+  it("notices a neighbour that starts claiming the target identity", async () => {
+    const neighbour = "00 Inbox/Source Captures/neighbour.md";
+    cli.notes.set(neighbour, "---\ntype: source\nsource_id: neighbour-1\n---\nbody\n");
+
+    const first = await publisher.publish(makeDocument());
+
+    // The pathname never changes, only its contents: a listing cannot see this,
+    // so a cached identity for an already-scanned path would miss it entirely.
+    cli.notes.set(
+      neighbour,
+      `---\ntype: source\nsource_id: ${sourceId(makeDocument())}\n---\nbody\n`,
     );
-    for (const [index, neighbour] of neighbours.entries()) {
-      cli.notes.set(
-        neighbour,
-        `---\ntype: source\nsource_id: neighbour-${index}\n---\nbody\n`,
-      );
-    }
 
-    await publisher.publish(makeDocument());
-    const seenFirst = cli.invocations.filter((call) => call.args[0] === "read").length;
-    expect(seenFirst).toBeGreaterThan(neighbours.length);
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
 
-    const mark = cli.invocations.length;
-    await publisher.publish(makeDocument());
-    const secondPass = cli.invocations
-      .slice(mark)
-      .filter((call) => call.args[0] === "read")
-      .map((call) => call.args[1]);
+    expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("identity-conflict");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+  });
 
-    // Re-scanning an unchanged collection costs listings, not a re-read of
-    // every note in it.
-    for (const neighbour of neighbours) {
-      expect(secondPass).not.toContain(neighbour);
-    }
+  it("notices an identity added to a note that had none", async () => {
+    const plain = "00 Inbox/Source Captures/plain.md";
+    cli.notes.set(plain, "# Just a note\n");
+
+    await publisher.publish(
+      makeDocument({
+        sourceUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        requestedUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        title: "Other Source",
+      }),
+    );
+
+    cli.notes.set(
+      plain,
+      `---\ntype: source\nsource_id: ${sourceId(makeDocument())}\n---\nadopted\n`,
+    );
+
+    const publication = await publisher.publish(makeDocument());
+
+    // The identity now lives at a path the scan had already dismissed, so no
+    // second note may be allocated for it.
+    expect(publication.path).toBe(plain);
+    expect(publication.status).toBe("conflict");
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(2);
+  });
+
+  it("falls back to the ownership record when our own note loses its identity", async () => {
+    const first = await publisher.publish(makeDocument());
+
+    // A human strips the frontmatter; the scan can no longer see the identity.
+    cli.notes.set(first.path, "# Stripped by a human\n");
+
+    const second = await publisher.publish(makeDocument());
+
+    expect(second.path).toBe(first.path);
+    expect(second.status).toBe("conflict");
+    expect(cli.notes.get(first.path)).toBe("# Stripped by a human\n");
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(1);
   });
 });
 
@@ -1467,5 +1505,83 @@ describe("VaultPublisher candidate integrity", () => {
 
     expect(third.conflictReason).toBe("candidate-modified");
     expect(cli.notes.get(candidatePath)).toBe(touched);
+  });
+
+  it("records what it is about to write before it writes the candidate", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    // The baseline is durable state written around the creation, so an
+    // interruption cannot leave a candidate with no recorded baseline.
+    const name = (second.candidatePath ?? "").split("/").pop() ?? "";
+    const record = new PublicationJournal({
+      stateDir,
+      vaultPath: vaultDir,
+    }).readCandidate(name);
+    expect(record?.digest).toBe(sha256(cli.notes.get(second.candidatePath ?? "") ?? ""));
+    expect(record?.verified).toBe(true);
+  });
+
+  it("treats a candidate with no trustworthy baseline as modified", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+    const second = await publisher.publish(changed);
+
+    // Losing the record leaves bytes we cannot vouch for. Semantic equality is
+    // not enough: a metadata-only edit is semantically identical.
+    fs.rmSync(path.join(stateDir, "candidates"), { recursive: true, force: true });
+
+    const third = await publisher.publish(changed);
+
+    expect(third.candidatePath).toBe(second.candidatePath);
+    expect(third.conflictReason).toBe("candidate-modified");
+    expect(cli.notes.get(second.candidatePath ?? "")).toBe(
+      cli.notes.get(third.candidatePath ?? ""),
+    );
+  });
+
+  it("reconciles a candidate whose record never got its confirmation", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+    const second = await publisher.publish(changed);
+    const candidatePath = second.candidatePath ?? "";
+    const name = candidatePath.split("/").pop() ?? "";
+
+    // Exactly the state a process death between creation and confirmation
+    // leaves behind: intent recorded, never confirmed.
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    const record = journal.readCandidate(name);
+    journal.writeCandidate({
+      name,
+      path: candidatePath,
+      digest: record?.digest ?? "",
+      verified: false,
+    });
+
+    // Untouched bytes still match the recorded intent, so the candidate is ours.
+    expect((await publisher.publish(changed)).conflictReason).toBe("manual-edit");
+
+    // A metadata-only edit no longer matches it, and must be reported.
+    cli.notes.set(
+      candidatePath,
+      (cli.notes.get(candidatePath) ?? "").replace(
+        "captured_at: 2026-09-10T12:00:00.000Z",
+        "captured_at: 2026-09-10T12:00:09.000Z",
+      ),
+    );
+    journal.writeCandidate({
+      name,
+      path: candidatePath,
+      digest: record?.digest ?? "",
+      verified: false,
+    });
+
+    expect((await publisher.publish(changed)).conflictReason).toBe("candidate-modified");
   });
 });

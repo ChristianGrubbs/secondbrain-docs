@@ -289,8 +289,17 @@ interface LockOwner {
 export interface CandidateRecord {
   /** Vault-relative path of the candidate note. */
   path: string;
-  /** SHA-256 of the whole candidate note as this publisher wrote it. */
+  /** SHA-256 of the whole candidate note this publisher wrote, or intended to. */
   digest: string;
+  /**
+   * Whether the note was observed in the vault carrying exactly those bytes.
+   *
+   * The record is written before the note is created, so an interruption
+   * between the two leaves `false`: the digest is then an intent, good enough
+   * to recognise our own untouched bytes, and never good enough to declare an
+   * edited candidate unmodified.
+   */
+  verified: boolean;
 }
 
 export class PublicationJournal {
@@ -345,12 +354,24 @@ export class PublicationJournal {
    * Path of a proposal's bytes.
    *
    * Proposals are content addressed and immutable, so an entry's
-   * `proposedWholeNoteDigest` names exactly one generation of bytes. Re-preparing
-   * a source writes a new file rather than replacing the one an older entry
-   * still refers to, which is what makes the two writes safe to interrupt.
+   * `proposedWholeNoteDigest` names exactly one generation of bytes.
+   * Re-preparing a source writes a new file rather than replacing the one an
+   * older entry still refers to, which is what makes the two writes safe to
+   * interrupt.
+   *
+   * They are also namespaced per source, so their whole lifecycle sits under
+   * that source's lock. A digest-only namespace would be shared state: two
+   * sources proposing identical bytes would share one file, and one of them
+   * collecting it could delete bytes the other had just decided not to rewrite.
    */
-  private proposalFile(digest: string): string {
-    return path.join(this.stateDir, "journal", "proposals", `${digest}.md`);
+  private proposalFile(sourceId: string, digest: string): string {
+    return path.join(
+      this.stateDir,
+      "journal",
+      "proposals",
+      this.key(sourceId),
+      `${digest}.md`,
+    );
   }
 
   private ownershipFile(sourceId: string): string {
@@ -387,7 +408,7 @@ export class PublicationJournal {
     // The proposal lands first, under its own digest. A death before the entry
     // write leaves an orphan file nobody reads; a death after it leaves an
     // entry whose bytes are provably the ones it names.
-    const proposal = this.proposalFile(input.proposedWholeNoteDigest);
+    const proposal = this.proposalFile(input.sourceId, input.proposedWholeNoteDigest);
     if (!fs.existsSync(proposal)) writeFileAtomic(proposal, input.bytes);
 
     const previous = this.entry(input.sourceId);
@@ -396,7 +417,7 @@ export class PublicationJournal {
       previous !== null &&
       previous.proposedWholeNoteDigest !== input.proposedWholeNoteDigest
     ) {
-      this.collectProposal(previous.proposedWholeNoteDigest);
+      this.collectProposal(input.sourceId, previous.proposedWholeNoteDigest);
     }
     this.logger({
       level: "debug",
@@ -446,15 +467,20 @@ export class PublicationJournal {
   discard(sourceId: string): void {
     const entry = this.entry(sourceId);
     removeFile(this.entryFile(sourceId));
-    if (entry !== null) this.collectProposal(entry.proposedWholeNoteDigest);
+    if (entry !== null) this.collectProposal(sourceId, entry.proposedWholeNoteDigest);
   }
 
-  /** Removes a proposal's bytes once no entry refers to them any more. */
-  private collectProposal(digest: string): void {
-    const stillReferenced = this.pending().some(
-      (entry) => entry.proposedWholeNoteDigest === digest,
-    );
-    if (!stillReferenced) removeFile(this.proposalFile(digest));
+  /**
+   * Removes a proposal's bytes once this source's entry no longer refers to
+   * them.
+   *
+   * Only this source's own namespace is ever touched, so collection is covered
+   * by the same lock that covers the entry it belongs to.
+   */
+  private collectProposal(sourceId: string, digest: string): void {
+    const current = this.entry(sourceId);
+    if (current?.proposedWholeNoteDigest === digest) return;
+    removeFile(this.proposalFile(sourceId, digest));
   }
 
   /** Reads one journal entry, or null when there is none. */
@@ -476,7 +502,7 @@ export class PublicationJournal {
 
     try {
       const bytes = fs.readFileSync(
-        this.proposalFile(entry.proposedWholeNoteDigest),
+        this.proposalFile(sourceId, entry.proposedWholeNoteDigest),
         "utf8",
       );
       if (sha256(bytes) !== entry.proposedWholeNoteDigest) {
@@ -500,13 +526,27 @@ export class PublicationJournal {
   }
 
   /**
-   * Records the exact bytes a preserved candidate was written with.
+   * Records the exact bytes a preserved candidate was, or is about to be,
+   * written with.
    *
    * Semantic addressing decides which candidate a conflict reuses; this
    * whole-note digest is what proves the candidate has not been edited since.
+   *
+   * @param input.verified False while the note has not yet been observed
+   *   carrying these bytes, which is how the intent survives a process death
+   *   between recording and creation.
    */
-  writeCandidate(input: { name: string; path: string; digest: string }): CandidateRecord {
-    const record: CandidateRecord = { path: input.path, digest: input.digest };
+  writeCandidate(input: {
+    name: string;
+    path: string;
+    digest: string;
+    verified: boolean;
+  }): CandidateRecord {
+    const record: CandidateRecord = {
+      path: input.path,
+      digest: input.digest,
+      verified: input.verified,
+    };
     writeFileAtomic(this.candidateFile(input.name), JSON.stringify(record, null, 2));
     return record;
   }
@@ -606,7 +646,12 @@ export class PublicationJournal {
     for (;;) {
       token = this.tryAcquire(lockDir);
       if (token !== null) break;
-      if (this.reclaimIfAbandoned(lockDir, sourceId)) continue;
+
+      if (this.looksAbandoned(lockDir)) {
+        await this.beforeReclaim(sourceId);
+        if (this.reclaimIfAbandoned(lockDir, sourceId)) continue;
+      }
+
       if (Date.now() >= deadline) {
         throw new LockTimeoutError(
           `another capture holds the lock for ${sourceId} (${lockDir})`,
@@ -676,82 +721,147 @@ export class PublicationJournal {
   /**
    * Releases a lock we still hold.
    *
-   * If the directory now carries somebody else's token, this lock was already
-   * reclaimed and re-acquired: deleting it would strip a live holder of its
-   * mutual exclusion, so it is left exactly as it is.
+   * A directory that carries somebody else's token was reclaimed and
+   * re-acquired while we worked; one that carries no token at all is a
+   * replacement mid-acquire, which has not written its owner file yet. Deleting
+   * either would strip a live holder of its mutual exclusion, so only a
+   * directory still carrying our own token is removed.
    */
   private release(lockDir: string, token: string, sourceId: string): void {
     const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
-    if (owner !== null && owner.token !== token) {
+    if (owner === null || owner.token !== token) {
       this.logger({
         level: "warn",
         event: "lock.release_skipped",
         loc: "PublicationJournal.release",
-        ctx: { sourceId, reason: "reacquired-by-another-holder" },
+        ctx: {
+          sourceId,
+          reason: owner === null ? "replacement-without-owner" : "reacquired-by-another",
+        },
       });
       return;
     }
-    this.removeLockDir(lockDir);
+    this.capture(lockDir, (retired) => {
+      fs.rmSync(retired, { recursive: true, force: true });
+      return true;
+    });
   }
 
   /**
-   * Removes a lock directory through a rename, so exactly one of several
-   * concurrent removers can win and none of them can delete a directory that
-   * has already been replaced.
+   * Takes exclusive possession of the lock directory, then hands it to
+   * `decide`.
+   *
+   * The rename is the whole point: it is atomic, so out of any number of
+   * concurrent callers exactly one moves the directory and the rest fail. From
+   * that moment the caller is judging and disposing of the directory it
+   * actually holds, never a pathname that something else may have replaced in
+   * the meantime.
+   *
+   * @param decide Receives the retired path. Returning false puts the directory
+   *   back, because it turned out not to be the caller's to remove.
+   * @returns Whether the directory was captured and disposed of.
    */
-  private removeLockDir(lockDir: string): boolean {
+  private capture(lockDir: string, decide: (retired: string) => boolean): boolean {
     const retired = `${lockDir}.retired-${randomUUID()}`;
     try {
       fs.renameSync(lockDir, retired);
     } catch {
-      // Somebody else got there first.
+      // Somebody else captured it first, or it is already gone.
       return false;
     }
-    fs.rmSync(retired, { recursive: true, force: true });
-    fsyncDir(path.dirname(lockDir));
-    return true;
+
+    if (decide(retired)) {
+      fsyncDir(path.dirname(lockDir));
+      return true;
+    }
+
+    this.restore(retired, lockDir);
+    return false;
+  }
+
+  /** Puts a captured directory back after deciding it was not ours to take. */
+  private restore(retired: string, lockDir: string): void {
+    try {
+      fs.renameSync(retired, lockDir);
+      return;
+    } catch {
+      // The path was taken while we held the directory aside.
+    }
+
+    this.logger({
+      level: "error",
+      event: "lock.restore_failed",
+      loc: "PublicationJournal.restore",
+      ctx: { lockDir, retired },
+    });
   }
 
   /**
-   * Reclaims a lock whose owner is provably gone, or whose heartbeat stopped
-   * long enough ago to count as abandoned.
+   * Test seam: awaited after a lock is judged abandoned and before it is
+   * captured, so a fixture can let a peer reclaim it in that window.
+   */
+  protected async beforeReclaim(_sourceId: string): Promise<void> {
+    return undefined;
+  }
+
+  /**
+   * Reports whether a lock looks abandoned, without touching it.
+   *
+   * A live local owner is never abandoned, no matter how old the lock is: a
+   * capture that outlives the staleness window is slow, not dead.
+   */
+  private looksAbandoned(lockDir: string): boolean {
+    const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
+
+    if (owner !== null && owner.host === os.hostname()) return !processAlive(owner.pid);
+
+    try {
+      const heartbeat =
+        owner === null ? fs.statSync(lockDir).mtimeMs : Date.parse(owner.heartbeatAt);
+      const age =
+        Date.now() - (Number.isNaN(heartbeat) ? fs.statSync(lockDir).mtimeMs : heartbeat);
+      return age > this.lockOptions.staleAfterMs;
+    } catch {
+      // The directory vanished; treat that as reclaimable so the caller retries.
+      return true;
+    }
+  }
+
+  /**
+   * Reclaims an abandoned lock.
+   *
+   * The directory is captured first and judged second. Judging first and
+   * deleting second would delete a pathname rather than the directory that was
+   * judged — and between those two steps another reclaimer can retire the same
+   * lock and acquire a live replacement at that pathname, which the first
+   * reclaimer would then destroy. Capturing first means the owner we validate
+   * is, by construction, the owner of the directory we are holding.
    *
    * @returns true when the lock was reclaimed and acquisition should be retried.
    */
   private reclaimIfAbandoned(lockDir: string, sourceId: string): boolean {
-    const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
+    return this.capture(lockDir, (retired) => {
+      // Re-judge what we actually captured. Still abandoned means it is the
+      // lock we set out to reclaim; anything else is a replacement that has to
+      // go straight back.
+      if (!this.looksAbandoned(retired)) {
+        this.logger({
+          level: "warn",
+          event: "lock.reclaim_abandoned",
+          loc: "PublicationJournal.reclaimIfAbandoned",
+          ctx: { sourceId, reason: "captured-a-live-replacement" },
+        });
+        return false;
+      }
 
-    if (owner !== null && owner.host === os.hostname()) {
-      // A live local owner is never abandoned, no matter how old the lock is.
-      if (processAlive(owner.pid)) return false;
       this.logger({
         level: "warn",
         event: "lock.reclaimed",
         loc: "PublicationJournal.reclaimIfAbandoned",
-        ctx: { sourceId, reason: "owner-process-gone", pid: owner.pid },
+        ctx: { sourceId },
       });
-      return this.removeLockDir(lockDir);
-    }
-
-    let age: number;
-    try {
-      const heartbeat =
-        owner === null ? fs.statSync(lockDir).mtimeMs : Date.parse(owner.heartbeatAt);
-      age =
-        Date.now() - (Number.isNaN(heartbeat) ? fs.statSync(lockDir).mtimeMs : heartbeat);
-    } catch {
-      // The directory vanished; retrying is exactly right.
+      fs.rmSync(retired, { recursive: true, force: true });
       return true;
-    }
-
-    if (age <= this.lockOptions.staleAfterMs) return false;
-
-    this.logger({
-      level: "warn",
-      event: "lock.reclaimed",
-      loc: "PublicationJournal.reclaimIfAbandoned",
-      ctx: { sourceId, reason: "heartbeat-stopped", ageMs: age },
     });
-    return this.removeLockDir(lockDir);
   }
 }

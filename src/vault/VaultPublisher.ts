@@ -138,9 +138,6 @@ export class VaultPublisher implements Publisher {
   /** Normalized collection identity to its one canonical vault folder. */
   private readonly folders = new Map<string, string>();
 
-  /** Per collection folder, the note paths already read and their identities. */
-  private readonly discoveries = new Map<string, Map<string, string | null>>();
-
   /** Durable journal, ownership records and per-source locks. */
   readonly journal: PublicationJournal;
 
@@ -223,8 +220,7 @@ export class VaultPublisher implements Publisher {
     // same identity, and allocating a path on that assumption is how duplicates
     // are born. The refresh re-lists the folder and re-reads our own note, and
     // reads nothing else it has already seen.
-    const discovered =
-      (await this.refreshIdentities(folder, ownership?.path)).get(id) ?? [];
+    const discovered = (await this.refreshIdentities(folder)).get(id) ?? [];
     if (discovered.length > 1) {
       return this.conflictAt(input, rendered, discovered[0], "identity-conflict");
     }
@@ -380,7 +376,6 @@ export class VaultPublisher implements Publisher {
     }
 
     this.journal.advance(id, "note-written");
-    this.remember(folder, id, path);
 
     const verified = await this.verifyReadback(path, rendered.digest);
     if (verified === null) {
@@ -636,17 +631,40 @@ export class VaultPublisher implements Publisher {
     const path = `${SOURCE_UPDATES_PATH}/${name}`;
 
     /**
-     * Reports whether a candidate has been edited since we wrote it.
+     * Reports whether an existing candidate can still be treated as ours.
      *
-     * The recorded whole-note digest is authoritative, because semantic
-     * addressing deliberately ignores capture time and publisher release — so
-     * a frontmatter-only edit is semantically identical and byte-wise not. The
-     * semantic comparison is only the fallback for state we no longer have.
+     * Only a recorded whole-note digest can answer this. Semantic addressing
+     * deliberately ignores capture time and publisher release, so a
+     * frontmatter-only edit is semantically identical and byte-wise not —
+     * which means a semantic comparison would report an edited candidate as
+     * untouched. With no record at all there is no baseline to trust, and the
+     * conservative answer is the only safe one.
      */
     const wasEdited = (markdown: string): boolean => {
       const record = this.journal.readCandidate(name);
-      if (record !== null) return sha256(markdown) !== record.digest;
-      return semanticDigestOfNote(markdown) !== rendered.semanticDigest;
+      if (record === null) {
+        this.logger({
+          level: "warn",
+          event: "candidate.unverifiable",
+          loc: "VaultPublisher.writeCandidate",
+          ctx: { path },
+        });
+        return true;
+      }
+
+      const matchesBaseline = sha256(markdown) === record.digest;
+      // An unconfirmed record is an intent from an interrupted run: it can
+      // still recognise our own untouched bytes, and confirming them now is
+      // what reconciles that interruption.
+      if (matchesBaseline && !record.verified) {
+        this.journal.writeCandidate({
+          name,
+          path,
+          digest: record.digest,
+          verified: true,
+        });
+      }
+      return !matchesBaseline;
     };
 
     let modified = false;
@@ -654,10 +672,22 @@ export class VaultPublisher implements Publisher {
     if (existing !== null) {
       modified = wasEdited(existing);
     } else {
+      // The baseline is recorded BEFORE the note exists. A death in between
+      // then leaves an intent rather than a candidate nobody can vouch for.
+      this.journal.writeCandidate({
+        name,
+        path,
+        digest: rendered.digest,
+        verified: false,
+      });
       try {
         await this.cli.createNote(path, rendered.markdown);
-        // Only ever record bytes we wrote ourselves.
-        this.journal.writeCandidate({ name, path, digest: rendered.digest });
+        this.journal.writeCandidate({
+          name,
+          path,
+          digest: rendered.digest,
+          verified: true,
+        });
       } catch (error) {
         if (!(error instanceof CasConflictError)) throw error;
         const raced = await this.cli.readNote(path);
@@ -678,34 +708,21 @@ export class VaultPublisher implements Publisher {
   /**
    * Re-scans a collection folder for source identities.
    *
-   * The folder listing is walked again on every capture, so a note another
-   * process created or moved after an earlier scan is seen before this capture
-   * allocates a path. Reads are the expensive part and are not repeated: only
-   * paths the scan has never read, plus the note we believe is ours, are read
-   * again.
-   *
-   * @param staleHint Path to re-read even if it is already known.
+   * This runs on every capture, inside the source's lock, and it reads rather
+   * than remembering. Identity lives in a note's frontmatter, and the only
+   * evidence the vault CLI offers about a pathname is that it exists — so a
+   * neighbour edited to claim this identity, or a note that has just been given
+   * one, is invisible to anything cheaper. A path is allocated on the strength
+   * of this answer, which makes a stale answer worse than a slow one.
    */
-  private async refreshIdentities(
-    folder: string,
-    staleHint?: string,
-  ): Promise<Map<string, string[]>> {
-    const scan = await scanSources({
-      cli: this.cli,
-      collectionPath: folder,
-      logger: this.logger,
-      known: this.discoveries.get(folder),
-      stale: staleHint === undefined ? [] : [staleHint],
-    });
-    this.discoveries.set(folder, scan.seen);
-    return scan.map;
-  }
-
-  /** Adds a freshly written note to the cached scan for its folder. */
-  private remember(folder: string, sourceId: string, path: string): void {
-    const seen = this.discoveries.get(folder);
-    if (seen === undefined) return;
-    seen.set(path, sourceId);
+  private async refreshIdentities(folder: string): Promise<Map<string, string[]>> {
+    return (
+      await scanSources({
+        cli: this.cli,
+        collectionPath: folder,
+        logger: this.logger,
+      })
+    ).map;
   }
 
   /**

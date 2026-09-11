@@ -86,42 +86,35 @@ async function collectNotePaths(
 export interface SourceScan {
   /** Source id to sorted note paths; more than one path is a conflict. */
   map: Map<string, string[]>;
-  /**
-   * Every note path the scan saw, with the identity it carries (null when it
-   * carries none). Passing this back as `known` makes the next scan cost one
-   * listing plus a read of whatever is new.
-   */
+  /** Every note path the scan saw, with the identity it carries. */
   seen: Map<string, string | null>;
 }
 
 /**
- * Scans a collection folder for source identities, reusing what is already
- * known.
+ * Scans a collection folder for source identities.
  *
- * Re-listing is cheap and re-reading is not, so a repeat scan lists the folder
- * tree again — that is what catches a note another process created or moved
- * since the last scan — and only reads note paths it has not seen before.
+ * Every note is read, every time. A cached identity for a pathname cannot be
+ * trusted, because `obsidian-cli list` reports names and nothing else: it
+ * exposes no mtime and no size, so there is no evidence that a note whose name
+ * has not changed still carries the identity it carried an hour ago. A neighbour
+ * edited to claim this source's id, or a previously identity-free note that has
+ * just been given one, changes nothing a listing can see — and both are exactly
+ * the cases that decide whether a capture may allocate a new path. Uniqueness is
+ * only as sound as the reads behind it.
  *
- * @param options.known Result of a previous scan's `seen`, if any.
- * @param options.stale Paths to re-read even when they are already known.
+ * @param options.concurrency Notes read at once; defaults to 4.
  */
 export async function scanSources(options: {
   cli: ObsidianCli;
   collectionPath: string;
   concurrency?: number;
   logger?: VaultLogger;
-  known?: Map<string, string | null>;
-  stale?: Iterable<string>;
 }): Promise<SourceScan> {
   const logger = options.logger ?? nullLogger;
-  const known = new Map(options.known ?? []);
-  for (const path of options.stale ?? []) known.delete(path);
-
   const notePaths = await collectNotePaths(options.cli, options.collectionPath, logger);
-  const unknown = notePaths.filter((notePath) => !known.has(notePath));
 
   const found = await mapWithLimit(
-    unknown,
+    notePaths,
     options.concurrency ?? DEFAULT_CONCURRENCY,
     async (notePath) => {
       const markdown = await options.cli.readNote(notePath);
@@ -136,19 +129,17 @@ export async function scanSources(options: {
       };
     },
   );
-  for (const hit of found) known.set(hit.path, hit.sourceId);
 
   // Only paths that still exist count; a note that was moved away stops
   // claiming its old identity.
   const seen = new Map<string, string | null>();
   const map = new Map<string, string[]>();
-  for (const notePath of notePaths) {
-    const sourceId = known.get(notePath) ?? null;
-    seen.set(notePath, sourceId);
-    if (sourceId === null) continue;
-    const paths = map.get(sourceId);
-    if (paths === undefined) map.set(sourceId, [notePath]);
-    else paths.push(notePath);
+  for (const hit of found) {
+    seen.set(hit.path, hit.sourceId);
+    if (hit.sourceId === null) continue;
+    const paths = map.get(hit.sourceId);
+    if (paths === undefined) map.set(hit.sourceId, [hit.path]);
+    else paths.push(hit.path);
   }
 
   for (const [sourceId, paths] of map) {

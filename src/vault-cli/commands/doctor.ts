@@ -91,6 +91,11 @@ export function createDoctorCommand(deps: DoctorDeps = {}): CommandModule {
           requiresArg: true,
           describe: "Accept an exact note path's current bytes as the new baseline",
         })
+        .option("state-dir", {
+          type: "string",
+          requiresArg: true,
+          describe: "Runtime state directory; defaults to the platform location",
+        })
         .strict(),
 
     handler: async (args) => {
@@ -101,8 +106,14 @@ export function createDoctorCommand(deps: DoctorDeps = {}): CommandModule {
         deps.cli ??
         new ObsidianCli(createObsidianCliRunner(vaultPath === null ? {} : { vaultPath }));
 
+      // The flag is what makes this command testable against a throwaway state
+      // directory; injected dependencies still win, so tests need neither.
+      const stateDir =
+        deps.stateDir ??
+        (typeof args["state-dir"] === "string" ? args["state-dir"] : undefined);
+
       const journal = new PublicationJournal({
-        stateDir: deps.stateDir,
+        stateDir,
         vaultPath: vaultPath ?? undefined,
       });
       const publisher = new VaultPublisher(cli, { journal });

@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { collectionIndexPath, notePath, sha256 } from "../src/vault/identity";
+import { collectionIndexPath, notePath, sha256, sourceId } from "../src/vault/identity";
 import { createObsidianCliRunner, ObsidianCli } from "../src/vault/ObsidianCli";
 import { PublicationJournal } from "../src/vault/PublicationJournal";
 import type { SourceDocument } from "../src/vault/types";
@@ -259,6 +259,8 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
       fs.writeFileSync(bodyFile, options.body);
 
       return new Promise((resolve, reject) => {
+        // A fresh discovery cache per child is the point: each run is a
+        // separate process, exactly as a real capture would be.
         const child = spawn(viteNode, [fixture], {
           env: {
             ...process.env,
@@ -339,6 +341,117 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
       expect(report[0].completed).toBe(true);
       expect(new PublicationJournal({ stateDir, vaultPath: sandbox }).pending()).toEqual([]);
       expect(fs.readFileSync(notePathOnDisk, "utf8")).toBe(onDisk);
+    }, 120_000);
+
+    it("exits on its own after a capture, leaving no handle behind", async () => {
+      // The lock heartbeat is a timer. If it were not unreferenced and cleared,
+      // a process that finished its work would sit there forever, and this
+      // promise — which only settles on close — would never resolve.
+      const signal = await publishAndDie({
+        crashAt: "none",
+        sourceUrl: "https://example.invalid/exits-cleanly",
+        title: "Exits Cleanly",
+        body: "# Exits Cleanly\n\nBody.\n",
+      });
+
+      expect(signal).toBeNull();
+    }, 120_000);
+
+    it("exits after a real doctor run over the same state", async () => {
+      const result = await new Promise<{ code: number | null; stdout: string }>(
+        (resolve, reject) => {
+          const child = spawn(
+            viteNode,
+            [
+              path.join(process.cwd(), "src", "vault-cli", "main.ts"),
+              "doctor",
+              "--json",
+              "--state-dir",
+              stateDir,
+            ],
+            {
+              env: { ...process.env, OBSIDIAN_VAULT: sandbox },
+              stdio: ["ignore", "pipe", "pipe"],
+            },
+          );
+          let stdout = "";
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+          });
+          child.on("error", reject);
+          child.on("close", (code) => resolve({ code, stdout }));
+        },
+      );
+
+      expect(result.code).toBe(0);
+      const report = JSON.parse(
+        result.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}",
+      );
+      expect(report.vaultPath).toBe(sandbox);
+      expect(report.ownershipCount).toBeGreaterThan(0);
+    }, 120_000);
+
+    it("does not trust a candidate whose baseline was never confirmed", async () => {
+      const sourceUrl = "https://example.invalid/killed-mid-candidate";
+      const body = "# Killed Mid Candidate\n\nOriginal body.\n";
+
+      // Publish it, then let a human take the note over, so the next capture
+      // has to preserve it and write an incoming candidate.
+      await publishAndDie({ crashAt: "none", sourceUrl, title: "Killed Mid Candidate", body });
+      const notePathOnDisk = path.join(
+        sandbox,
+        notePath({ ...document, sourceUrl, requestedUrl: sourceUrl, title: "Killed Mid Candidate" }),
+      );
+      fs.writeFileSync(notePathOnDisk, "# A human took this over\n");
+
+      // The child dies between creating the candidate and confirming its
+      // baseline in durable state.
+      const signal = await publishAndDie({
+        crashAt: "candidate-record",
+        sourceUrl,
+        title: "Killed Mid Candidate",
+        body: `${body}\nUpstream changed.\n`,
+      });
+      expect(signal).toBe("SIGKILL");
+
+      // Candidates are content addressed by source, and earlier tests in this
+      // sandbox left their own, so only this source's are counted.
+      const mine = sourceId({
+        ...document,
+        sourceUrl,
+        requestedUrl: sourceUrl,
+        title: "Killed Mid Candidate",
+      }).slice(0, 12);
+      const candidatesFor = () =>
+        fs
+          .readdirSync(path.join(sandbox, SOURCE_UPDATES_PATH))
+          .filter((name) => name.startsWith(mine));
+
+      const candidates = candidatesFor();
+      expect(candidates).toHaveLength(1);
+      const candidateOnDisk = path.join(sandbox, SOURCE_UPDATES_PATH, candidates[0]);
+
+      // A metadata-only edit is semantically identical, so only a whole-note
+      // baseline can catch it.
+      const edited = fs
+        .readFileSync(candidateOnDisk, "utf8")
+        .replace(/^captured_at:.*$/m, "captured_at: 2027-03-03T03:03:03.000Z");
+      fs.writeFileSync(candidateOnDisk, edited);
+
+      const retried = await makePublisher().publish({
+        ...document,
+        sourceUrl,
+        requestedUrl: sourceUrl,
+        title: "Killed Mid Candidate",
+        markdown: `${body}\nUpstream changed.\n`,
+      });
+
+      expect(retried.status).toBe("conflict");
+      expect(retried.conflictReason).toBe("candidate-modified");
+      expect(fs.readFileSync(candidateOnDisk, "utf8")).toBe(edited);
+      expect(candidatesFor()).toHaveLength(1);
+      expect(fs.readFileSync(notePathOnDisk, "utf8")).toBe("# A human took this over\n");
     }, 120_000);
 
     it("leaves a capture killed before its write retryable, with nothing written", async () => {
