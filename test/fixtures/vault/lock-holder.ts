@@ -16,6 +16,9 @@
  * - `VAULT_PATH`    vault the state directory must stay out of
  * - `SOURCE_ID`     identity to lock
  * - `WITNESS_FILE`  exclusive-create witness proving sections never overlap
+ * - `ATTEMPTED_FILE` written the first time the lock is found already held, so
+ *                    the parent can prove contention happened rather than
+ *                    assume it from a sleep
  * - `ACQUIRED_FILE` written once the lock is held
  * - `RELEASE_FILE`  polled until it exists; the child then leaves the section
  * - `ENTRIES_FILE`  one line appended per critical section entered
@@ -40,12 +43,22 @@ const acquiredFile = process.env.ACQUIRED_FILE ?? "";
 const releaseFile = process.env.RELEASE_FILE ?? "";
 const entriesFile = process.env.ENTRIES_FILE ?? "";
 
+const attemptedFile = process.env.ATTEMPTED_FILE ?? "";
+let reportedContention = false;
+
 const journal = new PublicationJournal({
   stateDir: process.env.STATE_DIR,
   vaultPath: process.env.VAULT_PATH,
   lock: {
     timeoutMs: Number(process.env.TIMEOUT_MS ?? 10_000),
     pollMs: 10,
+    onBusy: (attempt) => {
+      say("busy", { attempt });
+      if (attemptedFile && !reportedContention) {
+        reportedContention = true;
+        fs.writeFileSync(attemptedFile, String(attempt));
+      }
+    },
   },
 });
 

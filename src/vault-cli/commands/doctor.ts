@@ -11,7 +11,7 @@
 import type { CommandModule } from "yargs";
 import { sha256 } from "../../vault/identity";
 import { createObsidianCliRunner, ObsidianCli } from "../../vault/ObsidianCli";
-import { PublicationJournal } from "../../vault/PublicationJournal";
+import { type LockRecord, PublicationJournal } from "../../vault/PublicationJournal";
 import { parseNoteFrontmatter } from "../../vault/render";
 import { VaultPublisher } from "../../vault/VaultPublisher";
 
@@ -43,6 +43,8 @@ interface DoctorReport {
   vaultPath: string | null;
   pending: PendingReport[];
   ownershipCount: number;
+  /** Per-source locks, including any a capture is inside right now. */
+  locks: LockRecord[];
   adopted?: { path: string; sourceId: string; digest: string };
 }
 
@@ -57,6 +59,13 @@ function formatReport(report: DoctorReport): string[] {
 
   for (const entry of report.pending) {
     lines.push(`  - ${entry.classification} [${entry.phase}] ${entry.path}`);
+  }
+
+  lines.push(`locks: ${report.locks.length}`);
+  for (const lock of report.locks) {
+    // A busy lock is a capture in flight, which is the one lock state an
+    // operator staring at a stuck run actually wants to see.
+    lines.push(`  - ${lock.source} ${lock.busy ? "HELD NOW" : "free"}`);
   }
 
   if (report.adopted !== undefined) {
@@ -150,6 +159,7 @@ export function createDoctorCommand(deps: DoctorDeps = {}): CommandModule {
           classification: entry.classification,
         })),
         ownershipCount: journal.ownershipCount(),
+        locks: journal.lockRecords(),
         ...(adopted === undefined ? {} : { adopted }),
       };
 

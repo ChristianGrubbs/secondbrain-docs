@@ -290,6 +290,25 @@ export interface LockOptions {
   timeoutMs?: number;
   /** Base retry interval; the real pause is jittered around it. */
   pollMs?: number;
+  /**
+   * Called each time the lock is found already held, with the attempt number.
+   *
+   * Contention is otherwise invisible from outside: a caller that eventually
+   * acquires looks exactly like one that never waited. This makes "somebody
+   * else had it" an observable event.
+   */
+  onBusy?: (attempt: number) => void;
+}
+
+/** One per-source lock, as `doctor` reports it. */
+export interface LockRecord {
+  /** Sanitized source key the lock database is named for. */
+  source: string;
+  /** Token of the last recorded holder, or null when it cannot be read. */
+  ownerToken: string | null;
+  acquiredAt: string | null;
+  /** True when a capture holds this lock right now. */
+  busy: boolean;
 }
 
 /** What this publisher recorded for one preserved incoming candidate. */
@@ -332,6 +351,7 @@ export class PublicationJournal {
     this.lockOptions = {
       timeoutMs: options.lock?.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
       pollMs: options.lock?.pollMs ?? DEFAULT_LOCK_POLL_MS,
+      onBusy: options.lock?.onBusy ?? (() => undefined),
     };
     fs.mkdirSync(this.stateDir, { recursive: true });
     this.ensureLayout();
@@ -707,8 +727,10 @@ export class PublicationJournal {
     const deadline = Date.now() + this.lockOptions.timeoutMs;
     const token = randomUUID();
     let db: DatabaseType | null = null;
+    let attempt = 0;
 
     for (;;) {
+      attempt += 1;
       const handle = new Database(file);
       try {
         // Bounded per attempt, so the loop stays in charge of the deadline.
@@ -722,6 +744,15 @@ export class PublicationJournal {
       } catch (error) {
         handle.close();
         if (!isBusy(error)) throw error;
+
+        this.lockOptions.onBusy(attempt);
+        this.logger({
+          level: "debug",
+          event: "lock.busy",
+          loc: "PublicationJournal.withLock",
+          ctx: { sourceId, attempt },
+        });
+
         if (Date.now() >= deadline) {
           throw new LockTimeoutError(
             `another capture holds the lock for ${sourceId} (${file})`,
@@ -733,14 +764,17 @@ export class PublicationJournal {
       }
     }
 
-    this.logger({
-      level: "debug",
-      event: "lock.acquired",
-      loc: "PublicationJournal.withLock",
-      ctx: { sourceId },
-    });
-
     try {
+      // Everything after the transaction opens belongs inside this block. A
+      // logger is injected, so it can throw, and anything that throws between
+      // acquiring and the cleanup below would leave the connection — and the
+      // lock — open until the process exits.
+      this.logger({
+        level: "debug",
+        event: "lock.acquired",
+        loc: "PublicationJournal.withLock",
+        ctx: { sourceId },
+      });
       this.recordHolder(db, token);
       return await critical();
     } finally {
@@ -787,22 +821,66 @@ export class PublicationJournal {
    *   one would make a diagnostic command block.
    */
   lockDiagnostics(sourceId: string): { ownerToken: string; acquiredAt: string } | null {
-    const file = this.lockFile(sourceId);
-    if (!fs.existsSync(file)) return null;
+    const read = this.readLockHolder(this.lockFile(sourceId));
+    return read.busy ? null : read.holder;
+  }
+
+  /**
+   * Reads a lock database's recorded holder without ever waiting for it.
+   *
+   * The busy timeout is zero on purpose. better-sqlite3 defaults to five
+   * seconds, which would make a diagnostic command sit and stare at a capture
+   * that is doing its job; "held right now" is the answer, and it is available
+   * immediately.
+   */
+  private readLockHolder(file: string): {
+    holder: { ownerToken: string; acquiredAt: string } | null;
+    busy: boolean;
+  } {
+    if (!fs.existsSync(file)) return { holder: null, busy: false };
 
     let db: DatabaseType | null = null;
     try {
-      db = new Database(file, { readonly: true });
+      db = new Database(file, { readonly: true, timeout: 0 });
       const row = db
         .prepare(
           "SELECT owner_token AS ownerToken, acquired_at AS acquiredAt FROM lock_holder WHERE id = 1",
         )
         .get() as { ownerToken: string; acquiredAt: string } | undefined;
-      return row ?? null;
-    } catch {
-      return null;
+      return { holder: row ?? null, busy: false };
+    } catch (error) {
+      return { holder: null, busy: isBusy(error) };
     } finally {
       db?.close();
     }
+  }
+
+  /**
+   * Lists every per-source lock this state directory holds a database for.
+   *
+   * @returns One record per lock, with its recorded holder, or `busy` when a
+   *   capture is inside that lock right now.
+   */
+  lockRecords(): LockRecord[] {
+    const directory = path.join(this.stateDir, "locks");
+    let names: string[];
+    try {
+      names = fs.readdirSync(directory);
+    } catch {
+      return [];
+    }
+
+    const records: LockRecord[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".db")) continue;
+      const read = this.readLockHolder(path.join(directory, name));
+      records.push({
+        source: name.replace(/\.db$/, ""),
+        ownerToken: read.holder?.ownerToken ?? null,
+        acquiredAt: read.holder?.acquiredAt ?? null,
+        busy: read.busy,
+      });
+    }
+    return records.sort((a, b) => a.source.localeCompare(b.source));
   }
 }

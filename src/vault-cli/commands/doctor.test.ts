@@ -181,6 +181,29 @@ describe("sb-docs doctor", () => {
     expect(text).toContain("pending journal entries: 0");
   });
 
+  it("reports the per-source locks it can see", async () => {
+    await makePublisher().publish(document);
+
+    await runDoctor(["--json"]);
+
+    const locks = envelope().locks as {
+      source: string;
+      ownerToken: string | null;
+      busy: boolean;
+    }[];
+    expect(locks).toHaveLength(1);
+    expect(locks[0].busy).toBe(false);
+    expect(typeof locks[0].ownerToken).toBe("string");
+  });
+
+  it("names the locks in its human-readable report", async () => {
+    await makePublisher().publish(document);
+
+    await runDoctor([]);
+
+    expect(out.join("\n")).toContain("locks: 1");
+  });
+
   it("classifies a pending journal entry it can resume", async () => {
     const publication = await makePublisher().publish(document);
     const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });

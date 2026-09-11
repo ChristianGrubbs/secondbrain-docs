@@ -304,6 +304,24 @@ describe("PublicationJournal lock", () => {
     });
   });
 
+  it("releases the lock when the logger itself throws", async () => {
+    const journal = makeJournal({
+      lock: { timeoutMs: 200, pollMs: 5 },
+      logger: () => {
+        throw new Error("the logger failed");
+      },
+    });
+
+    await expect(journal.withLock("abc123", async () => "ok")).rejects.toThrow(
+      "the logger failed",
+    );
+
+    // Anything that can throw between taking the lock and the cleanup block
+    // leaks the connection, and the next acquirer waits out its whole timeout.
+    const next = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
+    await expect(next.withLock("abc123", async () => "ok")).resolves.toBe("ok");
+  });
+
   it("leaves no timer behind that would keep a process alive", async () => {
     const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
     const before = process
@@ -701,6 +719,7 @@ describe("PublicationJournal multiprocess lock", () => {
     const second = spawnHolder({
       SOURCE_ID: "shared",
       WITNESS_FILE: witness,
+      ATTEMPTED_FILE: fileIn("attempted-2"),
       ACQUIRED_FILE: fileIn("acquired-2"),
       RELEASE_FILE: fileIn("release-2"),
       ENTRIES_FILE: fileIn("entries"),
@@ -708,9 +727,10 @@ describe("PublicationJournal multiprocess lock", () => {
     });
     const secondDone = collect(second);
 
-    // Give the contender real time to try, then assert it is still outside:
-    // its own barrier file is the proof, not a timing guess.
-    await new Promise((resolve) => setTimeout(resolve, 800));
+    // Wait until the contender has actually been refused the lock, rather than
+    // sleeping and hoping it got that far. Only then is "it is still outside"
+    // a statement about exclusion instead of about scheduling.
+    await waitForFile(fileIn("attempted-2"));
     expect(fs.existsSync(fileIn("acquired-2"))).toBe(false);
     expect(fs.readFileSync(witness, "utf8")).toBe(String(first.pid));
 
@@ -753,17 +773,34 @@ describe("PublicationJournal multiprocess lock", () => {
 
   it("serializes three processes over one source", async () => {
     const witness = fileIn("witness-3");
-    const children = [0, 1, 2].map(() =>
+    // The first holds behind a release barrier; the other two must both be
+    // refused before it lets go, so all three genuinely contend.
+    const holder = spawnHolder({
+      SOURCE_ID: "three",
+      WITNESS_FILE: witness,
+      ACQUIRED_FILE: fileIn("acquired-3a"),
+      RELEASE_FILE: fileIn("release-3a"),
+      ENTRIES_FILE: fileIn("entries-3"),
+      TIMEOUT_MS: "20000",
+    });
+    await waitForFile(fileIn("acquired-3a"));
+
+    const contenders = ["b", "c"].map((name) =>
       spawnHolder({
         SOURCE_ID: "three",
         WITNESS_FILE: witness,
+        ATTEMPTED_FILE: fileIn(`attempted-3${name}`),
         ENTRIES_FILE: fileIn("entries-3"),
-        HOLD_MS: "80",
+        HOLD_MS: "20",
         TIMEOUT_MS: "20000",
       }),
     );
+    await waitForFile(fileIn("attempted-3b"));
+    await waitForFile(fileIn("attempted-3c"));
+    expect(fs.readFileSync(witness, "utf8")).toBe(String(holder.pid));
 
-    const results = await Promise.all(children.map(collect));
+    fs.writeFileSync(fileIn("release-3a"), "go");
+    const results = await Promise.all([holder, ...contenders].map(collect));
 
     for (const result of results) {
       expect(result.code).toBe(0);
@@ -806,6 +843,38 @@ describe("PublicationJournal multiprocess lock", () => {
     const [one, two] = await Promise.all([firstDone, secondDone]);
     expect(one.code).toBe(0);
     expect(two.code).toBe(0);
+  }, 90_000);
+
+  it("reports lock diagnostics promptly instead of waiting on a live holder", async () => {
+    const holder = spawnHolder({
+      SOURCE_ID: "busy",
+      ACQUIRED_FILE: fileIn("acquired-busy"),
+      RELEASE_FILE: fileIn("release-busy"),
+      TIMEOUT_MS: "20000",
+    });
+    const holderDone = collect(holder);
+    await waitForFile(fileIn("acquired-busy"));
+
+    const journal = makeJournal();
+    const started = Date.now();
+    const diagnostics = journal.lockDiagnostics("busy");
+    const elapsed = Date.now() - started;
+
+    // A diagnostic command must never block behind a capture. Reading into an
+    // exclusive transaction is impossible, so the honest answer is "held".
+    expect(elapsed).toBeLessThan(1000);
+    expect(diagnostics).toBeNull();
+    expect(journal.lockRecords()).toContainEqual(
+      expect.objectContaining({ source: "busy", busy: true }),
+    );
+
+    // The holder still has it; nothing about reading disturbed the lock.
+    expect(fs.existsSync(fileIn("release-busy"))).toBe(false);
+    fs.writeFileSync(fileIn("release-busy"), "go");
+    expect((await holderDone).code).toBe(0);
+
+    // Once released, the recorded holder is readable.
+    expect(typeof journal.lockDiagnostics("busy")?.ownerToken).toBe("string");
   }, 90_000);
 
   it("releases a lock whose holder failed inside its critical section", async () => {
