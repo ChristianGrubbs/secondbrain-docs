@@ -8,13 +8,14 @@
  * the operator's live vault.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { collectionIndexPath, notePath, sha256 } from "../src/vault/identity";
 import { createObsidianCliRunner, ObsidianCli } from "../src/vault/ObsidianCli";
+import { PublicationJournal } from "../src/vault/PublicationJournal";
 import type { SourceDocument } from "../src/vault/types";
 import {
   SOURCE_UPDATES_INDEX,
@@ -235,6 +236,141 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
     expect(report.ownershipCount).toBeGreaterThan(0);
     // Every publication above ran to completion, so nothing is pending.
     expect(report.pending).toEqual([]);
+  });
+
+  describe("recovery after real process death", () => {
+    const viteNode = path.join(process.cwd(), "node_modules", ".bin", "vite-node");
+    const fixture = path.join(process.cwd(), "test", "fixtures", "vault", "publish-crash.ts");
+
+    /**
+     * Publishes one source in a child process that SIGKILLs itself at a chosen
+     * journal phase.
+     *
+     * @returns The child's exit signal, which proves it was killed rather than
+     *   having returned normally.
+     */
+    function publishAndDie(options: {
+      crashAt: string;
+      sourceUrl: string;
+      title: string;
+      body: string;
+    }): Promise<NodeJS.Signals | null> {
+      const bodyFile = path.join(stateDir, `body-${Buffer.from(options.title).toString("hex")}.md`);
+      fs.writeFileSync(bodyFile, options.body);
+
+      return new Promise((resolve, reject) => {
+        const child = spawn(viteNode, [fixture], {
+          env: {
+            ...process.env,
+            VAULT_PATH: sandbox,
+            STATE_DIR: stateDir,
+            CLI_PATH: cliPath,
+            CRASH_AT: options.crashAt,
+            SOURCE_URL: options.sourceUrl,
+            TITLE: options.title,
+            BODY_FILE: bodyFile,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stderr = "";
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on("error", reject);
+        child.on("close", (code, signal) => {
+          if (signal === null && code !== 0) {
+            reject(new Error(`child failed (${code}): ${stderr}`));
+            return;
+          }
+          resolve(signal);
+        });
+      });
+    }
+
+    it("recovers a capture whose process was killed after the note was written", async () => {
+      const signal = await publishAndDie({
+        crashAt: "note-written",
+        sourceUrl: "https://example.invalid/killed-after-write",
+        title: "Killed After Write",
+        body: "# Killed After Write\n\nBody that reached the vault.\n",
+      });
+      expect(signal).toBe("SIGKILL");
+
+      const journal = new PublicationJournal({ stateDir, vaultPath: sandbox });
+      const pending = journal.pending();
+      expect(pending).toHaveLength(1);
+      expect(pending[0].phase).toBe("note-written");
+
+      const onDisk = fs.readFileSync(path.join(sandbox, pending[0].path), "utf8");
+      expect(sha256(onDisk)).toBe(pending[0].proposedWholeNoteDigest);
+
+      const report = await makePublisher().recoverPending();
+
+      expect(report[0].classification).toBe("resumable");
+      expect(report[0].completed).toBe(true);
+      // The bytes the dead process wrote are still exactly the bytes on disk.
+      expect(fs.readFileSync(path.join(sandbox, pending[0].path), "utf8")).toBe(onDisk);
+      expect(new PublicationJournal({ stateDir, vaultPath: sandbox }).pending()).toEqual([]);
+
+      const index = fs.readFileSync(path.join(sandbox, collectionIndexPath("inbox")), "utf8");
+      const target = pending[0].path.replace(/\.md$/, "");
+      expect(index.split("\n").filter((line) => line.includes(target))).toHaveLength(1);
+    }, 120_000);
+
+    it("recovers a capture killed before its journal entry was pruned", async () => {
+      const signal = await publishAndDie({
+        crashAt: "before-prune",
+        sourceUrl: "https://example.invalid/killed-before-prune",
+        title: "Killed Before Prune",
+        body: "# Killed Before Prune\n\nFully published, never pruned.\n",
+      });
+      expect(signal).toBe("SIGKILL");
+
+      const journal = new PublicationJournal({ stateDir, vaultPath: sandbox });
+      const pending = journal.pending();
+      expect(pending).toHaveLength(1);
+      expect(pending[0].phase).toBe("complete");
+      const notePathOnDisk = path.join(sandbox, pending[0].path);
+      const onDisk = fs.readFileSync(notePathOnDisk, "utf8");
+
+      const report = await makePublisher().recoverPending();
+
+      expect(report[0].completed).toBe(true);
+      expect(new PublicationJournal({ stateDir, vaultPath: sandbox }).pending()).toEqual([]);
+      expect(fs.readFileSync(notePathOnDisk, "utf8")).toBe(onDisk);
+    }, 120_000);
+
+    it("leaves a capture killed before its write retryable, with nothing written", async () => {
+      const signal = await publishAndDie({
+        crashAt: "prepared",
+        sourceUrl: "https://example.invalid/killed-before-write",
+        title: "Killed Before Write",
+        body: "# Killed Before Write\n\nNever reached the vault.\n",
+      });
+      expect(signal).toBe("SIGKILL");
+
+      const journal = new PublicationJournal({ stateDir, vaultPath: sandbox });
+      const pending = journal.pending();
+      expect(pending).toHaveLength(1);
+      expect(pending[0].phase).toBe("prepared");
+      expect(fs.existsSync(path.join(sandbox, pending[0].path))).toBe(false);
+
+      const report = await makePublisher().recoverPending();
+      expect(report[0].classification).toBe("retryable");
+      expect(report[0].completed).toBe(false);
+
+      // The dead process also left its lock behind; a retry has to reclaim it.
+      const retried = await makePublisher().publish({
+        ...document,
+        sourceUrl: "https://example.invalid/killed-before-write",
+        requestedUrl: "https://example.invalid/killed-before-write",
+        title: "Killed Before Write",
+        markdown: "# Killed Before Write\n\nNever reached the vault.\n",
+      });
+      expect(retried.status).toBe("published");
+      expect(fs.existsSync(path.join(sandbox, retried.path))).toBe(true);
+    }, 120_000);
   });
 
   it("leaves the operator's live vault untouched", () => {

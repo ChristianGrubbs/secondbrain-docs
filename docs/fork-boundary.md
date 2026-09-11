@@ -28,6 +28,8 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `src/vault-cli/index.test.ts` | Unit contract for the program shape |
 | `test/vault-cli-e2e.test.ts` | Process-level checks against the built executable |
 | `test/fixtures/vault-cli/no-listen-guard.mjs` | `net.Server.prototype.listen` recorder used by that suite |
+| `test/fixtures/vault/lock-holder.ts` | Child process that holds a real per-source lock (multiprocess lock tests) |
+| `test/fixtures/vault/publish-crash.ts` | Child process that publishes and SIGKILLs itself at a chosen journal phase |
 | `docs/fork-boundary.md` | This file |
 
 Upstream files changed, and nothing else:

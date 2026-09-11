@@ -3,9 +3,11 @@
  * lock, and the refusal to keep runtime state inside the vault.
  */
 
+import { type ChildProcessByStdio, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sha256 } from "./identity";
 import {
@@ -375,4 +377,356 @@ describe("createJsonlLogger", () => {
       else process.env.SB_DOCS_LOG = previous;
     }
   });
+});
+
+// Regressions for the 2026-09-11 Codex review of commit ca3c3ad.
+describe("PublicationJournal lock ownership", () => {
+  const lockDirFor = (id: string) => path.join(stateDir, "locks", `${id}.lock`);
+
+  /** Writes a lock directory owned by somebody else. */
+  function plantLock(id: string, owner: Record<string, unknown>): string {
+    const lockDir = lockDirFor(id);
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify(owner));
+    return lockDir;
+  }
+
+  it("never expires a lock whose local owner is still alive, however old it looks", async () => {
+    // The staleness window exists for crashed holders, not slow ones. A live
+    // local pid is proof the holder is still working.
+    const journal = makeJournal({
+      lock: { timeoutMs: 60, pollMs: 5, staleAfterMs: 1 },
+    });
+    const lockDir = plantLock("abc123", {
+      pid: process.pid,
+      host: os.hostname(),
+      token: "somebody-elses-token",
+      acquiredAt: new Date(Date.now() - 3_600_000).toISOString(),
+      heartbeatAt: new Date(Date.now() - 3_600_000).toISOString(),
+    });
+    fs.utimesSync(
+      lockDir,
+      new Date(Date.now() - 3_600_000),
+      new Date(Date.now() - 3_600_000),
+    );
+
+    await expect(journal.withLock("abc123", async () => "ok")).rejects.toThrow(
+      LockTimeoutError,
+    );
+    expect(fs.existsSync(lockDir)).toBe(true);
+    expect(
+      JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")).token,
+    ).toBe("somebody-elses-token");
+  });
+
+  it("refreshes its own heartbeat while it holds the lock", async () => {
+    const journal = makeJournal({
+      lock: { timeoutMs: 500, pollMs: 5, staleAfterMs: 60, heartbeatMs: 15 },
+    });
+
+    const beats = await journal.withLock("abc123", async () => {
+      const first = JSON.parse(
+        fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"),
+      ).heartbeatAt;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const second = JSON.parse(
+        fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"),
+      ).heartbeatAt;
+      return { first, second };
+    });
+
+    expect(beats.second).not.toBe(beats.first);
+  });
+
+  it("does not delete a replacement holder's lock when it releases", async () => {
+    const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
+
+    await journal.withLock("abc123", async () => {
+      // Somebody reclaimed this lock while we were working and is holding it
+      // now. Our release must not touch their directory.
+      fs.rmSync(lockDirFor("abc123"), { recursive: true, force: true });
+      plantLock("abc123", {
+        pid: process.pid,
+        host: os.hostname(),
+        token: "replacement-token",
+        acquiredAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+      });
+    });
+
+    expect(fs.existsSync(lockDirFor("abc123"))).toBe(true);
+    expect(
+      JSON.parse(fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"))
+        .token,
+    ).toBe("replacement-token");
+  });
+
+  it("lets exactly one of two simultaneous reclaimers win a dead owner's lock", async () => {
+    plantLock("abc123", {
+      // Chosen by the test, not observed: a pid no live process holds.
+      pid: 2_147_483_646,
+      host: os.hostname(),
+      token: "dead-owners-token",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+    });
+
+    const spans: { enter: number; exit: number }[] = [];
+    const contend = (journal: PublicationJournal) =>
+      journal.withLock("abc123", async () => {
+        const enter = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        spans.push({ enter, exit: Date.now() });
+      });
+
+    await Promise.all([
+      contend(makeJournal({ lock: { timeoutMs: 2000, pollMs: 5 } })),
+      contend(makeJournal({ lock: { timeoutMs: 2000, pollMs: 5 } })),
+    ]);
+
+    expect(spans).toHaveLength(2);
+    const [first, second] = spans.sort((a, b) => a.enter - b.enter);
+    expect(second.enter).toBeGreaterThanOrEqual(first.exit);
+  });
+});
+
+describe("PublicationJournal durability", () => {
+  it("keeps proposal bytes immutable and content addressed", () => {
+    const journal = makeJournal();
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+
+    const proposals = fs.readdirSync(path.join(journal.stateDir, "journal", "proposals"));
+    expect(proposals).toContain(`${sha256(NOTE)}.md`);
+  });
+
+  it("does not let a re-prepared proposal rewrite the bytes an older entry names", () => {
+    const journal = makeJournal();
+    const first = "---\ntype: source\n---\nfirst\n";
+    const second = "---\ntype: source\n---\nsecond\n";
+
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(first),
+      bytes: first,
+    });
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(second),
+      bytes: second,
+    });
+
+    // Each generation's bytes live under their own digest, so a proposal file
+    // can never hold bytes that disagree with the name an entry refers to.
+    const proposals = path.join(journal.stateDir, "journal", "proposals");
+    for (const name of fs.readdirSync(proposals)) {
+      const bytes = fs.readFileSync(path.join(proposals, name), "utf8");
+      expect(`${sha256(bytes)}.md`).toBe(name);
+    }
+    expect(journal.entry("abc123")?.proposedWholeNoteDigest).toBe(sha256(second));
+    expect(journal.proposedBytes("abc123")).toBe(second);
+  });
+
+  it("reports proposal bytes as missing when they do not match their digest", () => {
+    const journal = makeJournal();
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+
+    // Corruption, however it happened, must never be served as a proposal.
+    fs.writeFileSync(
+      path.join(journal.stateDir, "journal", "proposals", `${sha256(NOTE)}.md`),
+      "tampered\n",
+    );
+
+    expect(journal.proposedBytes("abc123")).toBeNull();
+  });
+
+  it("leaves the entry usable when the process dies between the two writes", () => {
+    const journal = makeJournal();
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+
+    // A death after the proposal write but before the entry write leaves an
+    // orphan proposal, never an entry pointing at the wrong bytes.
+    const orphan = "---\ntype: source\n---\norphan\n";
+    fs.writeFileSync(
+      path.join(journal.stateDir, "journal", "proposals", `${sha256(orphan)}.md`),
+      orphan,
+    );
+
+    const reopened = makeJournal();
+    expect(reopened.pending()).toHaveLength(1);
+    expect(reopened.proposedBytes("abc123")).toBe(NOTE);
+  });
+
+  it("discards an entry and its proposal together", () => {
+    const journal = makeJournal();
+    journal.prepare({
+      sourceId: "abc123",
+      path: "note.md",
+      priorWholeNoteDigest: null,
+      proposedWholeNoteDigest: sha256(NOTE),
+      bytes: NOTE,
+    });
+
+    journal.complete("abc123");
+
+    expect(journal.pending()).toEqual([]);
+    expect(
+      fs.existsSync(
+        path.join(journal.stateDir, "journal", "proposals", `${sha256(NOTE)}.md`),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps a proposal another entry still references", () => {
+    const journal = makeJournal();
+    for (const id of ["a", "b"]) {
+      journal.prepare({
+        sourceId: id,
+        path: `${id}.md`,
+        priorWholeNoteDigest: null,
+        proposedWholeNoteDigest: sha256(NOTE),
+        bytes: NOTE,
+      });
+    }
+
+    journal.complete("a");
+
+    expect(journal.proposedBytes("b")).toBe(NOTE);
+  });
+
+  it("records and reads back a candidate's whole-note digest", () => {
+    const journal = makeJournal();
+    journal.writeCandidate({ name: "cand.md", path: "x/cand.md", digest: sha256(NOTE) });
+
+    expect(journal.readCandidate("cand.md")).toMatchObject({
+      path: "x/cand.md",
+      digest: sha256(NOTE),
+    });
+    expect(journal.readCandidate("missing.md")).toBeNull();
+  });
+});
+
+describe("PublicationJournal multiprocess lock", () => {
+  const viteNode = path.join(process.cwd(), "node_modules", ".bin", "vite-node");
+  const fixture = path.join(process.cwd(), "test", "fixtures", "vault", "lock-holder.ts");
+
+  /** A spawned lock holder: no stdin, both output streams piped. */
+  type LockHolderProcess = ChildProcessByStdio<null, Readable, Readable>;
+
+  /** Spawns a real child process that takes the lock. */
+  function spawnHolder(env: Record<string, string>): LockHolderProcess {
+    return spawn(viteNode, [fixture], {
+      env: { ...process.env, STATE_DIR: stateDir, VAULT_PATH: vaultDir, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  /** Resolves with every JSON line the child printed, once it exits. */
+  function collect(child: LockHolderProcess): Promise<Record<string, unknown>[]> {
+    return new Promise((resolve) => {
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        out += chunk;
+      });
+      child.on("close", () =>
+        resolve(
+          out
+            .split("\n")
+            .filter((line) => line.startsWith("{"))
+            .map((line) => JSON.parse(line)),
+        ),
+      );
+    });
+  }
+
+  /** Waits until the child reports it holds the lock. */
+  function waitForAcquire(child: LockHolderProcess): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        out += chunk;
+        if (out.includes('"acquired"')) resolve();
+      });
+      child.on("close", () => reject(new Error(`child exited before acquiring: ${out}`)));
+    });
+  }
+
+  it("serializes two real processes over one state directory", async () => {
+    const [first, second] = await Promise.all([
+      collect(spawnHolder({ SOURCE_ID: "shared", HOLD_MS: "300", TIMEOUT_MS: "20000" })),
+      collect(spawnHolder({ SOURCE_ID: "shared", HOLD_MS: "300", TIMEOUT_MS: "20000" })),
+    ]);
+
+    const spanOf = (lines: Record<string, unknown>[]) => ({
+      enter: Number(lines.find((line) => line.event === "acquired")?.at),
+      exit: Number(lines.find((line) => line.event === "releasing")?.at),
+    });
+    const spans = [spanOf(first), spanOf(second)].sort((a, b) => a.enter - b.enter);
+
+    expect(spans[0].enter).toBeGreaterThan(0);
+    expect(spans[1].enter).toBeGreaterThanOrEqual(spans[0].exit);
+  }, 60_000);
+
+  it("does not reclaim a lock a live process is still holding", async () => {
+    const holder = spawnHolder({
+      SOURCE_ID: "held",
+      MODE: "hang",
+      TIMEOUT_MS: "20000",
+    });
+    await waitForAcquire(holder);
+
+    try {
+      // A staleness window of 1 ms would expire this lock instantly if age
+      // were the only test; the holder is alive, so it must not be broken.
+      const journal = makeJournal({
+        lock: { timeoutMs: 150, pollMs: 5, staleAfterMs: 1 },
+      });
+      await expect(journal.withLock("held", async () => "ok")).rejects.toThrow(
+        LockTimeoutError,
+      );
+    } finally {
+      holder.kill("SIGKILL");
+      await new Promise((resolve) => holder.on("close", resolve));
+    }
+  }, 60_000);
+
+  it("reclaims the lock of a process that was killed while holding it", async () => {
+    const holder = spawnHolder({
+      SOURCE_ID: "killed",
+      MODE: "hang",
+      TIMEOUT_MS: "20000",
+    });
+    await waitForAcquire(holder);
+    holder.kill("SIGKILL");
+    await new Promise((resolve) => holder.on("close", resolve));
+
+    // The lock directory outlived its owner; the pid is what proves it is dead.
+    expect(fs.existsSync(path.join(stateDir, "locks", "killed.lock"))).toBe(true);
+
+    const journal = makeJournal({ lock: { timeoutMs: 5000, pollMs: 10 } });
+    await expect(journal.withLock("killed", async () => "ok")).resolves.toBe("ok");
+  }, 60_000);
 });

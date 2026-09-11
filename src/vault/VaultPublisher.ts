@@ -13,7 +13,7 @@
  * rather than replayed blindly over whatever is there now.
  */
 
-import { discoverSources } from "./discovery";
+import { scanSources } from "./discovery";
 import {
   collectionIndexPath,
   DOC_SETS_ROOT,
@@ -138,8 +138,8 @@ export class VaultPublisher implements Publisher {
   /** Normalized collection identity to its one canonical vault folder. */
   private readonly folders = new Map<string, string>();
 
-  /** One `source_id` scan per collection folder, reused across pages. */
-  private readonly discoveries = new Map<string, Promise<Map<string, string[]>>>();
+  /** Per collection folder, the note paths already read and their identities. */
+  private readonly discoveries = new Map<string, Map<string, string | null>>();
 
   /** Durable journal, ownership records and per-source locks. */
   readonly journal: PublicationJournal;
@@ -217,26 +217,29 @@ export class VaultPublisher implements Publisher {
     let snapshot: Snapshot | null = null;
     let computed = false;
 
-    // A VERIFIED ownership hit skips the scan: the recorded path still holds a
-    // note and its whole-note bytes are exactly the ones we committed. Anything
-    // weaker is re-resolved by discovery, so a duplicate identity or a human
-    // rename is seen rather than assumed away.
-    if (ownership !== null) {
-      const recorded = await this.cli.readNoteWithAnchor(ownership.path);
-      if (recorded !== null && sha256(recorded.markdown) === ownership.digest) {
-        path = ownership.path;
-        snapshot = recorded;
-      }
+    // The scan is refreshed inside the lock, every time, and an ownership
+    // record never substitutes for it. A record only proves which bytes we
+    // last wrote; it cannot prove that no second note has appeared claiming the
+    // same identity, and allocating a path on that assumption is how duplicates
+    // are born. The refresh re-lists the folder and re-reads our own note, and
+    // reads nothing else it has already seen.
+    const discovered =
+      (await this.refreshIdentities(folder, ownership?.path)).get(id) ?? [];
+    if (discovered.length > 1) {
+      return this.conflictAt(input, rendered, discovered[0], "identity-conflict");
+    }
+    if (discovered.length === 1) {
+      path = discovered[0];
+      snapshot = await this.cli.readNoteWithAnchor(path);
     }
 
-    if (path === null) {
-      const discovered = (await this.discover(folder)).get(id) ?? [];
-      if (discovered.length > 1) {
-        return this.conflictAt(input, rendered, discovered[0], "identity-conflict");
-      }
-      if (discovered.length === 1) {
-        path = discovered[0];
-        snapshot = await this.cli.readNoteWithAnchor(path);
+    // A note we own whose frontmatter a human stripped is invisible to the
+    // scan, but the ownership record still names where it lives.
+    if (path === null && ownership !== null) {
+      const recorded = await this.cli.readNoteWithAnchor(ownership.path);
+      if (recorded !== null) {
+        path = ownership.path;
+        snapshot = recorded;
       }
     }
 
@@ -384,10 +387,13 @@ export class VaultPublisher implements Publisher {
       return this.conflictAt(input, rendered, path, "manual-edit");
     }
 
-    const moc = await this.linkFromCollectionIndex(input.title, folder, path);
-    this.journal.advance(id, "moc-linked");
-    this.journal.writeOwnership({ sourceId: id, path, digest: rendered.digest });
-    this.journal.complete(id);
+    const moc = await this.finishPublication(
+      id,
+      input.title,
+      folder,
+      path,
+      rendered.digest,
+    );
 
     return {
       status: "published",
@@ -396,6 +402,41 @@ export class VaultPublisher implements Publisher {
       digest: rendered.digest,
       moc,
     };
+  }
+
+  /**
+   * Records ownership, links the note, and closes the journal entry.
+   *
+   * Ownership is recorded first, because the bytes are ours the moment the
+   * readback confirms them. The entry is only closed once the link exists: an
+   * unlinked note is unfinished work, and leaving the journal at `note-written`
+   * is what keeps it visible to `doctor` and recoverable later.
+   *
+   * @returns Whether the note is linked from its collection index.
+   */
+  private async finishPublication(
+    sourceId: string,
+    title: string,
+    folder: string,
+    path: string,
+    digest: string,
+  ): Promise<"linked" | "pending"> {
+    this.journal.writeOwnership({ sourceId, path, digest });
+
+    const moc = await this.linkFromCollectionIndex(title, folder, path);
+    if (moc === "pending") {
+      this.logger({
+        level: "warn",
+        event: "capture.link_pending",
+        loc: "VaultPublisher.finishPublication",
+        ctx: { sourceId, path },
+      });
+      return moc;
+    }
+
+    this.journal.advance(sourceId, "moc-linked");
+    this.journal.complete(sourceId);
+    return moc;
   }
 
   /**
@@ -507,10 +548,13 @@ export class VaultPublisher implements Publisher {
       return this.conflictAt(input, rendered, path, "manual-edit");
     }
 
-    const moc = await this.linkFromCollectionIndex(input.title, folder, path);
-    this.journal.advance(id, "moc-linked");
-    this.journal.writeOwnership({ sourceId: id, path, digest: rendered.digest });
-    this.journal.complete(id);
+    const moc = await this.finishPublication(
+      id,
+      input.title,
+      folder,
+      path,
+      rendered.digest,
+    );
 
     return {
       status: "replaced",
@@ -591,21 +635,34 @@ export class VaultPublisher implements Publisher {
     const name = `${rendered.sourceId.slice(0, CANDIDATE_HASH_LENGTH)}-${rendered.semanticDigest.slice(0, CANDIDATE_HASH_LENGTH)}.md`;
     const path = `${SOURCE_UPDATES_PATH}/${name}`;
 
-    const reuse = (markdown: string) =>
-      semanticDigestOfNote(markdown) !== rendered.semanticDigest;
+    /**
+     * Reports whether a candidate has been edited since we wrote it.
+     *
+     * The recorded whole-note digest is authoritative, because semantic
+     * addressing deliberately ignores capture time and publisher release — so
+     * a frontmatter-only edit is semantically identical and byte-wise not. The
+     * semantic comparison is only the fallback for state we no longer have.
+     */
+    const wasEdited = (markdown: string): boolean => {
+      const record = this.journal.readCandidate(name);
+      if (record !== null) return sha256(markdown) !== record.digest;
+      return semanticDigestOfNote(markdown) !== rendered.semanticDigest;
+    };
 
     let modified = false;
     const existing = await this.cli.readNote(path);
     if (existing !== null) {
-      modified = reuse(existing);
+      modified = wasEdited(existing);
     } else {
       try {
         await this.cli.createNote(path, rendered.markdown);
+        // Only ever record bytes we wrote ourselves.
+        this.journal.writeCandidate({ name, path, digest: rendered.digest });
       } catch (error) {
         if (!(error instanceof CasConflictError)) throw error;
         const raced = await this.cli.readNote(path);
         if (raced === null) throw error;
-        modified = reuse(raced);
+        modified = wasEdited(raced);
       }
     }
 
@@ -618,29 +675,37 @@ export class VaultPublisher implements Publisher {
     return { path, moc, modified };
   }
 
-  /** Scans one collection folder for source identities, once per instance. */
-  private discover(folder: string): Promise<Map<string, string[]>> {
-    const cached = this.discoveries.get(folder);
-    if (cached !== undefined) return cached;
-
-    const scan = discoverSources({
+  /**
+   * Re-scans a collection folder for source identities.
+   *
+   * The folder listing is walked again on every capture, so a note another
+   * process created or moved after an earlier scan is seen before this capture
+   * allocates a path. Reads are the expensive part and are not repeated: only
+   * paths the scan has never read, plus the note we believe is ours, are read
+   * again.
+   *
+   * @param staleHint Path to re-read even if it is already known.
+   */
+  private async refreshIdentities(
+    folder: string,
+    staleHint?: string,
+  ): Promise<Map<string, string[]>> {
+    const scan = await scanSources({
       cli: this.cli,
       collectionPath: folder,
       logger: this.logger,
+      known: this.discoveries.get(folder),
+      stale: staleHint === undefined ? [] : [staleHint],
     });
-    this.discoveries.set(folder, scan);
-    return scan;
+    this.discoveries.set(folder, scan.seen);
+    return scan.map;
   }
 
   /** Adds a freshly written note to the cached scan for its folder. */
   private remember(folder: string, sourceId: string, path: string): void {
-    const scan = this.discoveries.get(folder);
-    if (scan === undefined) return;
-    void scan.then((map) => {
-      const paths = map.get(sourceId);
-      if (paths === undefined) map.set(sourceId, [path]);
-      else if (!paths.includes(path)) paths.push(path);
-    });
+    const seen = this.discoveries.get(folder);
+    if (seen === undefined) return;
+    seen.set(path, sourceId);
   }
 
   /**
@@ -649,11 +714,31 @@ export class VaultPublisher implements Publisher {
    * @returns One outcome per pending entry, in journal order.
    */
   async recoverPending(): Promise<RecoveryOutcome[]> {
+    // Only the identities are carried out of the unlocked scan. Everything the
+    // recovery decides on is reread inside that identity's lock, because an
+    // entry can be completed, pruned or replaced by another process while this
+    // one waits for the lock — and acting on the snapshot would then either
+    // advance an entry that no longer exists or discard a newer publication.
+    const identities = [
+      ...new Set(this.journal.pending().map((entry) => entry.sourceId)),
+    ];
+
     const outcomes: RecoveryOutcome[] = [];
-    for (const entry of this.journal.pending()) {
-      outcomes.push(
-        await this.journal.withLock(entry.sourceId, () => this.recoverEntry(entry)),
-      );
+    for (const sourceId of identities) {
+      const outcome = await this.journal.withLock(sourceId, async () => {
+        const current = this.journal.entry(sourceId);
+        if (current === null) {
+          this.logger({
+            level: "info",
+            event: "recovery.entry_gone",
+            loc: "VaultPublisher.recoverPending",
+            ctx: { sourceId },
+          });
+          return null;
+        }
+        return this.recoverEntry(current);
+      });
+      if (outcome !== null) outcomes.push(outcome);
     }
     return outcomes;
   }
@@ -735,21 +820,22 @@ export class VaultPublisher implements Publisher {
     const title = String(parsed?.data.title ?? entry.path.split("/").pop() ?? "untitled");
     const folder = await this.resolveCollectionFolder(collection);
 
-    await this.linkFromCollectionIndex(title, folder, entry.path);
-    this.journal.advance(entry.sourceId, "moc-linked");
-    this.journal.writeOwnership({
-      sourceId: entry.sourceId,
-      path: entry.path,
-      digest: entry.proposedWholeNoteDigest,
-    });
-    this.journal.complete(entry.sourceId);
+    const moc = await this.finishPublication(
+      entry.sourceId,
+      title,
+      folder,
+      entry.path,
+      entry.proposedWholeNoteDigest,
+    );
 
     return {
       sourceId: entry.sourceId,
       path: entry.path,
       phase: entry.phase,
       classification,
-      completed: true,
+      // A note that still cannot be linked is still unfinished, and its entry
+      // is still pending, so recovery must not claim it is done.
+      completed: moc === "linked",
     };
   }
 

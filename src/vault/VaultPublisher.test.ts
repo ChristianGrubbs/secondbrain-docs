@@ -6,6 +6,7 @@ import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
 import { ObsidianCli } from "./ObsidianCli";
 import { PublicationJournal } from "./PublicationJournal";
+import { renderSourceNote } from "./render";
 import type { CliResult, SourceDocument } from "./types";
 import {
   SOURCE_UPDATES_INDEX,
@@ -65,10 +66,22 @@ class FakeObsidianCliProcess {
   /** Folders that exist without holding a note directly. */
   readonly folders = new Set<string>();
 
+  /** Bumped per note to invalidate an anchor without changing any bytes. */
+  private readonly anchorSalt = new Map<string, number>();
+
   /** Anchor the CLI reports for a note's current bytes. */
   anchorOf(notePath: string): string {
     const existing = this.notes.get(notePath);
-    return existing === undefined ? "sha256:<absent>" : `sha256:${sha256(existing)}`;
+    if (existing === undefined) return "sha256:<absent>";
+    return `sha256:${sha256(`${existing}${this.anchorSalt.get(notePath) ?? 0}`)}`;
+  }
+
+  /**
+   * Invalidates a note's anchor while leaving its bytes alone, which is what a
+   * touch — or any write that lands identical content — looks like to CAS.
+   */
+  bumpAnchor(notePath: string): void {
+    this.anchorSalt.set(notePath, (this.anchorSalt.get(notePath) ?? 0) + 1);
   }
 
   run = async (args: string[], stdin: string | null): Promise<CliResult> => {
@@ -1087,5 +1100,372 @@ describe("VaultPublisher review regressions", () => {
     expect(
       linksTo(cli.notes.get(indexPath) ?? "", publication.path.replace(/\.md$/, "")),
     ).toHaveLength(1);
+  });
+});
+
+// Regressions for the 2026-09-11 Codex review of commit ca3c3ad.
+describe("VaultPublisher identity refresh", () => {
+  let cli: FakeObsidianCliProcess;
+  let publisher: VaultPublisher;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+    publisher = makePublisher(cli);
+  });
+
+  it("sees a note created at another filename after the first scan", async () => {
+    const first = await publisher.publish(makeDocument());
+
+    // Another writer copies our note to a second filename afterwards. A valid
+    // ownership record must not hide that duplicate identity.
+    const alternate = "00 Inbox/Source Captures/another filename aaaa.md";
+    cli.notes.set(alternate, first.markdown);
+
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("identity-conflict");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+    expect(cli.notes.get(alternate)).toBe(first.markdown);
+  });
+
+  it("follows a note somebody moved rather than recreating it", async () => {
+    const first = await publisher.publish(makeDocument());
+
+    const moved = "00 Inbox/Source Captures/moved by a human aaaa.md";
+    cli.notes.set(moved, first.markdown);
+    cli.notes.delete(first.path);
+
+    const second = await publisher.publish(makeDocument());
+
+    expect(second.path).toBe(moved);
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toEqual([moved]);
+  });
+
+  it("re-scans before allocating a path when a note appears mid-run", async () => {
+    // Warm the scan with an unrelated capture, then let a note for our own
+    // identity appear before the next capture allocates a filename.
+    await publisher.publish(
+      makeDocument({
+        sourceUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        requestedUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        title: "Other Source",
+      }),
+    );
+
+    const planted = "00 Inbox/Source Captures/planted by another process.md";
+    cli.notes.set(
+      planted,
+      `---\ntype: source\ntitle: Planted\nsource_id: ${sourceId(makeDocument())}\n---\nplanted\n`,
+    );
+
+    const publication = await publisher.publish(makeDocument());
+
+    expect(publication.path).toBe(planted);
+    expect(publication.status).toBe("conflict");
+    expect(cli.notes.get(planted)).toContain("planted");
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(2);
+  });
+
+  it("re-reads only the entries it has not seen before", async () => {
+    const neighbours = Array.from(
+      { length: 6 },
+      (_, index) => `00 Inbox/Source Captures/neighbour ${index}.md`,
+    );
+    for (const [index, neighbour] of neighbours.entries()) {
+      cli.notes.set(
+        neighbour,
+        `---\ntype: source\nsource_id: neighbour-${index}\n---\nbody\n`,
+      );
+    }
+
+    await publisher.publish(makeDocument());
+    const seenFirst = cli.invocations.filter((call) => call.args[0] === "read").length;
+    expect(seenFirst).toBeGreaterThan(neighbours.length);
+
+    const mark = cli.invocations.length;
+    await publisher.publish(makeDocument());
+    const secondPass = cli.invocations
+      .slice(mark)
+      .filter((call) => call.args[0] === "read")
+      .map((call) => call.args[1]);
+
+    // Re-scanning an unchanged collection costs listings, not a re-read of
+    // every note in it.
+    for (const neighbour of neighbours) {
+      expect(secondPass).not.toContain(neighbour);
+    }
+  });
+});
+
+describe("VaultPublisher pending links", () => {
+  let cli: FakeObsidianCliProcess;
+
+  /** An index that exists but carries no `## Sources` heading. */
+  const unamendableIndex = () =>
+    cli.notes.set(
+      "00 Inbox/Source Captures/index.md",
+      "# Source Captures\n\n## Something Else\n",
+    );
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+  });
+
+  it("keeps the journal entry when the MOC link could not be made", async () => {
+    unamendableIndex();
+
+    const publication = await makePublisher(cli).publish(makeDocument());
+
+    expect(publication.status).toBe("published");
+    expect(publication.moc).toBe("pending");
+
+    // An unlinked note is unfinished work, and doctor has to be able to see it.
+    const pending = new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].phase).toBe("note-written");
+  });
+
+  it("reports recovery as incomplete while the link is still impossible", async () => {
+    unamendableIndex();
+    await makePublisher(cli).publish(makeDocument());
+
+    const report = await makePublisher(cli).recoverPending();
+
+    expect(report[0].classification).toBe("resumable");
+    expect(report[0].completed).toBe(false);
+    expect(
+      new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending(),
+    ).toHaveLength(1);
+  });
+
+  it("finishes recovery once the heading is repaired", async () => {
+    unamendableIndex();
+    const publication = await makePublisher(cli).publish(makeDocument());
+
+    cli.notes.set(
+      "00 Inbox/Source Captures/index.md",
+      "# Source Captures\n\n## Something Else\n\n## Sources\n",
+    );
+
+    const report = await makePublisher(cli).recoverPending();
+
+    expect(report[0].completed).toBe(true);
+    expect(
+      linksTo(
+        cli.notes.get("00 Inbox/Source Captures/index.md") ?? "",
+        publication.path.replace(/\.md$/, ""),
+      ),
+    ).toHaveLength(1);
+    expect(new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending()).toEqual(
+      [],
+    );
+  });
+
+  it("still records ownership for a note it wrote but could not link", async () => {
+    unamendableIndex();
+    const publication = await makePublisher(cli).publish(makeDocument());
+
+    const second = await makePublisher(cli).publish(makeDocument());
+
+    expect(second.status).toBe("unchanged");
+    expect(cli.notes.get(publication.path)).toBe(publication.markdown);
+  });
+});
+
+describe("VaultPublisher concurrent recovery", () => {
+  let cli: FakeObsidianCliProcess;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+  });
+
+  it("rereads the entry inside the lock instead of acting on a stale snapshot", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+    cli.notes.set(
+      "00 Inbox/Source Captures/index.md",
+      "# Source Captures\n\n## Sources\n",
+    );
+
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    journal.prepare({
+      sourceId: sourceId(makeDocument()),
+      path: first.path,
+      priorWholeNoteDigest: first.digest,
+      proposedWholeNoteDigest: first.digest,
+      bytes: first.markdown,
+    });
+    journal.advance(sourceId(makeDocument()), "note-written");
+
+    // Two recoverers race over one entry; the loser must notice it is gone
+    // rather than advancing an entry that no longer exists.
+    const [one, two] = await Promise.all([
+      makePublisher(cli).recoverPending(),
+      makePublisher(cli).recoverPending(),
+    ]);
+
+    expect([...one, ...two].filter((outcome) => outcome.completed)).toHaveLength(1);
+    expect(new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending()).toEqual(
+      [],
+    );
+    expect(
+      linksTo(
+        cli.notes.get("00 Inbox/Source Captures/index.md") ?? "",
+        first.path.replace(/\.md$/, ""),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not discard a newer publication because a snapshot said complete", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+    const id = sourceId(makeDocument());
+
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    journal.prepare({
+      sourceId: id,
+      path: first.path,
+      priorWholeNoteDigest: first.digest,
+      proposedWholeNoteDigest: first.digest,
+      bytes: first.markdown,
+    });
+    journal.advance(id, "complete");
+
+    // While recovery waits for the lock, a fresh capture replaces that entry
+    // with a genuinely pending one.
+    const slow = journal.withLock(id, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      journal.prepare({
+        sourceId: id,
+        path: first.path,
+        priorWholeNoteDigest: first.digest,
+        proposedWholeNoteDigest: sha256("a newer proposal"),
+        bytes: "---\ntype: source\n---\na newer proposal\n",
+      });
+    });
+
+    await Promise.all([slow, makePublisher(cli).recoverPending()]);
+
+    // The newer entry survives: recovery classified what it locked, not what
+    // it had read before waiting.
+    const remaining = new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending();
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].proposedWholeNoteDigest).toBe(sha256("a newer proposal"));
+  });
+});
+
+describe("VaultPublisher compare-and-swap failures", () => {
+  let cli: FakeObsidianCliProcess;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+  });
+
+  /** Builds a publisher that runs `mutate` once, just before its first write. */
+  function racedOnWrite(mutate: () => void): VaultPublisher {
+    let raced = false;
+    return makePublisher(
+      new ObsidianCli(async (args, stdin) => {
+        if (!raced && args[0] === "write") {
+          raced = true;
+          mutate();
+        }
+        return cli.run(args, stdin);
+      }),
+    );
+  }
+
+  it("preserves an edit that lands between the read and the write", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+    const handEdited = `${first.markdown}\nA human, mid-write.\n`;
+
+    const publication = await racedOnWrite(() => {
+      cli.notes.set(first.path, handEdited);
+    }).publish(makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }));
+
+    expect(publication.status).toBe("conflict");
+    expect(cli.notes.get(first.path)).toBe(handEdited);
+    expect(publication.candidatePath).toBeDefined();
+  });
+
+  it("retries once from a fresh anchor when the bytes did not change", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+
+    // The anchor is invalidated without the bytes changing — a touch, not an
+    // edit — so exactly one retry must carry the write through.
+    const publication = await racedOnWrite(() => {
+      cli.bumpAnchor(first.path);
+    }).publish(makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }));
+
+    expect(publication.status).toBe("replaced");
+    expect(cli.notes.get(first.path)).toContain("Upstream changed.");
+  });
+
+  it("accepts a proposal another writer already applied", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+    const proposed = renderSourceNote(changed).markdown;
+
+    const publication = await racedOnWrite(() => {
+      cli.notes.set(first.path, proposed);
+      cli.bumpAnchor(first.path);
+    }).publish(changed);
+
+    expect(publication.status).toBe("replaced");
+    expect(cli.notes.get(first.path)).toBe(proposed);
+    expect(new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending()).toEqual(
+      [],
+    );
+  });
+
+  it("treats a note deleted mid-write as a conflict rather than recreating it", async () => {
+    const first = await makePublisher(cli).publish(makeDocument());
+
+    const publication = await racedOnWrite(() => {
+      cli.notes.delete(first.path);
+    }).publish(makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }));
+
+    expect(publication.status).toBe("conflict");
+    expect(cli.notes.has(first.path)).toBe(false);
+  });
+});
+
+describe("VaultPublisher candidate integrity", () => {
+  let cli: FakeObsidianCliProcess;
+  let publisher: VaultPublisher;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+    publisher = makePublisher(cli);
+  });
+
+  it("detects a frontmatter-only edit to a candidate", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+
+    const second = await publisher.publish(changed);
+    const candidatePath = second.candidatePath ?? "";
+
+    // Semantically identical, byte-wise not: the whole-note digest is what has
+    // to notice this one.
+    const touched = (cli.notes.get(candidatePath) ?? "").replace(
+      "captured_at: 2026-09-10T12:00:00.000Z",
+      "captured_at: 2026-09-10T12:00:09.000Z",
+    );
+    expect(touched).not.toBe(cli.notes.get(candidatePath));
+    cli.notes.set(candidatePath, touched);
+
+    const third = await publisher.publish(changed);
+
+    expect(third.conflictReason).toBe("candidate-modified");
+    expect(cli.notes.get(candidatePath)).toBe(touched);
   });
 });
