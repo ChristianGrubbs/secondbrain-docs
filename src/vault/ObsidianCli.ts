@@ -57,8 +57,17 @@ export class HeadingNotFoundError extends ObsidianCliError {
   }
 }
 
-/** Recognizes the CLI's missing-note diagnostic. */
-const isNotFound = (stderr: string): boolean => /not a file:/.test(stderr);
+/**
+ * Recognizes the CLI's missing-note diagnostics.
+ *
+ * There are two, and both mean "no such note": a note missing from a folder
+ * that exists reports `not a file:`, while a note whose folder does not exist
+ * yet reports `no such directory for:`. Reading before the first write in a
+ * collection hits the second one, so treating it as a hard failure would break
+ * every first capture into a new collection.
+ */
+const isNotFound = (stderr: string): boolean =>
+  /not a file:|no such directory for:/.test(stderr);
 
 /** Recognizes the CLI's missing-heading diagnostic. */
 const isHeadingNotFound = (stderr: string): boolean => /heading not found/.test(stderr);
@@ -183,6 +192,58 @@ export class ObsidianCli {
     if (result.code === 0) return result.stdout;
     if (result.code === 1 && isNotFound(result.stderr)) return null;
     throw toError("read", path, result);
+  }
+
+  /**
+   * Reads a note in full together with the anchor a later write must match.
+   *
+   * The anchor is the CLI's compare-and-swap token: it is printed on stderr,
+   * not stdout, so it can never be mistaken for note bytes.
+   *
+   * @returns The note's bytes and its anchor, or null when it does not exist.
+   * @throws ObsidianCliError when the CLI printed no anchor, because writing
+   *   without one would silently become an unconditional overwrite.
+   */
+  async readNoteWithAnchor(
+    path: string,
+  ): Promise<{ markdown: string; anchor: string } | null> {
+    assertVaultRelative(path);
+    const result = await this.run(["read", path, "--all", "--with-anchor"], null);
+    if (result.code === 1 && isNotFound(result.stderr)) return null;
+    if (result.code !== 0) throw toError("read", path, result);
+
+    const anchor = result.stderr.match(/^anchor:\s*(sha256:[0-9a-f]+)\s*$/m)?.[1];
+    if (anchor === undefined) {
+      throw new ObsidianCliError(
+        `read did not report an anchor for ${path}`,
+        result.code,
+        result.stderr,
+      );
+    }
+    return { markdown: result.stdout, anchor };
+  }
+
+  /**
+   * Replaces a note's bytes only if it still matches `anchor`.
+   *
+   * @param anchor Anchor from {@link readNoteWithAnchor}; an anchor is never
+   *   reused after a failed write.
+   * @throws CasConflictError when the note changed since that read.
+   */
+  async replaceNote(path: string, markdown: string, anchor: string): Promise<void> {
+    assertVaultRelative(path);
+    if (markdown.trim().length === 0) {
+      throw new Error(`refusing to blank a note: ${path}`);
+    }
+    if (!/^sha256:[0-9a-f]+$/.test(anchor)) {
+      throw new Error(`refusing to write ${path} without a usable anchor`);
+    }
+
+    const result = await this.run(
+      ["write", path, "--force", "--if-match", anchor],
+      markdown,
+    );
+    if (result.code !== 0) throw toError("write", path, result);
   }
 
   /**

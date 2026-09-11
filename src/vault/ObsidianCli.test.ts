@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  CasConflictError,
   createObsidianCliRunner,
   HeadingFormatError,
   ObsidianCli,
@@ -75,6 +76,61 @@ describe("obsidian-cli process boundary", () => {
 
     await expect(run(["read", "note.md", "--all"], null)).rejects.toThrow();
   });
+
+  it.runIf(realCliAvailable)(
+    "reports both of the installed CLI's missing-note diagnostics as absent",
+    async () => {
+      // A note missing from an existing folder and a note whose folder does
+      // not exist yet are different diagnostics, both exit 1, and both mean
+      // "not there" — the second one is what every first capture into a new
+      // collection reads.
+      const vault = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-absent-"));
+      fs.mkdirSync(path.join(vault, "Notes"), { recursive: true });
+
+      const cli = new ObsidianCli(
+        createObsidianCliRunner({ vaultPath: vault, cliPath: realCliPath }),
+      );
+
+      expect(await cli.readNote("Notes/missing.md")).toBeNull();
+      expect(await cli.readNote("Ghost/missing.md")).toBeNull();
+      expect(await cli.readNoteWithAnchor("Notes/missing.md")).toBeNull();
+      expect(await cli.readNoteWithAnchor("Ghost/missing.md")).toBeNull();
+
+      fs.rmSync(vault, { recursive: true, force: true });
+    },
+  );
+
+  it.runIf(realCliAvailable)(
+    "round-trips an anchor through a compare-and-swap replacement",
+    async () => {
+      const vault = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-cas-"));
+      fs.mkdirSync(path.join(vault, "Notes"), { recursive: true });
+      fs.writeFileSync(path.join(vault, "Notes", "cas.md"), "original\n");
+
+      const cli = new ObsidianCli(
+        createObsidianCliRunner({ vaultPath: vault, cliPath: realCliPath }),
+      );
+
+      const snapshot = await cli.readNoteWithAnchor("Notes/cas.md");
+      expect(snapshot?.markdown).toBe("original\n");
+      expect(snapshot?.anchor).toMatch(/^sha256:[0-9a-f]+$/);
+
+      await cli.replaceNote("Notes/cas.md", "replaced\n", snapshot?.anchor ?? "");
+      expect(fs.readFileSync(path.join(vault, "Notes", "cas.md"), "utf8")).toBe(
+        "replaced\n",
+      );
+
+      // The burnt anchor must never write again.
+      await expect(
+        cli.replaceNote("Notes/cas.md", "third\n", snapshot?.anchor ?? ""),
+      ).rejects.toThrow(CasConflictError);
+      expect(fs.readFileSync(path.join(vault, "Notes", "cas.md"), "utf8")).toBe(
+        "replaced\n",
+      );
+
+      fs.rmSync(vault, { recursive: true, force: true });
+    },
+  );
 
   it.runIf(realCliAvailable)(
     "maps the installed CLI's setext refusal to HeadingFormatError",

@@ -16,7 +16,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { collectionIndexPath, notePath, sha256 } from "../src/vault/identity";
 import { createObsidianCliRunner, ObsidianCli } from "../src/vault/ObsidianCli";
 import type { SourceDocument } from "../src/vault/types";
-import { VaultPublisher } from "../src/vault/VaultPublisher";
+import {
+  SOURCE_UPDATES_INDEX,
+  SOURCE_UPDATES_PATH,
+  VaultPublisher,
+} from "../src/vault/VaultPublisher";
+import { createVaultCli } from "../src/vault-cli/index";
 
 const cliPath = path.join(os.homedir(), "ai-stack", "bin", "obsidian-cli");
 const cliAvailable = fs.existsSync(cliPath);
@@ -69,10 +74,21 @@ const document: SourceDocument = {
 
 describe.skipIf(!cliAvailable)("vault publication E2E", () => {
   let sandbox: string;
+  let stateDir: string;
   let publisher: VaultPublisher;
+
+  /** Builds a publisher over the sandbox vault and the throwaway state dir. */
+  const makePublisher = (): VaultPublisher =>
+    new VaultPublisher(
+      new ObsidianCli(createObsidianCliRunner({ vaultPath: sandbox, cliPath })),
+      { stateDir, vaultPath: sandbox, publisherVersion: "0.0.0-test" },
+    );
 
   beforeAll(() => {
     sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-vault-"));
+    // Runtime state is durable and must never live inside a vault, not even a
+    // throwaway one.
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-e2e-state-"));
     fs.mkdirSync(path.join(sandbox, "00 Inbox"), { recursive: true });
 
     // GATE. This runs before the publisher exists, so nothing in this file can
@@ -85,14 +101,12 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
       );
     }
 
-    publisher = new VaultPublisher(
-      new ObsidianCli(createObsidianCliRunner({ vaultPath: sandbox })),
-      { publisherVersion: "0.0.0-test" },
-    );
+    publisher = makePublisher();
   });
 
   afterAll(() => {
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
+    if (stateDir) fs.rmSync(stateDir, { recursive: true, force: true });
   });
 
   it("ran the override gate before constructing the publisher", () => {
@@ -153,6 +167,74 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
     expect(readBack).toContain("source_id:");
     expect(readBack).toContain("publisher: secondbrain-docs");
     expect(readBack).toContain("日本語 ✅");
+  });
+
+  it("replaces its own note through a real compare-and-swap write", async () => {
+    const changed = { ...document, markdown: `${SOURCE_MARKDOWN}\nA new section.\n` };
+
+    const publication = await publisher.publish(changed);
+
+    expect(publication.status).toBe("replaced");
+    expect(publication.path).toBe(notePath(document));
+    const onDisk = fs.readFileSync(path.join(sandbox, publication.path), "utf8");
+    expect(onDisk).toBe(publication.markdown);
+    expect(onDisk).toContain("A new section.");
+    expect(sha256(onDisk)).toBe(publication.digest);
+
+    // Still one link, and still exactly one note in the collection.
+    const index = fs.readFileSync(path.join(sandbox, collectionIndexPath("inbox")), "utf8");
+    const target = notePath(document).replace(/\.md$/, "");
+    expect(index.split("\n").filter((line) => line.includes(target))).toHaveLength(1);
+  });
+
+  it("preserves a human edit and writes a real incoming candidate", async () => {
+    const notePathOnDisk = path.join(sandbox, notePath(document));
+    const handEdited = `${fs.readFileSync(notePathOnDisk, "utf8")}\n\nA human wrote this.\n`;
+    fs.writeFileSync(notePathOnDisk, handEdited);
+
+    const publication = await publisher.publish({
+      ...document,
+      markdown: `${SOURCE_MARKDOWN}\nUpstream moved on.\n`,
+    });
+
+    expect(publication.status).toBe("conflict");
+    expect(publication.conflictReason).toBe("manual-edit");
+    // The human's bytes are still there, byte for byte.
+    expect(fs.readFileSync(notePathOnDisk, "utf8")).toBe(handEdited);
+
+    const candidate = publication.candidatePath ?? "";
+    expect(candidate.startsWith(`${SOURCE_UPDATES_PATH}/`)).toBe(true);
+    expect(fs.readFileSync(path.join(sandbox, candidate), "utf8")).toContain(
+      "Upstream moved on.",
+    );
+    const updatesIndex = fs.readFileSync(path.join(sandbox, SOURCE_UPDATES_INDEX), "utf8");
+    expect(
+      updatesIndex.split("\n").filter((line) => line.includes(candidate.replace(/\.md$/, ""))),
+    ).toHaveLength(1);
+  });
+
+  it("reports that state through a real doctor run", async () => {
+    const lines: string[] = [];
+
+    await createVaultCli(["doctor", "--json"], {
+      doctor: {
+        stateDir,
+        vaultPath: sandbox,
+        cli: new ObsidianCli(createObsidianCliRunner({ vaultPath: sandbox, cliPath })),
+        stdout: (line) => lines.push(line),
+        stderr: () => undefined,
+      },
+    })
+      .exitProcess(false)
+      .fail(false)
+      .parseAsync();
+
+    const report = JSON.parse(lines.join("\n"));
+    expect(report.stateDir).toBe(fs.realpathSync(stateDir));
+    expect(report.vaultPath).toBe(sandbox);
+    expect(report.ownershipCount).toBeGreaterThan(0);
+    // Every publication above ran to completion, so nothing is pending.
+    expect(report.pending).toEqual([]);
   });
 
   it("leaves the operator's live vault untouched", () => {

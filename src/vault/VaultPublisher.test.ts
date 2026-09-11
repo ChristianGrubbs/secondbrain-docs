@@ -1,9 +1,18 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
 import { ObsidianCli } from "./ObsidianCli";
+import { PublicationJournal } from "./PublicationJournal";
 import type { CliResult, SourceDocument } from "./types";
-import { VaultPublisher } from "./VaultPublisher";
+import {
+  SOURCE_UPDATES_INDEX,
+  SOURCE_UPDATES_PATH,
+  updateDecision,
+  VaultPublisher,
+} from "./VaultPublisher";
 
 /**
  * Markdown that exercises everything publication must not mangle: a GFM table,
@@ -45,7 +54,8 @@ function makeDocument(overrides: Partial<SourceDocument> = {}): SourceDocument {
  * It records every argument array and stdin payload so tests can assert the
  * exact process contract, and it also holds note bytes so tests can assert the
  * resulting vault state. Its exit codes mirror the documented CLI: 3 for a
- * create-only collision, 1 for a missing note, 4 for a setext-heading refusal.
+ * create-only collision or a failed compare-and-swap, 1 for a missing note, and
+ * a setext-heading refusal that arrives as exit 1 with its own diagnostic.
  */
 class FakeObsidianCliProcess {
   readonly invocations: { args: string[]; stdin: string | null }[] = [];
@@ -54,6 +64,12 @@ class FakeObsidianCliProcess {
   readonly setextNotes = new Set<string>();
   /** Folders that exist without holding a note directly. */
   readonly folders = new Set<string>();
+
+  /** Anchor the CLI reports for a note's current bytes. */
+  anchorOf(notePath: string): string {
+    const existing = this.notes.get(notePath);
+    return existing === undefined ? "sha256:<absent>" : `sha256:${sha256(existing)}`;
+  }
 
   run = async (args: string[], stdin: string | null): Promise<CliResult> => {
     this.invocations.push({ args, stdin });
@@ -75,12 +91,36 @@ class FakeObsidianCliProcess {
       };
     }
 
+    if (command === "write") {
+      const ifMatchIndex = args.indexOf("--if-match");
+      const expected = ifMatchIndex === -1 ? null : args[ifMatchIndex + 1];
+      if (expected !== null && expected !== this.anchorOf(notePath)) {
+        return {
+          code: 3,
+          stdout: "",
+          stderr: `obsidian-cli: note changed since ${expected} — re-read and retry`,
+        };
+      }
+      if (!args.includes("--force") && this.notes.has(notePath)) {
+        return { code: 1, stdout: "", stderr: "obsidian-cli: refusing to overwrite" };
+      }
+      this.notes.set(notePath, stdin ?? "");
+      return {
+        code: 0,
+        stdout: `wrote ${(stdin ?? "").length} bytes -> ${notePath}`,
+        stderr: "",
+      };
+    }
+
     if (command === "read") {
       const existing = this.notes.get(notePath);
       if (existing === undefined) {
         return { code: 1, stdout: "", stderr: `obsidian-cli: not a file: ${notePath}` };
       }
-      return { code: 0, stdout: existing, stderr: "" };
+      const stderr = args.includes("--with-anchor")
+        ? `anchor: ${this.anchorOf(notePath)}\n`
+        : "";
+      return { code: 0, stdout: existing, stderr };
     }
 
     if (command === "section-insert") {
@@ -141,13 +181,101 @@ function splitNote(note: string): { frontmatter: string; body: string } {
   return { frontmatter: match[1], body: match[2] };
 }
 
+const temporaries: string[] = [];
+let stateDir: string;
+let vaultDir: string;
+
+function makeTempDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  temporaries.push(dir);
+  return dir;
+}
+
+/** Counts index lines that live-link a note path. */
+function linksTo(index: string, target: string): string[] {
+  return index
+    .split("```")
+    .filter((_, i) => i % 2 === 0)
+    .join("")
+    .split("\n")
+    .filter((line) => line.includes(`[[${target}`));
+}
+
+beforeEach(() => {
+  stateDir = makeTempDir("sb-docs-pub-state-");
+  vaultDir = makeTempDir("sb-docs-pub-vault-");
+});
+
+afterEach(() => {
+  while (temporaries.length > 0) {
+    const dir = temporaries.pop();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makePublisher(cli: FakeObsidianCliProcess | ObsidianCli): VaultPublisher {
+  const wrapped = cli instanceof ObsidianCli ? cli : new ObsidianCli(cli.run);
+  return new VaultPublisher(wrapped, {
+    stateDir,
+    vaultPath: vaultDir,
+    lock: { timeoutMs: 2000, pollMs: 5 },
+  });
+}
+
+describe("updateDecision", () => {
+  it.each([
+    {
+      name: "an absent note is created",
+      input: { currentDigest: null, ownedDigest: null, semanticChanged: true },
+      expected: "create",
+    },
+    {
+      name: "an unowned existing note is a conflict",
+      input: { currentDigest: "a", ownedDigest: null, semanticChanged: true },
+      expected: "conflict",
+    },
+    {
+      name: "a note edited since we wrote it is a conflict",
+      input: { currentDigest: "b", ownedDigest: "a", semanticChanged: false },
+      expected: "conflict",
+    },
+    {
+      name: "our own note with changed content is replaced",
+      input: { currentDigest: "a", ownedDigest: "a", semanticChanged: true },
+      expected: "replace",
+    },
+    {
+      name: "our own note with unchanged content is left alone",
+      input: { currentDigest: "a", ownedDigest: "a", semanticChanged: false },
+      expected: "unchanged",
+    },
+    {
+      name: "an absent note wins over a stale ownership record",
+      input: { currentDigest: null, ownedDigest: "a", semanticChanged: false },
+      expected: "create",
+    },
+  ])("$name", ({ input, expected }) => {
+    expect(updateDecision(input)).toBe(expected);
+  });
+});
+
 describe("VaultPublisher", () => {
   let cli: FakeObsidianCliProcess;
   let publisher: VaultPublisher;
 
   beforeEach(() => {
     cli = new FakeObsidianCliProcess();
-    publisher = new VaultPublisher(new ObsidianCli(cli.run));
+    publisher = makePublisher(cli);
+  });
+
+  it("refuses to keep its runtime state inside the vault", () => {
+    expect(
+      () =>
+        new VaultPublisher(new ObsidianCli(cli.run), {
+          stateDir: path.join(vaultDir, "state"),
+          vaultPath: vaultDir,
+        }),
+    ).toThrow(/vault/i);
   });
 
   it("publishes one source note under the reserved inbox collection", async () => {
@@ -200,6 +328,8 @@ describe("VaultPublisher", () => {
     });
     expect(typeof metadata.publisher_version).toBe("string");
     expect(metadata.publisher_version.length).toBeGreaterThan(0);
+    // `last_seen_at` is external state, never a note byte.
+    expect(frontmatter).not.toContain("last_seen_at");
   });
 
   it("keeps the source identity stable when only the title changes", async () => {
@@ -249,10 +379,7 @@ describe("VaultPublisher", () => {
     expect(second.status).toBe("unchanged");
 
     const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
-    const links = index
-      .split("\n")
-      .filter((line) => line.includes(first.path.replace(/\.md$/, "")));
-    expect(links).toHaveLength(1);
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
   });
 
   it("treats a later capture of unchanged content as unchanged, not a conflict", async () => {
@@ -267,18 +394,70 @@ describe("VaultPublisher", () => {
     expect(cli.notes.get(first.path)).toContain("captured_at: 2026-09-10T12:00:00.000Z");
   });
 
-  it("reports a conflict when the source body actually changed", async () => {
+  it("keeps prior bytes when only the publisher release changed", async () => {
+    const first = await publisher.publish(makeDocument());
+
+    const upgraded = new VaultPublisher(new ObsidianCli(cli.run), {
+      stateDir,
+      vaultPath: vaultDir,
+      publisherVersion: "99.0.0",
+      lock: { timeoutMs: 2000, pollMs: 5 },
+    });
+    const second = await upgraded.publish(
+      makeDocument({ capturedAt: "2027-01-01T00:00:00.000Z" }),
+    );
+
+    expect(second.status).toBe("unchanged");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+    expect(cli.notes.get(first.path)).not.toContain("publisher_version: 99.0.0");
+  });
+
+  it("replaces its own note when the source body actually changed", async () => {
     const first = await publisher.publish(makeDocument());
     const changed = await publisher.publish(
       makeDocument({ markdown: `${SOURCE_MARKDOWN}\nA new paragraph.\n` }),
     );
 
-    expect(changed.status).toBe("conflict");
-    expect(cli.notes.get(first.path)).toBe(first.markdown);
+    expect(changed.status).toBe("replaced");
+    expect(changed.path).toBe(first.path);
+    expect(cli.notes.get(first.path)).toBe(changed.markdown);
+    expect(cli.notes.get(first.path)).toContain("A new paragraph.");
+    expect(cli.notes.size).toBe(2); // the note and its index, nothing else
   });
 
-  // Path freezing across a title change needs source_id discovery, which Task 3
-  // introduces in discovery.ts. Task 2 only guarantees the identity is stable.
+  it("freezes the path across a title change and keeps exactly one MOC link", async () => {
+    const first = await publisher.publish(makeDocument());
+    const retitled = await publisher.publish(
+      makeDocument({
+        title: "uv — Working on Projects (2026 edition)",
+        markdown: `${SOURCE_MARKDOWN}\nRewritten.\n`,
+      }),
+    );
+
+    expect(retitled.status).toBe("replaced");
+    expect(retitled.path).toBe(first.path);
+
+    const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
+    const notePaths = [...cli.notes.keys()].filter((key) => !key.endsWith("index.md"));
+    expect(notePaths).toHaveLength(1);
+  });
+
+  it("gives two same-title sources distinct paths and two MOC links", async () => {
+    const first = await publisher.publish(makeDocument({ title: "Shared Title" }));
+    const second = await publisher.publish(
+      makeDocument({
+        title: "Shared Title",
+        sourceUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        requestedUrl: "https://docs.astral.sh/uv/guides/scripts/",
+      }),
+    );
+
+    expect(second.path).not.toBe(first.path);
+    const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
+    expect(linksTo(index, second.path.replace(/\.md$/, ""))).toHaveLength(1);
+  });
 
   it("preserves an existing note whose bytes differ and reports a conflict", async () => {
     const first = await publisher.publish(makeDocument());
@@ -287,7 +466,148 @@ describe("VaultPublisher", () => {
     const second = await publisher.publish(makeDocument());
 
     expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("manual-edit");
     expect(cli.notes.get(first.path)).toBe("# Hand edited by a human\n");
+  });
+
+  it("writes an incoming candidate when a human edited the body", async () => {
+    const first = await publisher.publish(makeDocument());
+    const handEdited = `${first.markdown}\n\nA human added this paragraph.\n`;
+    cli.notes.set(first.path, handEdited);
+
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed too.\n` }),
+    );
+
+    expect(second.status).toBe("conflict");
+    expect(cli.notes.get(first.path)).toBe(handEdited);
+    expect(second.candidatePath?.startsWith(`${SOURCE_UPDATES_PATH}/`)).toBe(true);
+    const candidate = cli.notes.get(second.candidatePath ?? "") ?? "";
+    expect(candidate).toContain("Upstream changed too.");
+
+    const updatesIndex = cli.notes.get(SOURCE_UPDATES_INDEX) ?? "";
+    expect(updatesIndex).toContain("## Sources");
+    expect(
+      linksTo(updatesIndex, (second.candidatePath ?? "").replace(/\.md$/, "")),
+    ).toHaveLength(1);
+  });
+
+  it("catches a human frontmatter edit through the whole-note digest", async () => {
+    const first = await publisher.publish(makeDocument());
+    // Semantically identical: only the capture timestamp line moved.
+    const touched = first.markdown.replace(
+      "captured_at: 2026-09-10T12:00:00.000Z",
+      "captured_at: 2026-09-10T12:00:01.000Z",
+    );
+    expect(touched).not.toBe(first.markdown);
+    cli.notes.set(first.path, touched);
+
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("manual-edit");
+    expect(cli.notes.get(first.path)).toBe(touched);
+  });
+
+  it("reuses an identical conflict candidate instead of writing a second one", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+
+    const second = await publisher.publish(changed);
+    const third = await publisher.publish({
+      ...changed,
+      capturedAt: "2027-02-02T02:02:02.000Z",
+    });
+
+    expect(third.status).toBe("conflict");
+    expect(third.candidatePath).toBe(second.candidatePath);
+    // Reused byte for byte, including the first capture timestamp.
+    expect(cli.notes.get(third.candidatePath ?? "")).toBe(
+      cli.notes.get(second.candidatePath ?? ""),
+    );
+    expect(cli.notes.get(third.candidatePath ?? "")).toContain(
+      "captured_at: 2026-09-10T12:00:00.000Z",
+    );
+
+    const candidates = [...cli.notes.keys()].filter(
+      (key) => key.startsWith(`${SOURCE_UPDATES_PATH}/`) && !key.endsWith("index.md"),
+    );
+    expect(candidates).toHaveLength(1);
+    const updatesIndex = cli.notes.get(SOURCE_UPDATES_INDEX) ?? "";
+    expect(
+      linksTo(updatesIndex, (second.candidatePath ?? "").replace(/\.md$/, "")),
+    ).toHaveLength(1);
+  });
+
+  it("never overwrites a candidate a human edited", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` });
+
+    const second = await publisher.publish(changed);
+    const candidatePath = second.candidatePath ?? "";
+    const editedCandidate = `${cli.notes.get(candidatePath) ?? ""}\nHuman note on the candidate.\n`;
+    cli.notes.set(candidatePath, editedCandidate);
+
+    const third = await publisher.publish(changed);
+
+    expect(third.status).toBe("conflict");
+    expect(third.conflictReason).toBe("candidate-modified");
+    expect(cli.notes.get(candidatePath)).toBe(editedCandidate);
+    const candidates = [...cli.notes.keys()].filter(
+      (key) => key.startsWith(`${SOURCE_UPDATES_PATH}/`) && !key.endsWith("index.md"),
+    );
+    expect(candidates).toHaveLength(1);
+  });
+
+  it("refuses to publish a third note when two notes claim one source id", async () => {
+    const first = await publisher.publish(makeDocument());
+    const duplicatePath = "00 Inbox/Source Captures/a human copy.md";
+    cli.notes.set(duplicatePath, first.markdown);
+    // Runtime state is disposable, so the scan — not the ownership record — is
+    // what has to notice that two notes now claim one identity.
+    fs.rmSync(path.join(stateDir, "ownership"), { recursive: true, force: true });
+
+    const fresh = makePublisher(cli);
+    const second = await fresh.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("identity-conflict");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+    expect(cli.notes.get(duplicatePath)).toBe(first.markdown);
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(2);
+  });
+
+  it("resolves a lost ownership record through discovery rather than a third note", async () => {
+    const first = await publisher.publish(makeDocument({ title: "Original Title" }));
+
+    // Runtime state is disposable; a human deleting it must not duplicate notes.
+    fs.rmSync(path.join(stateDir, "ownership"), { recursive: true, force: true });
+
+    const fresh = makePublisher(cli);
+    const second = await fresh.publish(
+      makeDocument({
+        title: "A Completely New Title",
+        markdown: `${SOURCE_MARKDOWN}\nx\n`,
+      }),
+    );
+
+    expect(second.status).toBe("conflict");
+    expect(second.conflictReason).toBe("user-owned");
+    expect(second.path).toBe(first.path);
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(1);
   });
 
   it("creates the collection index with a Sources heading when it is absent", async () => {
@@ -339,12 +659,243 @@ describe("VaultPublisher", () => {
     ]);
 
     const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
-    const links = index
-      .split("\n")
-      .filter((line) => line.includes(first.path.replace(/\.md$/, "")));
 
-    expect(links).toHaveLength(1);
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
     expect([first.status, second.status].sort()).toEqual(["published", "unchanged"]);
+  });
+
+  it("keeps one note and one link when two publishers race over one source", async () => {
+    // Two independent publisher instances, as two processes would be: they
+    // share only the vault and the state directory, which is where the
+    // interprocess lock lives.
+    const one = makePublisher(cli);
+    const two = makePublisher(cli);
+
+    const [first, second] = await Promise.all([
+      one.publish(makeDocument()),
+      two.publish(makeDocument()),
+    ]);
+
+    expect(first.path).toBe(second.path);
+    expect([first.status, second.status].sort()).toEqual(["published", "unchanged"]);
+
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(1);
+    const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
+  });
+
+  it("does not create a second note when another writer wins the race after discovery", async () => {
+    // Warm the discovery scan with an unrelated note, then let a foreign writer
+    // create our note between that scan and our create.
+    await publisher.publish(
+      makeDocument({
+        sourceUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        requestedUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        title: "Other Source",
+      }),
+    );
+
+    const target = notePath(makeDocument());
+    let intercepted = false;
+    const racing = new ObsidianCli(async (args, stdin) => {
+      if (!intercepted && args[0] === "create" && args[1] === target) {
+        intercepted = true;
+        cli.notes.set(target, "---\ntype: source\n---\nwritten by somebody else\n");
+      }
+      return cli.run(args, stdin);
+    });
+
+    const publication = await new VaultPublisher(racing, {
+      stateDir,
+      vaultPath: vaultDir,
+      lock: { timeoutMs: 2000, pollMs: 5 },
+    }).publish(makeDocument());
+
+    expect(intercepted).toBe(true);
+    expect(publication.status).toBe("conflict");
+    expect(cli.notes.get(target)).toBe(
+      "---\ntype: source\n---\nwritten by somebody else\n",
+    );
+    const notes = [...cli.notes.keys()].filter(
+      (key) => key.startsWith("00 Inbox/Source Captures/") && !key.endsWith("index.md"),
+    );
+    expect(notes).toHaveLength(2);
+  });
+
+  it("links two sources from one MOC without duplicating either", async () => {
+    const first = await publisher.publish(makeDocument({ collection: "uv" }));
+    const second = await publisher.publish(
+      makeDocument({
+        collection: "uv",
+        sourceUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        requestedUrl: "https://docs.astral.sh/uv/guides/scripts/",
+        title: "Running Scripts",
+      }),
+    );
+    await publisher.publish(makeDocument({ collection: "uv" }));
+
+    const index = cli.notes.get("30 Tools-Models/Doc Sets/uv/index.md") ?? "";
+    expect(linksTo(index, first.path.replace(/\.md$/, ""))).toHaveLength(1);
+    expect(linksTo(index, second.path.replace(/\.md$/, ""))).toHaveLength(1);
+    expect((index.match(/\[\[/g) ?? []).length).toBe(2);
+  });
+});
+
+describe("VaultPublisher recovery", () => {
+  let cli: FakeObsidianCliProcess;
+
+  beforeEach(() => {
+    cli = new FakeObsidianCliProcess();
+  });
+
+  /** Builds a publisher whose CLI throws once a predicate matches. */
+  function crashingPublisher(shouldCrash: (args: string[]) => boolean): VaultPublisher {
+    const runner = new ObsidianCli(async (args, stdin) => {
+      if (shouldCrash(args)) throw new Error("process died");
+      return cli.run(args, stdin);
+    });
+    return new VaultPublisher(runner, {
+      stateDir,
+      vaultPath: vaultDir,
+      lock: { timeoutMs: 2000, pollMs: 5 },
+    });
+  }
+
+  it("classifies a crash before the note write as retryable and preserves bytes", async () => {
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(makeDocument());
+
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nChanged.\n` });
+    const crashing = crashingPublisher((args) => args[0] === "write");
+    await expect(crashing.publish(changed)).rejects.toThrow("process died");
+
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    expect(journal.pending()[0]?.phase).toBe("prepared");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+
+    const report = await makePublisher(cli).recoverPending();
+    expect(report).toHaveLength(1);
+    expect(report[0].classification).toBe("retryable");
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+
+    // The retry is an ordinary capture, and it succeeds.
+    const retried = await makePublisher(cli).publish(changed);
+    expect(retried.status).toBe("replaced");
+    expect(cli.notes.get(first.path)).toContain("Changed.");
+  });
+
+  it("resumes a crash after the note write and completes the MOC work", async () => {
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(makeDocument());
+    // Drop the link so recovery has real MOC work to finish.
+    const indexPath = "00 Inbox/Source Captures/index.md";
+    cli.notes.set(indexPath, "# Source Captures\n\n## Sources\n");
+
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nChanged.\n` });
+    let writes = 0;
+    const crashing = crashingPublisher((args) => {
+      if (args[0] === "write") writes += 1;
+      // Crash on the readback that follows a successful write.
+      return writes === 1 && args[0] === "read" && args[1] === first.path;
+    });
+    await expect(crashing.publish(changed)).rejects.toThrow("process died");
+
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    const pending = journal.pending()[0];
+    expect(pending?.phase).toBe("note-written");
+    expect(cli.notes.get(first.path)).toContain("Changed.");
+
+    const report = await makePublisher(cli).recoverPending();
+    expect(report[0].classification).toBe("resumable");
+    expect(report[0].completed).toBe(true);
+    expect(
+      linksTo(cli.notes.get(indexPath) ?? "", first.path.replace(/\.md$/, "")),
+    ).toHaveLength(1);
+    expect(new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending()).toEqual(
+      [],
+    );
+    expect(
+      new PublicationJournal({ stateDir, vaultPath: vaultDir }).readOwnership(
+        sourceId(changed),
+      )?.digest,
+    ).toBe(sha256(cli.notes.get(first.path) ?? ""));
+  });
+
+  it("completes a crash after the MOC link without duplicating the link", async () => {
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(makeDocument());
+    const indexPath = "00 Inbox/Source Captures/index.md";
+
+    // A crash between `moc-linked` and the ownership write, reconstructed as
+    // durable state: the note and its link are already in place.
+    const journal = new PublicationJournal({ stateDir, vaultPath: vaultDir });
+    journal.prepare({
+      sourceId: sourceId(makeDocument()),
+      path: first.path,
+      priorWholeNoteDigest: first.digest,
+      proposedWholeNoteDigest: first.digest,
+      bytes: first.markdown,
+    });
+    journal.advance(sourceId(makeDocument()), "note-written");
+    journal.advance(sourceId(makeDocument()), "moc-linked");
+
+    const report = await makePublisher(cli).recoverPending();
+
+    expect(report[0].classification).toBe("resumable");
+    expect(report[0].completed).toBe(true);
+    expect(
+      linksTo(cli.notes.get(indexPath) ?? "", first.path.replace(/\.md$/, "")),
+    ).toHaveLength(1);
+    expect(cli.notes.get(first.path)).toBe(first.markdown);
+  });
+
+  it("reports a conflict rather than rolling back over a manual edit", async () => {
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(makeDocument());
+
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nChanged.\n` });
+    const crashing = crashingPublisher((args) => args[0] === "write");
+    await expect(crashing.publish(changed)).rejects.toThrow("process died");
+
+    // A human edits the note while the entry is still pending.
+    cli.notes.set(first.path, "# Hand edited during the outage\n");
+
+    const report = await makePublisher(cli).recoverPending();
+
+    expect(report[0].classification).toBe("conflict");
+    expect(report[0].completed).toBe(false);
+    expect(cli.notes.get(first.path)).toBe("# Hand edited during the outage\n");
+    expect(
+      new PublicationJournal({ stateDir, vaultPath: vaultDir }).pending(),
+    ).toHaveLength(1);
+  });
+
+  it("restores ownership from the journal when the ownership file is lost", async () => {
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(makeDocument());
+    const indexPath = "00 Inbox/Source Captures/index.md";
+    cli.notes.set(indexPath, "# Source Captures\n\n## Sources\n");
+
+    const changed = makeDocument({ markdown: `${SOURCE_MARKDOWN}\nChanged.\n` });
+    let writes = 0;
+    const crashing = crashingPublisher((args) => {
+      if (args[0] === "write") writes += 1;
+      return writes === 1 && args[0] === "read" && args[1] === first.path;
+    });
+    await expect(crashing.publish(changed)).rejects.toThrow("process died");
+
+    // The ownership record never landed, but the journal proves those bytes.
+    fs.rmSync(path.join(stateDir, "ownership"), { recursive: true, force: true });
+
+    const republished = await makePublisher(cli).publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nChanged again.\n` }),
+    );
+
+    expect(republished.status).toBe("replaced");
+    expect(cli.notes.get(first.path)).toContain("Changed again.");
   });
 });
 
@@ -355,7 +906,7 @@ describe("VaultPublisher review regressions", () => {
 
   beforeEach(() => {
     cli = new FakeObsidianCliProcess();
-    publisher = new VaultPublisher(new ObsidianCli(cli.run));
+    publisher = makePublisher(cli);
   });
 
   describe("filename budget", () => {
@@ -434,14 +985,7 @@ describe("VaultPublisher review regressions", () => {
       const republished = await publisher.publish(makeDocument());
 
       expect(republished.moc).toBe("linked");
-      const index = cli.notes.get(indexPath) ?? "";
-      const liveLinks = index
-        .split("```")
-        .filter((_, i) => i % 2 === 0)
-        .join("")
-        .split("\n")
-        .filter((line) => line.includes(target));
-      expect(liveLinks).toHaveLength(1);
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
     });
 
     it("cannot be made to inject a second link through a hostile title", async () => {
@@ -536,13 +1080,12 @@ describe("VaultPublisher review regressions", () => {
       return realRun(args, stdin);
     });
 
-    const racingPublisher = new VaultPublisher(racingCli);
+    const racingPublisher = makePublisher(racingCli);
     const publication = await racingPublisher.publish(makeDocument());
 
     expect(publication.moc).toBe("linked");
-    const links = (cli.notes.get(indexPath) ?? "")
-      .split("\n")
-      .filter((line) => line.includes(publication.path.replace(/\.md$/, "")));
-    expect(links).toHaveLength(1);
+    expect(
+      linksTo(cli.notes.get(indexPath) ?? "", publication.path.replace(/\.md$/, "")),
+    ).toHaveLength(1);
   });
 });
