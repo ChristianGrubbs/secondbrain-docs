@@ -3,24 +3,42 @@
  * fixtures. Run through `vite-node` so it exercises the same source the
  * publisher does, in a genuinely separate process.
  *
- * Environment:
- * - `STATE_DIR`   runtime state directory (shared with the parent)
- * - `VAULT_PATH`  vault the state directory must stay out of
- * - `SOURCE_ID`   identity to lock
- * - `MODE`        `hold` (acquire, report, release) or `hang` (acquire, report,
- *                 never release — the parent kills it)
- * - `HOLD_MS`     how long `hold` keeps the lock
- * - `TIMEOUT_MS`  how long to wait for a contended lock
+ * Barriers are explicit files rather than sleeps, so the parent can assert on
+ * a state rather than on a timing guess: the child announces that it holds the
+ * lock, and waits to be told to let go.
  *
- * Every observable step is one JSON line on stdout, so the parent can assert
- * ordering and overlap rather than timing.
+ * Entry into the critical section is recorded through a witness file created
+ * with `wx`, an atomic create-if-absent. Two overlapping holders cannot both
+ * create it, so an overlap is observable as a fact rather than inferred.
+ *
+ * Environment:
+ * - `STATE_DIR`     runtime state directory (shared with the parent)
+ * - `VAULT_PATH`    vault the state directory must stay out of
+ * - `SOURCE_ID`     identity to lock
+ * - `WITNESS_FILE`  exclusive-create witness proving sections never overlap
+ * - `ACQUIRED_FILE` written once the lock is held
+ * - `RELEASE_FILE`  polled until it exists; the child then leaves the section
+ * - `ENTRIES_FILE`  one line appended per critical section entered
+ * - `MODE`          `hold` (release normally), `hang` (never leave; the parent
+ *                   kills it) or `throw` (fail inside the section)
+ * - `HOLD_MS`       fallback hold time when no release barrier is given
+ * - `TIMEOUT_MS`    how long to wait for a contended lock
  */
 
+import fs from "node:fs";
 import { PublicationJournal } from "../../../src/vault/PublicationJournal";
 
 const say = (event: string, extra: Record<string, unknown> = {}): void => {
-  process.stdout.write(`${JSON.stringify({ event, pid: process.pid, at: Date.now(), ...extra })}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ event, pid: process.pid, at: Date.now(), ...extra })}\n`,
+  );
 };
+
+const mode = process.env.MODE ?? "hold";
+const witnessFile = process.env.WITNESS_FILE ?? "";
+const acquiredFile = process.env.ACQUIRED_FILE ?? "";
+const releaseFile = process.env.RELEASE_FILE ?? "";
+const entriesFile = process.env.ENTRIES_FILE ?? "";
 
 const journal = new PublicationJournal({
   stateDir: process.env.STATE_DIR,
@@ -28,24 +46,47 @@ const journal = new PublicationJournal({
   lock: {
     timeoutMs: Number(process.env.TIMEOUT_MS ?? 10_000),
     pollMs: 10,
-    staleAfterMs: Number(process.env.STALE_AFTER_MS ?? 60_000),
   },
 });
 
-const sourceId = process.env.SOURCE_ID ?? "child";
-const mode = process.env.MODE ?? "hold";
-
 try {
-  await journal.withLock(sourceId, async () => {
+  await journal.withLock(process.env.SOURCE_ID ?? "child", async () => {
+    if (witnessFile) {
+      try {
+        fs.writeFileSync(witnessFile, String(process.pid), { flag: "wx" });
+      } catch {
+        say("overlap", { witness: fs.readFileSync(witnessFile, "utf8") });
+        throw new Error("critical sections overlapped");
+      }
+    }
+
     say("acquired");
+    if (entriesFile) fs.appendFileSync(entriesFile, `${process.pid}\n`);
+    if (acquiredFile) fs.writeFileSync(acquiredFile, String(process.pid));
+
+    if (mode === "throw") {
+      if (witnessFile) fs.rmSync(witnessFile, { force: true });
+      throw new Error("the critical section failed");
+    }
+
     if (mode === "hang") {
-      // Hold until the parent SIGKILLs us. This has to be a real, referenced
-      // timer: a promise that simply never resolves lets the event loop drain,
-      // and the process would exit on its own — a dead holder, not a live one.
+      // Held until the parent SIGKILLs us. A referenced timer, so the event
+      // loop cannot drain and let the process exit on its own.
       await new Promise((resolve) => setTimeout(resolve, 600_000));
     }
-    await new Promise((resolve) => setTimeout(resolve, Number(process.env.HOLD_MS ?? 50)));
+
+    if (releaseFile) {
+      while (!fs.existsSync(releaseFile)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } else {
+      await new Promise((resolve) =>
+        setTimeout(resolve, Number(process.env.HOLD_MS ?? 50)),
+      );
+    }
+
     say("releasing");
+    if (witnessFile) fs.rmSync(witnessFile, { force: true });
   });
   say("released");
 } catch (error) {

@@ -10,7 +10,9 @@
  *   publisher last committed — which is what distinguishes our own note from a
  *   note a human has edited;
  * - a per-source **interprocess lock**, so two captures of one source never
- *   interleave their read-decide-write cycle.
+ *   interleave their read-decide-write cycle. It is a SQLite `BEGIN EXCLUSIVE`
+ *   transaction, which means the operating system owns mutual exclusion and
+ *   releases it when a process dies — see {@link PublicationJournal.withLock}.
  *
  * The vault never learns about any of it: a note's bytes carry no `last_seen_at`
  * and no ownership marker, because publisher frontmatter is forgeable and a
@@ -21,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { sha256 } from "./identity";
 
 /** Default durable state location on macOS. */
@@ -39,9 +42,6 @@ export const DEFAULT_LOG_FILE = path.join(
   "SecondBrainDocs",
   "events.jsonl",
 );
-
-/** How long a lock may sit untouched before another process may break it. */
-const DEFAULT_STALE_AFTER_MS = 60_000;
 
 /** How long an acquirer waits before giving up on a live lock. */
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
@@ -278,35 +278,18 @@ function readJson<T>(file: string): T | null {
   }
 }
 
-/** Reports whether a process id is still running on this host. */
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the process exists but belongs to somebody else.
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+/** Recognizes SQLite's "somebody else holds the lock" failure. */
+function isBusy(error: unknown): boolean {
+  const code = (error as { code?: string }).code;
+  return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT";
 }
 
 /** Options accepted by the per-source lock. */
 export interface LockOptions {
-  /** How long a lock with no live local owner may sit before it is reclaimed. */
-  staleAfterMs?: number;
+  /** How long to wait for a lock another process holds. */
   timeoutMs?: number;
+  /** Base retry interval; the real pause is jittered around it. */
   pollMs?: number;
-  /** How often a held lock refreshes its heartbeat. */
-  heartbeatMs?: number;
-}
-
-/** Owner metadata written inside a held lock directory. */
-interface LockOwner {
-  pid: number;
-  host: string;
-  /** Unique per acquisition, so a release can only ever remove its own lock. */
-  token: string;
-  acquiredAt: string;
-  heartbeatAt: string;
 }
 
 /** What this publisher recorded for one preserved incoming candidate. */
@@ -346,15 +329,9 @@ export class PublicationJournal {
     this.stateDir = resolveStateDir(options);
     this.logger = options.logger ?? nullLogger;
     this.now = options.now ?? (() => new Date());
-    const staleAfterMs = options.lock?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
     this.lockOptions = {
-      staleAfterMs,
       timeoutMs: options.lock?.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
       pollMs: options.lock?.pollMs ?? DEFAULT_LOCK_POLL_MS,
-      // Beat several times per window, so a working holder is never mistaken
-      // for an abandoned one by a peer that cannot check its pid.
-      heartbeatMs:
-        options.lock?.heartbeatMs ?? Math.max(50, Math.floor(staleAfterMs / 3)),
     };
     fs.mkdirSync(this.stateDir, { recursive: true });
     this.ensureLayout();
@@ -704,322 +681,128 @@ export class PublicationJournal {
   /**
    * Runs `critical` while holding the per-source interprocess lock.
    *
-   * The lock is a directory, because `mkdir` is atomic on every filesystem the
-   * vault can live on, and every acquisition carries a unique token so a holder
-   * can only ever release its own lock.
+   * The lock is a SQLite database per source, held open inside a
+   * `BEGIN EXCLUSIVE` transaction for the whole critical section. That
+   * transaction takes a POSIX advisory lock on the file, and the *kernel*
+   * releases it when the holding process ends, however it ends.
    *
-   * Liveness beats age. A lock whose owning process is still running on this
-   * host is never reclaimed, however long it has been held — a capture that
-   * takes longer than the staleness window is slow, not dead — and a held lock
-   * refreshes its heartbeat so a peer that cannot check the pid (another host)
-   * sees the same thing. Only a provably dead local owner, or a lock whose
-   * heartbeat has stopped, is reclaimed, and reclaiming goes through the guard
-   * described on {@link reclaimAbandoned}.
+   * That is the entire reason for the choice. Any lock built from `mkdir` plus
+   * a liveness check has the same shape of race at its core: the state you
+   * validate and the state you then act on are two different observations, and
+   * anything can happen in between. Moving that decision into the operating
+   * system removes the question rather than narrowing the window — no owner
+   * file, no pid check, no heartbeat, no staleness window, no reclamation, no
+   * guard, and nothing left behind to clean up after a crash.
    *
-   * The invariant both paths keep: **a live lock is never moved, and the
-   * canonical path is never exposed as free while a live owner holds it.**
+   * The database stays in SQLite's default rollback-journal mode. WAL is
+   * deliberately not enabled: its readers do not block an exclusive writer the
+   * way this relies on.
    *
    * @throws LockTimeoutError when the holder outlives the wait.
    */
   async withLock<T>(sourceId: string, critical: () => Promise<T>): Promise<T> {
-    const lockDir = path.join(this.stateDir, "locks", `${this.key(sourceId)}.lock`);
-    fs.mkdirSync(path.dirname(lockDir), { recursive: true });
+    const file = this.lockFile(sourceId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
 
     const deadline = Date.now() + this.lockOptions.timeoutMs;
-    let token: string | null = null;
-    for (;;) {
-      // A fresh acquirer never needs the guard: the canonical directory is
-      // free, and `mkdir` is the whole handshake.
-      token = this.tryAcquire(lockDir);
-      if (token !== null) break;
-
-      if (this.looksAbandoned(lockDir)) {
-        await this.beforeReclaim(sourceId);
-        token = await this.reclaimAbandoned(lockDir, sourceId);
-        if (token !== null) break;
-      }
-
-      if (Date.now() >= deadline) {
-        throw new LockTimeoutError(
-          `another capture holds the lock for ${sourceId} (${lockDir})`,
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, this.lockOptions.pollMs));
-    }
-
-    // We hold the lock, so anything retired beside it is the residue of a
-    // reclaimer that died mid-protocol: unreachable by name, and garbage.
-    this.sweepRetired(lockDir);
-
-    const heartbeat = setInterval(
-      () => this.beat(lockDir, token),
-      this.lockOptions.heartbeatMs,
-    );
-    // Never let a heartbeat keep a finished process alive.
-    heartbeat.unref();
-
-    try {
-      return await critical();
-    } finally {
-      clearInterval(heartbeat);
-      this.release(lockDir, token, sourceId);
-    }
-  }
-
-  /**
-   * Attempts one atomic acquisition.
-   *
-   * @returns The acquisition token, or null when somebody else holds the lock.
-   */
-  private tryAcquire(lockDir: string): string | null {
-    try {
-      fs.mkdirSync(lockDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
-      throw error;
-    }
-
     const token = randomUUID();
-    const stamp = this.now().toISOString();
-    const owner: LockOwner = {
-      pid: process.pid,
-      host: os.hostname(),
-      token,
-      acquiredAt: stamp,
-      heartbeatAt: stamp,
-    };
-    writeFileAtomic(path.join(lockDir, "owner.json"), JSON.stringify(owner));
-    return token;
-  }
+    let db: DatabaseType | null = null;
 
-  /** Refreshes our own heartbeat, and only ours. */
-  private beat(lockDir: string, token: string): void {
-    const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
-    if (owner === null || owner.token !== token) return;
-
-    try {
-      writeFileAtomic(
-        path.join(lockDir, "owner.json"),
-        JSON.stringify({ ...owner, heartbeatAt: this.now().toISOString() }),
-      );
-      const now = new Date();
-      fs.utimesSync(lockDir, now, now);
-    } catch {
-      // A lock that vanished under us is handled at release time.
-    }
-  }
-
-  /**
-   * Releases a lock we still hold.
-   *
-   * A directory that carries somebody else's token was reclaimed and
-   * re-acquired while we worked; one that carries no token at all is a
-   * replacement mid-acquire, which has not written its owner file yet. Deleting
-   * either would strip a live holder of its mutual exclusion, so only a
-   * directory still carrying our own token is removed.
-   */
-  private release(lockDir: string, token: string, sourceId: string): void {
-    const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
-    if (owner === null || owner.token !== token) {
-      this.logger({
-        level: "warn",
-        event: "lock.release_skipped",
-        loc: "PublicationJournal.release",
-        ctx: {
-          sourceId,
-          reason: owner === null ? "replacement-without-owner" : "reacquired-by-another",
-        },
-      });
-      return;
-    }
-    this.retire(lockDir);
-  }
-
-  /**
-   * Moves a directory aside under a name only this call knows, then deletes it.
-   *
-   * Callers must already have established that the directory is theirs to
-   * remove — a dead owner's lock they hold the guard for, or their own live
-   * lock. The rename makes the deletion act on a path nothing else can reach.
-   */
-  private retire(directory: string): boolean {
-    const retired = `${directory}.retired-${randomUUID()}`;
-    try {
-      fs.renameSync(directory, retired);
-    } catch {
-      // Already gone, or somebody else retired it first.
-      return false;
-    }
-    fs.rmSync(retired, { recursive: true, force: true });
-    fsyncDir(path.dirname(directory));
-    return true;
-  }
-
-  /**
-   * Test seam: awaited after a lock is judged abandoned and before the reclaim
-   * guard is taken, so a fixture can let a peer reclaim it in that window.
-   */
-  protected async beforeReclaim(_sourceId: string): Promise<void> {
-    return undefined;
-  }
-
-  /**
-   * Test seam: awaited after an abandoned lock has been renamed aside and
-   * before the reclaimer takes the canonical path for itself.
-   */
-  protected async afterReclaimRename(_sourceId: string): Promise<void> {
-    return undefined;
-  }
-
-  /**
-   * Reports whether a lock looks abandoned, without touching it.
-   *
-   * A live local owner is never abandoned, no matter how old the lock is: a
-   * capture that outlives the staleness window is slow, not dead.
-   */
-  private looksAbandoned(lockDir: string): boolean {
-    const owner = readJson<LockOwner>(path.join(lockDir, "owner.json"));
-
-    if (owner !== null && owner.host === os.hostname()) return !processAlive(owner.pid);
-
-    try {
-      const heartbeat =
-        owner === null ? fs.statSync(lockDir).mtimeMs : Date.parse(owner.heartbeatAt);
-      const age =
-        Date.now() - (Number.isNaN(heartbeat) ? fs.statSync(lockDir).mtimeMs : heartbeat);
-      return age > this.lockOptions.staleAfterMs;
-    } catch {
-      // The directory vanished; treat that as reclaimable so the caller retries.
-      return true;
-    }
-  }
-
-  /**
-   * Reclaims an abandoned lock, through a guard that serializes reclaimers.
-   *
-   * Reclaiming is the only operation that moves somebody else's directory, so
-   * it is the only one that can strip a live holder of its mutual exclusion.
-   * The guard is what makes that impossible: it is a separate mkdir-atomic
-   * directory, every reclaimer must hold it, and the canonical owner is
-   * validated *while it is held*. Because no second reclaimer can replace the
-   * canonical directory in that window, the directory being renamed is provably
-   * the dead one — never a live replacement — so there is no "put back a live
-   * lock I should not have taken" case to get wrong.
-   *
-   * After the rename the canonical path is briefly free, which is correct: its
-   * owner was dead, so no live holder exists to be displaced. A fresh acquirer
-   * may win that path, and if it does, this reclaimer simply has not acquired
-   * anything and never touches the newcomer's directory.
-   *
-   * @returns The acquisition token when the lock was reclaimed AND taken, or
-   *   null when it was not — in which case nothing was acquired.
-   */
-  private async reclaimAbandoned(
-    lockDir: string,
-    sourceId: string,
-  ): Promise<string | null> {
-    const guardDir = `${lockDir}.reclaim`;
-    const guardToken = this.acquireGuard(guardDir);
-    if (guardToken === null) return null;
-
-    let retired: string | null = null;
-    try {
-      // Validated under the guard: this verdict cannot be invalidated by
-      // another reclaimer, because they would need this guard to change it.
-      if (fs.existsSync(lockDir)) {
-        if (!this.looksAbandoned(lockDir)) return null;
-
-        retired = `${lockDir}.retired-${randomUUID()}`;
-        try {
-          fs.renameSync(lockDir, retired);
-        } catch {
-          // Vanished under us; the next pass sees a free path.
-          retired = null;
-          return null;
+    for (;;) {
+      const handle = new Database(file);
+      try {
+        // Bounded per attempt, so the loop stays in charge of the deadline.
+        const remaining = Math.max(1, deadline - Date.now());
+        handle.pragma(
+          `busy_timeout = ${Math.min(this.lockOptions.pollMs * 5, remaining)}`,
+        );
+        handle.exec("BEGIN EXCLUSIVE");
+        db = handle;
+        break;
+      } catch (error) {
+        handle.close();
+        if (!isBusy(error)) throw error;
+        if (Date.now() >= deadline) {
+          throw new LockTimeoutError(
+            `another capture holds the lock for ${sourceId} (${file})`,
+          );
         }
-        this.logger({
-          level: "warn",
-          event: "lock.reclaimed",
-          loc: "PublicationJournal.reclaimAbandoned",
-          ctx: { sourceId },
-        });
-        await this.afterReclaimRename(sourceId);
+        // Jittered, so two contenders do not retry in lockstep.
+        const pause = this.lockOptions.pollMs * (1 + Math.random());
+        await new Promise((resolve) => setTimeout(resolve, pause));
       }
-
-      // Take the canonical path for ourselves. EEXIST means a fresh acquirer
-      // got in while we were reclaiming: they hold the lock, we do not, and
-      // their directory is none of our business.
-      const token = this.tryAcquire(lockDir);
-      if (token === null) {
-        this.logger({
-          level: "warn",
-          event: "lock.reclaim_lost",
-          loc: "PublicationJournal.reclaimAbandoned",
-          ctx: { sourceId },
-        });
-      }
-      return token;
-    } finally {
-      // Only ever the directory this call renamed: its name is unique to this
-      // call, so nothing else can have taken it over.
-      if (retired !== null) fs.rmSync(retired, { recursive: true, force: true });
-      this.releaseGuard(guardDir, guardToken);
     }
-  }
-
-  /**
-   * Takes the reclaim guard.
-   *
-   * A guard whose owner is gone is reclaimed by the same rename-first move.
-   * That is safe here in a way it is not for the lock itself: guard holders do
-   * no vault work and never run user code, so a guard is held for microseconds
-   * and a dead guard owner is genuinely dead.
-   *
-   * @returns The guard token, or null when another reclaimer holds it.
-   */
-  private acquireGuard(guardDir: string): string | null {
-    const token = this.tryAcquire(guardDir);
-    if (token !== null) return token;
-
-    if (!this.looksAbandoned(guardDir)) return null;
 
     this.logger({
-      level: "warn",
-      event: "lock.guard_reclaimed",
-      loc: "PublicationJournal.acquireGuard",
-      ctx: { guardDir },
+      level: "debug",
+      event: "lock.acquired",
+      loc: "PublicationJournal.withLock",
+      ctx: { sourceId },
     });
-    this.retire(guardDir);
-    return this.tryAcquire(guardDir);
+
+    try {
+      this.recordHolder(db, token);
+      return await critical();
+    } finally {
+      // Either ending releases the file lock; the distinction only matters to
+      // the diagnostics row, which nothing depends on.
+      try {
+        db.exec("COMMIT");
+      } catch {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* the transaction is already gone */
+        }
+      }
+      db.close();
+    }
   }
 
-  /** Releases the reclaim guard, and only when it is still ours. */
-  private releaseGuard(guardDir: string, token: string): void {
-    const owner = readJson<LockOwner>(path.join(guardDir, "owner.json"));
-    if (owner === null || owner.token !== token) return;
-    this.retire(guardDir);
+  /** Vault-free location of one source's lock database. */
+  private lockFile(sourceId: string): string {
+    return path.join(this.stateDir, "locks", `${this.key(sourceId)}.db`);
   }
 
   /**
-   * Removes retired lock directories left behind by a reclaimer that died
-   * before it could clean up its own.
+   * Records who holds the lock, inside the transaction that holds it.
    *
-   * A retired directory is unreachable by name — nothing acquires it, nothing
-   * validates it — so it is garbage by construction, and a double delete
-   * between two sweepers is harmless. This only ever runs once the caller holds
-   * the lock itself.
+   * This is diagnostics and nothing else: correctness comes from the file lock
+   * the kernel is managing, never from this row.
    */
-  private sweepRetired(lockDir: string): void {
-    const directory = path.dirname(lockDir);
-    const prefix = `${path.basename(lockDir)}.retired-`;
+  private recordHolder(db: DatabaseType, token: string): void {
+    db.exec(
+      "CREATE TABLE IF NOT EXISTS lock_holder (id INTEGER PRIMARY KEY CHECK (id = 1), owner_token TEXT NOT NULL, acquired_at TEXT NOT NULL)",
+    );
+    db.prepare(
+      "INSERT INTO lock_holder (id, owner_token, acquired_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET owner_token = excluded.owner_token, acquired_at = excluded.acquired_at",
+    ).run(token, this.now().toISOString());
+  }
+
+  /**
+   * Reports who last held a source's lock, for `doctor`.
+   *
+   * @returns The recorded holder, or null when there is none or the lock is
+   *   busy — a reader cannot see into an exclusive transaction, and waiting for
+   *   one would make a diagnostic command block.
+   */
+  lockDiagnostics(sourceId: string): { ownerToken: string; acquiredAt: string } | null {
+    const file = this.lockFile(sourceId);
+    if (!fs.existsSync(file)) return null;
+
+    let db: DatabaseType | null = null;
     try {
-      for (const name of fs.readdirSync(directory)) {
-        if (name.startsWith(prefix)) {
-          fs.rmSync(path.join(directory, name), { recursive: true, force: true });
-        }
-      }
+      db = new Database(file, { readonly: true });
+      const row = db
+        .prepare(
+          "SELECT owner_token AS ownerToken, acquired_at AS acquiredAt FROM lock_holder WHERE id = 1",
+        )
+        .get() as { ownerToken: string; acquiredAt: string } | undefined;
+      return row ?? null;
     } catch {
-      // Nothing to sweep.
+      return null;
+    } finally {
+      db?.close();
     }
   }
 }

@@ -275,58 +275,49 @@ describe("PublicationJournal lock", () => {
     await expect(journal.withLock("abc123", async () => "ok")).resolves.toBe("ok");
   });
 
-  it("times out rather than stealing a fresh lock held by a live process", async () => {
-    const journal = makeJournal({ lock: { timeoutMs: 60, pollMs: 5 } });
-    const lockDir = path.join(stateDir, "locks", "abc123.lock");
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        pid: process.pid,
-        host: os.hostname(),
-        acquiredAt: new Date().toISOString(),
-      }),
-    );
+  it("keeps its lock file out of the vault", async () => {
+    const journal = makeJournal();
+    await journal.withLock("abc123", async () => "ok");
 
-    await expect(journal.withLock("abc123", async () => "ok")).rejects.toThrow(
-      LockTimeoutError,
-    );
-    expect(fs.existsSync(lockDir)).toBe(true);
+    expect(fs.existsSync(path.join(journal.stateDir, "locks", "abc123.db"))).toBe(true);
+    expect(fs.readdirSync(vaultDir)).toEqual([]);
   });
 
-  it("breaks a lock whose owning process is gone", async () => {
-    const journal = makeJournal({ lock: { timeoutMs: 500, pollMs: 5 } });
-    const lockDir = path.join(stateDir, "locks", "abc123.lock");
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        // Chosen by the test, not observed: a pid that no live process holds.
-        pid: 2_147_483_646,
-        host: os.hostname(),
-        acquiredAt: new Date().toISOString(),
-      }),
-    );
+  it("records the holder for diagnostics without deciding anything with it", async () => {
+    const journal = makeJournal();
 
-    await expect(journal.withLock("abc123", async () => "ok")).resolves.toBe("ok");
+    await journal.withLock("abc123", async () => "ok");
+
+    const owner = journal.lockDiagnostics("abc123");
+    expect(typeof owner?.ownerToken).toBe("string");
+    expect(typeof owner?.acquiredAt).toBe("string");
   });
 
-  it("breaks a lock older than the staleness window", async () => {
-    const journal = makeJournal({
-      lock: { timeoutMs: 500, pollMs: 5, staleAfterMs: 50 },
+  it("times out rather than waiting forever on a lock it cannot get", async () => {
+    const holder = makeJournal();
+    const contender = makeJournal({ lock: { timeoutMs: 80, pollMs: 5 } });
+
+    await holder.withLock("abc123", async () => {
+      await expect(contender.withLock("abc123", async () => "ok")).rejects.toThrow(
+        LockTimeoutError,
+      );
     });
-    const lockDir = path.join(stateDir, "locks", "abc123.lock");
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        pid: process.pid,
-        host: "some-other-host",
-        acquiredAt: new Date(Date.now() - 10_000).toISOString(),
-      }),
-    );
+  });
 
-    await expect(journal.withLock("abc123", async () => "ok")).resolves.toBe("ok");
+  it("leaves no timer behind that would keep a process alive", async () => {
+    const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
+    const before = process
+      .getActiveResourcesInfo()
+      .filter((resource) => resource === "Timeout").length;
+
+    await journal.withLock("abc123", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    const after = process
+      .getActiveResourcesInfo()
+      .filter((resource) => resource === "Timeout").length;
+    expect(after).toBeLessThanOrEqual(before);
   });
 });
 
@@ -378,146 +369,6 @@ describe("createJsonlLogger", () => {
       if (previous === undefined) delete process.env.SB_DOCS_LOG;
       else process.env.SB_DOCS_LOG = previous;
     }
-  });
-});
-
-// Regressions for the 2026-09-11 Codex review of commit ca3c3ad.
-describe("PublicationJournal lock ownership", () => {
-  const lockDirFor = (id: string) => path.join(stateDir, "locks", `${id}.lock`);
-
-  /** Writes a lock directory owned by somebody else. */
-  function plantLock(id: string, owner: Record<string, unknown>): string {
-    const lockDir = lockDirFor(id);
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify(owner));
-    return lockDir;
-  }
-
-  it("never expires a lock whose local owner is still alive, however old it looks", async () => {
-    // The staleness window exists for crashed holders, not slow ones. A live
-    // local pid is proof the holder is still working.
-    const journal = makeJournal({
-      lock: { timeoutMs: 60, pollMs: 5, staleAfterMs: 1 },
-    });
-    const lockDir = plantLock("abc123", {
-      pid: process.pid,
-      host: os.hostname(),
-      token: "somebody-elses-token",
-      acquiredAt: new Date(Date.now() - 3_600_000).toISOString(),
-      heartbeatAt: new Date(Date.now() - 3_600_000).toISOString(),
-    });
-    fs.utimesSync(
-      lockDir,
-      new Date(Date.now() - 3_600_000),
-      new Date(Date.now() - 3_600_000),
-    );
-
-    await expect(journal.withLock("abc123", async () => "ok")).rejects.toThrow(
-      LockTimeoutError,
-    );
-    expect(fs.existsSync(lockDir)).toBe(true);
-    expect(
-      JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8")).token,
-    ).toBe("somebody-elses-token");
-  });
-
-  it("refreshes its own heartbeat while it holds the lock", async () => {
-    const journal = makeJournal({
-      lock: { timeoutMs: 500, pollMs: 5, staleAfterMs: 60, heartbeatMs: 15 },
-    });
-
-    const beats = await journal.withLock("abc123", async () => {
-      const first = JSON.parse(
-        fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"),
-      ).heartbeatAt;
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      const second = JSON.parse(
-        fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"),
-      ).heartbeatAt;
-      return { first, second };
-    });
-
-    expect(beats.second).not.toBe(beats.first);
-  });
-
-  it("does not delete a replacement holder's lock when it releases", async () => {
-    const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
-
-    await journal.withLock("abc123", async () => {
-      // Somebody reclaimed this lock while we were working and is holding it
-      // now. Our release must not touch their directory.
-      fs.rmSync(lockDirFor("abc123"), { recursive: true, force: true });
-      plantLock("abc123", {
-        pid: process.pid,
-        host: os.hostname(),
-        token: "replacement-token",
-        acquiredAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
-      });
-    });
-
-    expect(fs.existsSync(lockDirFor("abc123"))).toBe(true);
-    expect(
-      JSON.parse(fs.readFileSync(path.join(lockDirFor("abc123"), "owner.json"), "utf8"))
-        .token,
-    ).toBe("replacement-token");
-  });
-
-  it("leaves a replacement directory alone when it has no owner file yet", async () => {
-    const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5 } });
-
-    await journal.withLock("abc123", async () => {
-      // A replacement mid-acquire: the directory exists, its owner file does
-      // not yet. Releasing must not mistake that for our own lock.
-      fs.rmSync(lockDirFor("abc123"), { recursive: true, force: true });
-      fs.mkdirSync(lockDirFor("abc123"), { recursive: true });
-    });
-
-    expect(fs.existsSync(lockDirFor("abc123"))).toBe(true);
-  });
-
-  it("does not leave a heartbeat timer behind that would keep a process alive", async () => {
-    const journal = makeJournal({ lock: { timeoutMs: 200, pollMs: 5, heartbeatMs: 10 } });
-    const before = process
-      .getActiveResourcesInfo()
-      .filter((resource) => resource === "Timeout").length;
-
-    await journal.withLock("abc123", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    });
-
-    const after = process
-      .getActiveResourcesInfo()
-      .filter((resource) => resource === "Timeout").length;
-    expect(after).toBeLessThanOrEqual(before);
-  });
-
-  it("lets exactly one of two simultaneous reclaimers win a dead owner's lock", async () => {
-    plantLock("abc123", {
-      // Chosen by the test, not observed: a pid no live process holds.
-      pid: 2_147_483_646,
-      host: os.hostname(),
-      token: "dead-owners-token",
-      acquiredAt: new Date().toISOString(),
-      heartbeatAt: new Date().toISOString(),
-    });
-
-    const spans: { enter: number; exit: number }[] = [];
-    const contend = (journal: PublicationJournal) =>
-      journal.withLock("abc123", async () => {
-        const enter = Date.now();
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        spans.push({ enter, exit: Date.now() });
-      });
-
-    await Promise.all([
-      contend(makeJournal({ lock: { timeoutMs: 2000, pollMs: 5 } })),
-      contend(makeJournal({ lock: { timeoutMs: 2000, pollMs: 5 } })),
-    ]);
-
-    expect(spans).toHaveLength(2);
-    const [first, second] = spans.sort((a, b) => a.enter - b.enter);
-    expect(second.enter).toBeGreaterThanOrEqual(first.exit);
   });
 });
 
@@ -798,323 +649,178 @@ describe("PublicationJournal multiprocess lock", () => {
     });
   }
 
-  /** Resolves with every JSON line the child printed, once it exits. */
-  function collect(child: LockHolderProcess): Promise<Record<string, unknown>[]> {
+  /** Resolves with the child's JSON lines and how it exited. */
+  function collect(child: LockHolderProcess): Promise<{
+    lines: Record<string, unknown>[];
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }> {
     return new Promise((resolve) => {
       let out = "";
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
         out += chunk;
       });
-      child.on("close", () =>
-        resolve(
-          out
+      child.on("close", (code, signal) =>
+        resolve({
+          lines: out
             .split("\n")
             .filter((line) => line.startsWith("{"))
             .map((line) => JSON.parse(line)),
-        ),
+          code,
+          signal,
+        }),
       );
     });
   }
 
-  /** Waits until the child reports it holds the lock. */
-  function waitForAcquire(child: LockHolderProcess): Promise<void> {
-    return new Promise((resolve, reject) => {
-      let out = "";
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        out += chunk;
-        if (out.includes('"acquired"')) resolve();
-      });
-      child.on("close", () => reject(new Error(`child exited before acquiring: ${out}`)));
-    });
-  }
-
-  const reclaimerFixture = path.join(
-    process.cwd(),
-    "test",
-    "fixtures",
-    "vault",
-    "lock-reclaimer.ts",
-  );
-
-  const lockDirFor = (id: string) => path.join(stateDir, "locks", `${id}.lock`);
-
-  /** Spawns the reclaimer fixture, which can pause or die mid-protocol. */
-  function spawnReclaimer(env: Record<string, string>): LockHolderProcess {
-    return spawn(viteNode, [reclaimerFixture], {
-      env: {
-        ...process.env,
-        STATE_DIR: stateDir,
-        VAULT_PATH: vaultDir,
-        SOURCE_ID: "contended",
-        ...env,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  }
-
-  /** Alias used by the reclaim tests, which read lines rather than wait. */
-  const collectLines = collect;
-
-  /** Plants a lock whose owning process provably does not exist. */
-  function plantDeadLock(id: string): string {
-    const lockDir = lockDirFor(id);
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        // Chosen by the test, not observed: a pid no live process holds.
-        pid: 2_147_483_646,
-        host: os.hostname(),
-        token: "dead-owners-token",
-        acquiredAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
-      }),
-    );
-    return lockDir;
-  }
-
-  /** Waits until a file appears, which is how the fixtures signal a barrier. */
-  async function waitForFile(file: string): Promise<void> {
-    for (let tick = 0; tick < 2000 && !fs.existsSync(file); tick += 1) {
+  /** Waits for a barrier file the child writes, rather than for a duration. */
+  async function waitForFile(file: string, timeoutMs = 20_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!fs.existsSync(file)) {
+      if (Date.now() >= deadline) throw new Error(`barrier never appeared: ${file}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    if (!fs.existsSync(file)) throw new Error(`barrier file never appeared: ${file}`);
   }
 
-  it("serializes two real processes over one state directory", async () => {
-    const [first, second] = await Promise.all([
-      collect(spawnHolder({ SOURCE_ID: "shared", HOLD_MS: "300", TIMEOUT_MS: "20000" })),
-      collect(spawnHolder({ SOURCE_ID: "shared", HOLD_MS: "300", TIMEOUT_MS: "20000" })),
-    ]);
+  const fileIn = (name: string) => path.join(stateDir, name);
 
-    const spanOf = (lines: Record<string, unknown>[]) => ({
-      enter: Number(lines.find((line) => line.event === "acquired")?.at),
-      exit: Number(lines.find((line) => line.event === "releasing")?.at),
-    });
-    const spans = [spanOf(first), spanOf(second)].sort((a, b) => a.enter - b.enter);
-
-    expect(spans[0].enter).toBeGreaterThan(0);
-    expect(spans[1].enter).toBeGreaterThanOrEqual(spans[0].exit);
-  }, 60_000);
-
-  it("does not reclaim a lock a live process is still holding", async () => {
-    const holder = spawnHolder({
-      SOURCE_ID: "held",
-      MODE: "hang",
+  it("makes a second process wait, and never lets the two overlap", async () => {
+    const witness = fileIn("witness");
+    const first = spawnHolder({
+      SOURCE_ID: "shared",
+      WITNESS_FILE: witness,
+      ACQUIRED_FILE: fileIn("acquired-1"),
+      RELEASE_FILE: fileIn("release-1"),
+      ENTRIES_FILE: fileIn("entries"),
       TIMEOUT_MS: "20000",
     });
-    await waitForAcquire(holder);
+    const firstDone = collect(first);
+    await waitForFile(fileIn("acquired-1"));
 
-    try {
-      // A staleness window of 1 ms would expire this lock instantly if age
-      // were the only test; the holder is alive, so it must not be broken.
-      const journal = makeJournal({
-        lock: { timeoutMs: 150, pollMs: 5, staleAfterMs: 1 },
-      });
-      await expect(journal.withLock("held", async () => "ok")).rejects.toThrow(
-        LockTimeoutError,
-      );
-    } finally {
-      holder.kill("SIGKILL");
-      await new Promise((resolve) => holder.on("close", resolve));
-    }
-  }, 60_000);
-
-  it("does not delete a replacement lock a peer acquired while it was deciding", async () => {
-    // A observes an abandoned lock and pauses before acting on that decision.
-    // While it is paused, this process reclaims the same lock and takes it.
-    // A must not delete what it never exclusively captured.
-    const pausedFile = path.join(stateDir, "paused");
-    const goFile = path.join(stateDir, "go");
-    const lockDir = path.join(stateDir, "locks", "contended.lock");
-
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(lockDir, "owner.json"),
-      JSON.stringify({
-        // Chosen by the test, not observed: a pid no live process holds.
-        pid: 2_147_483_646,
-        host: os.hostname(),
-        token: "dead-owners-token",
-        acquiredAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
-      }),
-    );
-
-    const child = spawn(
-      path.join(process.cwd(), "node_modules", ".bin", "vite-node"),
-      [path.join(process.cwd(), "test", "fixtures", "vault", "lock-reclaimer.ts")],
-      {
-        env: {
-          ...process.env,
-          STATE_DIR: stateDir,
-          VAULT_PATH: vaultDir,
-          SOURCE_ID: "contended",
-          MODE: "pause-before-reclaim",
-          PAUSED_FILE: pausedFile,
-          GO_FILE: goFile,
-          WITNESS_FILE: path.join(stateDir, "witness-before"),
-          TIMEOUT_MS: "400",
-          HOLD_MS: "20",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-
-    const lines: Record<string, unknown>[] = [];
-    let out = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      out += chunk;
-      for (const line of out.split("\n")) {
-        if (line.startsWith("{")) lines.push(JSON.parse(line));
-      }
-      out = out.slice(out.lastIndexOf("\n") + 1);
-    });
-    const closed = new Promise<void>((resolve) => child.on("close", () => resolve()));
-
-    try {
-      while (!fs.existsSync(pausedFile)) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-
-      // This process now reclaims and holds the lock for real.
-      const journal = makeJournal({ lock: { timeoutMs: 2000, pollMs: 5 } });
-      let tokenWhileHeld = "";
-      let heldThroughout = true;
-
-      await journal.withLock("contended", async () => {
-        tokenWhileHeld = JSON.parse(
-          fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"),
-        ).token;
-        fs.writeFileSync(goFile, "go");
-
-        // Let the released child run while we are still inside the section.
-        for (let tick = 0; tick < 20; tick += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          const owner = fs.existsSync(path.join(lockDir, "owner.json"))
-            ? JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"))
-            : null;
-          if (owner === null || owner.token !== tokenWhileHeld) heldThroughout = false;
-          if (lines.some((line) => line.event === "acquired")) heldThroughout = false;
-        }
-      });
-
-      expect(tokenWhileHeld).not.toBe("dead-owners-token");
-      // Our lock survived the paused reclaimer, and it never got in with us.
-      expect(heldThroughout).toBe(true);
-    } finally {
-      if (!fs.existsSync(goFile)) fs.writeFileSync(goFile, "go");
-      await closed;
-    }
-  }, 60_000);
-
-  it("keeps a fresh acquirer out and stays out itself while paused mid-reclaim", async () => {
-    // The reclaimer has already renamed the dead lock aside and is paused. The
-    // canonical path is momentarily free, so a fresh acquirer may take it —
-    // and once it has, the paused reclaimer must NOT also get in.
-    const files = {
-      paused: path.join(stateDir, "paused"),
-      go: path.join(stateDir, "go"),
-      witness: path.join(stateDir, "witness"),
-      entries: path.join(stateDir, "entries"),
-    };
-    plantDeadLock("contended");
-
-    const reclaimer = spawnReclaimer({
-      MODE: "pause-after-rename",
-      PAUSED_FILE: files.paused,
-      GO_FILE: files.go,
-      WITNESS_FILE: files.witness,
-      ENTRIES_FILE: files.entries,
-      TIMEOUT_MS: "1500",
-      HOLD_MS: "40",
-    });
-    const reclaimerLines = collectLines(reclaimer);
-
-    await waitForFile(files.paused);
-
-    // A third process acquires while the reclaimer is paused mid-protocol.
-    const acquirer = spawnReclaimer({
-      MODE: "acquire",
-      WITNESS_FILE: files.witness,
-      ENTRIES_FILE: files.entries,
-      TIMEOUT_MS: "1500",
-      HOLD_MS: "150",
-    });
-    const acquirerLines = collectLines(acquirer);
-
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    fs.writeFileSync(files.go, "go");
-
-    const [fromReclaimer, fromAcquirer] = await Promise.all([
-      reclaimerLines,
-      acquirerLines,
-    ]);
-
-    // The witness is an exclusive create, so an overlap is a recorded fact.
-    expect(fromReclaimer.some((line) => line.event === "overlap")).toBe(false);
-    expect(fromAcquirer.some((line) => line.event === "overlap")).toBe(false);
-    expect(fromAcquirer.some((line) => line.event === "acquired")).toBe(true);
-
-    // Whoever entered, they entered one at a time.
-    const entries = fs.existsSync(files.entries)
-      ? fs.readFileSync(files.entries, "utf8").trim().split("\n").filter(Boolean)
-      : [];
-    expect(entries.length).toBeGreaterThanOrEqual(1);
-    expect(new Set(entries).size).toBe(entries.length);
-  }, 60_000);
-
-  it("survives a reclaimer killed immediately after it renamed the dead lock", async () => {
-    const witness = path.join(stateDir, "witness");
-    plantDeadLock("contended");
-
-    const dying = spawnReclaimer({
-      MODE: "die-after-rename",
+    const second = spawnHolder({
+      SOURCE_ID: "shared",
       WITNESS_FILE: witness,
-      TIMEOUT_MS: "1500",
-      HOLD_MS: "10",
+      ACQUIRED_FILE: fileIn("acquired-2"),
+      RELEASE_FILE: fileIn("release-2"),
+      ENTRIES_FILE: fileIn("entries"),
+      TIMEOUT_MS: "20000",
     });
-    const dyingLines = await collectLines(dying);
-    expect(dyingLines.some((line) => line.event === "dying")).toBe(true);
-    expect(dyingLines.some((line) => line.event === "acquired")).toBe(false);
+    const secondDone = collect(second);
 
-    // The dead reclaimer left its guard, and a retired directory, behind.
-    const journal = makeJournal({ lock: { timeoutMs: 5000, pollMs: 10 } });
-    let observedToken = "";
-    await expect(
-      journal.withLock("contended", async () => {
-        observedToken = JSON.parse(
-          fs.readFileSync(path.join(lockDirFor("contended"), "owner.json"), "utf8"),
-        ).token;
-        return "ok";
-      }),
-    ).resolves.toBe("ok");
+    // Give the contender real time to try, then assert it is still outside:
+    // its own barrier file is the proof, not a timing guess.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    expect(fs.existsSync(fileIn("acquired-2"))).toBe(false);
+    expect(fs.readFileSync(witness, "utf8")).toBe(String(first.pid));
 
-    expect(observedToken).not.toBe("dead-owners-token");
-    // Eventual cleanup: nothing retired is left lying around afterwards.
-    const leftovers = fs
-      .readdirSync(path.join(stateDir, "locks"))
-      .filter((name) => name.includes(".retired-"));
-    expect(leftovers).toEqual([]);
-  }, 60_000);
+    fs.writeFileSync(fileIn("release-1"), "go");
+    await waitForFile(fileIn("acquired-2"));
+    fs.writeFileSync(fileIn("release-2"), "go");
 
-  it("reclaims the lock of a process that was killed while holding it", async () => {
+    const [one, two] = await Promise.all([firstDone, secondDone]);
+    expect(one.code).toBe(0);
+    expect(two.code).toBe(0);
+    expect(one.signal).toBeNull();
+    expect(two.signal).toBeNull();
+    expect([...one.lines, ...two.lines].some((line) => line.event === "overlap")).toBe(
+      false,
+    );
+    expect(fs.readFileSync(fileIn("entries"), "utf8").trim().split("\n")).toHaveLength(2);
+  }, 90_000);
+
+  it("hands the lock straight to the next process when a holder is killed", async () => {
     const holder = spawnHolder({
       SOURCE_ID: "killed",
       MODE: "hang",
+      ACQUIRED_FILE: fileIn("acquired-hang"),
       TIMEOUT_MS: "20000",
     });
-    await waitForAcquire(holder);
+    const holderDone = collect(holder);
+    await waitForFile(fileIn("acquired-hang"));
+
     holder.kill("SIGKILL");
-    await new Promise((resolve) => holder.on("close", resolve));
+    const dead = await holderDone;
+    expect(dead.signal).toBe("SIGKILL");
 
-    // The lock directory outlived its owner; the pid is what proves it is dead.
-    expect(fs.existsSync(path.join(stateDir, "locks", "killed.lock"))).toBe(true);
-
+    // No cleanup step, no staleness window, no reclamation: the kernel
+    // released the file lock when the process died.
+    const started = Date.now();
     const journal = makeJournal({ lock: { timeoutMs: 5000, pollMs: 10 } });
     await expect(journal.withLock("killed", async () => "ok")).resolves.toBe("ok");
-  }, 60_000);
+    expect(Date.now() - started).toBeLessThan(3000);
+  }, 90_000);
+
+  it("serializes three processes over one source", async () => {
+    const witness = fileIn("witness-3");
+    const children = [0, 1, 2].map(() =>
+      spawnHolder({
+        SOURCE_ID: "three",
+        WITNESS_FILE: witness,
+        ENTRIES_FILE: fileIn("entries-3"),
+        HOLD_MS: "80",
+        TIMEOUT_MS: "20000",
+      }),
+    );
+
+    const results = await Promise.all(children.map(collect));
+
+    for (const result of results) {
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.lines.some((line) => line.event === "acquired")).toBe(true);
+      expect(result.lines.some((line) => line.event === "overlap")).toBe(false);
+    }
+    const entries = fs.readFileSync(fileIn("entries-3"), "utf8").trim().split("\n");
+    expect(entries).toHaveLength(3);
+    expect(new Set(entries).size).toBe(3);
+  }, 90_000);
+
+  it("does not make one source wait for another", async () => {
+    const first = spawnHolder({
+      SOURCE_ID: "alpha",
+      WITNESS_FILE: fileIn("witness-alpha"),
+      ACQUIRED_FILE: fileIn("acquired-alpha"),
+      RELEASE_FILE: fileIn("release-alpha"),
+      TIMEOUT_MS: "20000",
+    });
+    const firstDone = collect(first);
+    await waitForFile(fileIn("acquired-alpha"));
+
+    const second = spawnHolder({
+      SOURCE_ID: "beta",
+      WITNESS_FILE: fileIn("witness-beta"),
+      ACQUIRED_FILE: fileIn("acquired-beta"),
+      RELEASE_FILE: fileIn("release-beta"),
+      TIMEOUT_MS: "20000",
+    });
+    const secondDone = collect(second);
+
+    // Beta gets in while alpha is still holding: different sources are
+    // genuinely independent.
+    await waitForFile(fileIn("acquired-beta"));
+    expect(fs.existsSync(fileIn("acquired-alpha"))).toBe(true);
+
+    fs.writeFileSync(fileIn("release-alpha"), "go");
+    fs.writeFileSync(fileIn("release-beta"), "go");
+    const [one, two] = await Promise.all([firstDone, secondDone]);
+    expect(one.code).toBe(0);
+    expect(two.code).toBe(0);
+  }, 90_000);
+
+  it("releases a lock whose holder failed inside its critical section", async () => {
+    const failing = await collect(
+      spawnHolder({
+        SOURCE_ID: "throwing",
+        MODE: "throw",
+        ACQUIRED_FILE: fileIn("acquired-throw"),
+        TIMEOUT_MS: "20000",
+      }),
+    );
+    expect(failing.code).toBe(1);
+    expect(failing.lines.some((line) => line.event === "failed")).toBe(true);
+
+    const journal = makeJournal({ lock: { timeoutMs: 5000, pollMs: 10 } });
+    await expect(journal.withLock("throwing", async () => "ok")).resolves.toBe("ok");
+  }, 90_000);
 });
