@@ -278,6 +278,177 @@ describe("capture", () => {
     expect(result.outcomes[0]?.publication?.status).toBe("published");
   });
 
+  it("deduplicates a sequential (non-concurrent) duplicate final URL", async () => {
+    let publishCount = 0;
+    const publisher: Publisher = {
+      publish: async () => {
+        publishCount += 1;
+        return published();
+      },
+    };
+
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      // Fully sequential: the second occurrence starts only after the first
+      // has completely resolved, so no in-flight promise is ever shared —
+      // only a persistent cache keyed by URL catches this.
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/seq", depth: 1 }),
+      );
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/seq", depth: 1 }),
+      );
+    });
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/seq" },
+      {
+        scraperService:
+          scraperService as unknown as CaptureDependencies["scraperService"],
+        publisher,
+      },
+    );
+
+    expect(publishCount).toBe(1);
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.outcomes[0]?.publication?.status).toBe("published");
+  });
+
+  it("deduplicates the same final URL discovered again at a later depth", async () => {
+    let publishCount = 0;
+    const publisher: Publisher = {
+      publish: async () => {
+        publishCount += 1;
+        return published();
+      },
+    };
+
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/shared", depth: 1 }),
+      );
+      // Same canonical URL, discovered again one level deeper.
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/shared", depth: 2 }),
+      );
+    });
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/shared" },
+      {
+        scraperService:
+          scraperService as unknown as CaptureDependencies["scraperService"],
+        publisher,
+      },
+    );
+
+    // Only one real publish call, even though two page outcomes are recorded
+    // (dedup keys on URL alone; page outcomes still key on URL+depth).
+    expect(publishCount).toBe(1);
+    expect(result.outcomes).toHaveLength(2);
+    expect(result.outcomes.every((o) => o.publication?.status === "published")).toBe(
+      true,
+    );
+  });
+
+  it("catches a publisher that throws synchronously instead of rejecting a promise", async () => {
+    const publisher: Publisher = {
+      publish: (): Promise<Publication> => {
+        // A synchronous throw, not `Promise.reject(...)` — this must never
+        // escape into the caller's progress callback undetected.
+        throw new Error("publisher blew up synchronously");
+      },
+    };
+
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/sync-throw", depth: 0 }),
+      );
+    });
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/sync-throw" },
+      {
+        scraperService:
+          scraperService as unknown as CaptureDependencies["scraperService"],
+        publisher,
+      },
+    );
+
+    expect(result.cancelled).toBe(false);
+    expect(result.run_error).toBeUndefined();
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.outcomes[0]?.error).toBe("publisher blew up synchronously");
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("keeps distinct terminal statuses for the same page as separate outcomes rather than overwriting", async () => {
+    // Two different terminal events for the exact same (url, depth) — this
+    // should not normally happen, but the dedup key must not silently merge
+    // a "not-found" tag with an unrelated "fetch-failed" tag into one lossy
+    // entry.
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        skipEvent({
+          currentUrl: "https://example.com/mixed",
+          depth: 1,
+          outcome: "not-found",
+        }),
+      );
+      await progressCallback(
+        skipEvent({
+          currentUrl: "https://example.com/mixed",
+          depth: 1,
+          outcome: "fetch-failed",
+          errorMessage: "second distinct failure",
+        }),
+      );
+    });
+    const publisher = new ScriptedPublisher(async () => published());
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/mixed" },
+      {
+        scraperService:
+          scraperService as unknown as CaptureDependencies["scraperService"],
+        publisher,
+      },
+    );
+
+    expect(result.outcomes).toHaveLength(2);
+    const notFound = result.outcomes.find((o) => o.skipped === "not-found");
+    const fetchFailed = result.outcomes.find((o) => o.skipped === "fetch-failed");
+    expect(notFound).toBeDefined();
+    expect(fetchFailed).toBeDefined();
+    expect(fetchFailed?.error).toBe("second distinct failure");
+  });
+
+  it("carries the sanitized error message from a tagged fetch-failed event into the outcome", async () => {
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        skipEvent({
+          currentUrl: "https://example.com/child-failed",
+          depth: 1,
+          outcome: "fetch-failed",
+          errorMessage: "connection reset while fetching child",
+        }),
+      );
+    });
+    const publisher = new ScriptedPublisher(async () => published());
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      {
+        scraperService:
+          scraperService as unknown as CaptureDependencies["scraperService"],
+        publisher,
+      },
+    );
+
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.outcomes[0]?.skipped).toBe("fetch-failed");
+    expect(result.outcomes[0]?.error).toBe("connection reset while fetching child");
+  });
+
   it("records a 404 as a skipped outcome, retaining the published note from the crawl", async () => {
     const scraperService = new FakeScraperService(async (progressCallback) => {
       await progressCallback(
@@ -398,7 +569,7 @@ describe("capture", () => {
     expect(result.exitCode).toBe(130);
     expect(result.outcomes).toHaveLength(1);
     expect(result.outcomes[0]?.publication?.status).toBe("published");
-    expect(result.runError).toBeUndefined();
+    expect(result.run_error).toBeUndefined();
   });
 
   it("treats an in-flight publish failure as cancellation once the signal aborts, not a plain error outcome", async () => {
@@ -431,7 +602,7 @@ describe("capture", () => {
     expect(result.cancelled).toBe(true);
     expect(result.exitCode).toBe(130);
     expect(result.outcomes).toHaveLength(0);
-    expect(result.runError).toBeUndefined();
+    expect(result.run_error).toBeUndefined();
   });
 
   it("dedupes a tagged root failure against the same error re-thrown from scrape", async () => {
@@ -459,7 +630,7 @@ describe("capture", () => {
 
     expect(result.outcomes).toHaveLength(1);
     expect(result.outcomes[0]?.skipped).toBe("fetch-failed");
-    expect(result.runError).toBe("root fetch exploded");
+    expect(result.run_error).toBe("root fetch exploded");
     expect(result.exitCode).toBe(1);
   });
 });
@@ -549,5 +720,89 @@ describe("capture with a real BaseScraperStrategy", () => {
     // acquisition-failure accounting: the callback swallows them, so from the
     // strategy's perspective both pages "completed" successfully.
     expect(strategy.failedChildPagesCount).toBe(0);
+  });
+
+  it("integrated: a fatal root 404 produces exactly one not-found page outcome plus one separate run error", async () => {
+    // Exercises the real BaseScraperStrategy code path end to end: the
+    // NOT_FOUND branch tags the event "not-found" and throws a fatal
+    // ScraperError for the root, and the generic exception handler must not
+    // re-tag that same error as "fetch-failed" before it reaches capture()'s
+    // outer catch as a separate run_error.
+    const strategy = new InspectableStrategy(loadConfig());
+    strategy.processItem.mockResolvedValueOnce({
+      url: "https://example.com/",
+      links: [],
+      status: FetchStatus.NOT_FOUND,
+    });
+
+    class FakeRegistry extends ScraperRegistry {
+      getStrategy() {
+        return strategy;
+      }
+    }
+    const scraperService = new ScraperService(new FakeRegistry(loadConfig()));
+    const publisher = new ScriptedPublisher(async () => published());
+
+    const result = await capture(
+      {
+        options: baseOptions({ maxDepth: 1, maxPages: 5 }),
+        requestedUrl: "https://example.com/",
+      },
+      { scraperService, publisher },
+    );
+
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.outcomes[0]?.skipped).toBe("not-found");
+    expect(result.outcomes[0]?.sourceUrl).toBe("https://example.com/");
+    expect(result.run_error).toBeDefined();
+    expect(result.run_error).toContain("Root page not found");
+    expect(result.exitCode).toBe(1);
+    expect(publisher.calls).toHaveLength(0);
+  });
+
+  it("integrated: a root-success/child-404 crawl publishes the root and records the child as not-found", async () => {
+    const strategy = new InspectableStrategy(loadConfig());
+    strategy.processItem
+      .mockResolvedValueOnce({
+        url: "https://example.com/",
+        links: ["https://example.com/gone"],
+        status: FetchStatus.SUCCESS,
+        content: {
+          title: "Root",
+          textContent: "Root content",
+          links: [],
+          errors: [],
+          chunks: [],
+        },
+      })
+      .mockResolvedValueOnce({
+        url: "https://example.com/gone",
+        links: [],
+        status: FetchStatus.NOT_FOUND,
+      });
+
+    class FakeRegistry extends ScraperRegistry {
+      getStrategy() {
+        return strategy;
+      }
+    }
+    const scraperService = new ScraperService(new FakeRegistry(loadConfig()));
+    const publisher = new ScriptedPublisher(async () => published());
+
+    const result = await capture(
+      {
+        options: baseOptions({ maxDepth: 1, maxPages: 5 }),
+        requestedUrl: "https://example.com/",
+      },
+      { scraperService, publisher },
+    );
+
+    expect(result.run_error).toBeUndefined();
+    expect(result.outcomes).toHaveLength(2);
+    const root = result.outcomes.find((o) => o.sourceUrl === "https://example.com/");
+    const child = result.outcomes.find((o) => o.sourceUrl === "https://example.com/gone");
+    expect(root?.publication?.status).toBe("published");
+    expect(child?.skipped).toBe("not-found");
+    expect(result.exitCode).toBe(2);
   });
 });

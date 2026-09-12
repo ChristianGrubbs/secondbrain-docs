@@ -160,10 +160,24 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
         scrapeMode: ScrapeMode.Auto,
       };
 
-      const result = await capture(
-        { options, requestedUrl },
-        { scraperService, publisher },
-      );
+      // Command-scoped cancellation: a SIGINT during this capture aborts it
+      // (exit 130, preserving prior outcomes) without touching `main.ts` —
+      // Node lets any number of listeners share one signal, so this handler
+      // coexists with the process's default SIGINT behavior and is removed
+      // as soon as this command finishes, successfully or not.
+      const controller = new AbortController();
+      const onSigint = (): void => controller.abort();
+      process.on("SIGINT", onSigint);
+
+      let result: CaptureResult;
+      try {
+        result = await capture(
+          { options, requestedUrl, signal: controller.signal },
+          { scraperService, publisher },
+        );
+      } finally {
+        process.off("SIGINT", onSigint);
+      }
 
       report(result, { stdout, stderr, json: args.json === true });
 
@@ -201,8 +215,8 @@ function report(
     }
   }
 
-  if (result.runError !== undefined) {
-    sinks.stderr(`❌ run error: ${result.runError}`);
+  if (result.run_error !== undefined) {
+    sinks.stderr(`❌ run error: ${result.run_error}`);
   }
   if (result.cancelled) {
     sinks.stderr("cancelled");

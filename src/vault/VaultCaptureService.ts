@@ -17,7 +17,10 @@ import type { ScraperService } from "../scraper/ScraperService";
 import type { ScraperOptions, ScraperProgressEvent } from "../scraper/types";
 import type { Publication, Publisher, SourceDocument } from "./types";
 
-/** One page's outcome, keyed by final URL and crawl depth. */
+/** Tag distinguishing which terminal event produced one page outcome. */
+type TerminalCategory = "not-modified" | "not-found" | "fetch-failed" | "result";
+
+/** One page's outcome, keyed by final URL, crawl depth, and terminal status. */
 export type CapturePageOutcome = {
   /** Final canonical URL of the page, as reported by the scraper. */
   sourceUrl: string;
@@ -27,7 +30,10 @@ export type CapturePageOutcome = {
   index: "not-attempted";
   /** Present when the page was published, unchanged, replaced, or conflicted. */
   publication?: Publication;
-  /** Present when publishing this page threw. */
+  /**
+   * Present when publishing this page threw, or when a tagged `fetch-failed`
+   * scraper event carried a sanitized error message.
+   */
   error?: string;
   /**
    * Present when the scraper reported a tagged terminal event — 304, 404, or
@@ -42,7 +48,13 @@ export type CaptureExitCode = 0 | 1 | 2 | 130;
 
 /** The full result of one capture run. */
 export interface CaptureResult {
-  /** One outcome per distinct (URL, depth) page, in the order last touched. */
+  /**
+   * One outcome per distinct (URL, depth, terminal status) page. Repeated
+   * events for the same page and terminal status update that same entry;
+   * distinct terminal statuses for the same page (which should not normally
+   * both occur for one queue item) are kept as separate entries rather than
+   * silently overwriting one another.
+   */
   outcomes: CapturePageOutcome[];
   /** True when the run ended via cancellation (signal abort). */
   cancelled: boolean;
@@ -50,9 +62,10 @@ export interface CaptureResult {
    * Set when the scraper itself failed outside any single page's tagged
    * event — a separate summary field, never a synthesized page outcome, so a
    * terminal exception that was already tagged per-page is never double
-   * counted.
+   * counted. Named `run_error` (not `runError`) to match the documented wire
+   * contract for the CLI's JSON envelope.
    */
-  runError?: string;
+  run_error?: string;
   exitCode: CaptureExitCode;
 }
 
@@ -115,9 +128,14 @@ function deriveExitCode(
   return 2;
 }
 
-/** Builds the dedup key for one page outcome. */
-function pageKey(url: string, depth: number): string {
-  return `${depth} ${url}`;
+/**
+ * Builds the dedup key for one page outcome: final URL, depth, and terminal
+ * status. Including status means distinct terminal events for the same page
+ * (e.g. a tagged 404 and, separately, a publication result) never overwrite
+ * each other; repeated events sharing all three still update one entry.
+ */
+function pageKey(url: string, depth: number, category: TerminalCategory): string {
+  return `${depth}::${category}::${url}`;
 }
 
 /**
@@ -139,31 +157,40 @@ export async function capture(
   const { scraperService, publisher } = deps;
 
   const pages = new Map<string, CapturePageOutcome>();
-  // Deduplicates concurrent publish attempts for the same final URL — two
-  // queue items (e.g. a redirect-canonicalized duplicate) can resolve to one
-  // page inside the same concurrent batch; only one publish call is made and
-  // both callers await the same in-flight promise.
-  const inFlight = new Map<string, Promise<Publication>>();
+
+  // Run-scoped publication cache, keyed by final URL only (not depth), and
+  // never evicted: the same canonical URL discovered concurrently,
+  // sequentially, or at a different depth later in the same crawl shares one
+  // publish call and its settled result, rather than publishing again.
+  const publicationsByUrl = new Map<string, Promise<Publication>>();
 
   const recordSkip = (
     progress: ScraperProgressEvent,
-    outcome: "not-modified" | "not-found" | "fetch-failed",
+    outcomeTag: "not-modified" | "not-found" | "fetch-failed",
   ): void => {
-    const key = pageKey(progress.currentUrl, progress.depth);
-    const existing = pages.get(key);
+    const key = pageKey(progress.currentUrl, progress.depth, outcomeTag);
+
     // A 304 only counts as "unchanged" when this same run already verified
     // the source by publishing it; an unverified 304 is recorded as a
     // skipped outcome rather than assumed successful, since this task's
     // capture is always a fresh, non-refresh crawl with nothing else to
     // compare it against.
-    if (outcome === "not-modified" && existing?.publication !== undefined) {
-      return;
+    if (outcomeTag === "not-modified") {
+      const publishedKey = pageKey(progress.currentUrl, progress.depth, "result");
+      if (pages.get(publishedKey)?.publication !== undefined) {
+        return;
+      }
     }
+
     pages.set(key, {
       sourceUrl: progress.currentUrl,
       depth: progress.depth,
       index: "not-attempted",
-      skipped: outcome,
+      skipped: outcomeTag,
+      // Carries the acquisition/conversion failure detail forward: an
+      // ignored child failure (`ignoreErrors: true`) never throws, so this
+      // tagged event is the only place that detail is ever recorded.
+      ...(progress.errorMessage === undefined ? {} : { error: progress.errorMessage }),
     });
   };
 
@@ -179,34 +206,35 @@ export async function capture(
       return;
     }
 
-    const url = progress.result.url;
-    const key = pageKey(url, progress.depth);
-
-    let publishPromise = inFlight.get(url);
-    if (!publishPromise) {
-      const document: SourceDocument = {
-        sourceUrl: url,
-        requestedUrl,
-        collection: options.library,
-        version: options.version ?? "",
-        title: progress.result.title,
-        markdown: progress.result.textContent,
-        sourceContentType: progress.result.sourceContentType,
-        capturedAt: new Date().toISOString(),
-      };
-      publishPromise = publisher.publish(document);
-      inFlight.set(url, publishPromise);
-      // `.then` with both handlers, rather than `.finally`, so this
-      // bookkeeping chain never itself becomes an unhandled rejection when
-      // the publish fails — the real rejection is still delivered to every
-      // awaiter of `publishPromise` below.
-      publishPromise.then(
-        () => inFlight.delete(url),
-        () => inFlight.delete(url),
-      );
-    }
+    const result = progress.result;
+    const url = result.url;
+    const key = pageKey(url, progress.depth, "result");
 
     try {
+      let publishPromise = publicationsByUrl.get(url);
+      if (!publishPromise) {
+        // Wrapped in an async IIFE so a *synchronous* throw from
+        // `publisher.publish` — before it ever returns a promise — becomes a
+        // rejected promise instead of escaping this function outright. The
+        // assignment into the cache below always happens, even for a
+        // synchronous throw, so a later occurrence of the same URL reuses
+        // the settled (rejected) result rather than retrying.
+        publishPromise = (async () => {
+          const document: SourceDocument = {
+            sourceUrl: url,
+            requestedUrl,
+            collection: options.library,
+            version: options.version ?? "",
+            title: result.title,
+            markdown: result.textContent,
+            sourceContentType: result.sourceContentType,
+            capturedAt: new Date().toISOString(),
+          };
+          return publisher.publish(document);
+        })();
+        publicationsByUrl.set(url, publishPromise);
+      }
+
       const publication = await publishPromise;
       pages.set(key, {
         sourceUrl: url,
@@ -249,7 +277,7 @@ export async function capture(
   return {
     outcomes,
     cancelled,
-    ...(runError === undefined ? {} : { runError }),
+    ...(runError === undefined ? {} : { run_error: runError }),
     exitCode: deriveExitCode(outcomes, cancelled, runError),
   };
 }

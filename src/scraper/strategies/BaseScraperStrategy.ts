@@ -84,6 +84,16 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
   protected completedChildPageAttempts = 0;
   protected failedChildPages = 0;
 
+  /**
+   * Errors that were already reported as a tagged terminal progress event
+   * before being thrown (currently only the fatal root-404 `ScraperError`).
+   * The generic exception handler in `processBatch` checks this so it never
+   * re-tags the same failure as `fetch-failed` on top of the tag already
+   * emitted for it — a consumer keying outcomes by (url, depth, status)
+   * would otherwise see two conflicting terminal events for one page.
+   */
+  private readonly taggedTerminalErrors = new WeakSet<Error>();
+
   abstract canHandle(url: string): boolean;
 
   protected options: BaseScraperStrategyOptions;
@@ -264,8 +274,13 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
           }
 
           if (result.status === FetchStatus.NOT_MODIFIED) {
+            // Use the final (possibly redirected) URL, matching the SUCCESS
+            // path below — a consumer keying outcomes by URL must see the
+            // canonical URL the response actually settled on, not the one
+            // that was queued.
+            const notModifiedUrl = result.url || item.url;
             // File/page hasn't changed, skip processing but count as processed
-            logger.debug(`Page unchanged (304): ${item.url}`);
+            logger.debug(`Page unchanged (304): ${notModifiedUrl}`);
             // Emitted regardless of shouldCount so a consumer needing the
             // truthful per-page outcome sees every 304, not just the ones
             // that happened to be counted toward pagesScraped. This runs
@@ -274,7 +289,7 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
               pagesScraped: currentPageCount,
               totalPages: this.effectiveTotal,
               totalDiscovered: this.totalDiscovered,
-              currentUrl: item.url,
+              currentUrl: notModifiedUrl,
               depth: item.depth,
               maxDepth: maxDepth,
               result: null,
@@ -308,17 +323,23 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
               !isRefreshDeletion &&
               !hasNewFallbackQueueItem;
 
+            // Use the final (possibly redirected) URL, matching the SUCCESS
+            // path below — a consumer keying outcomes by URL must see the
+            // canonical URL the response actually settled on, not the one
+            // that was queued.
+            const notFoundUrl = result.url || item.url;
+
             // File/page was deleted. Emitted regardless of shouldCount, and
             // before both the fatal-root throw below and
             // ensureFailureRateWithinThreshold, so a consumer sees every 404 —
             // including an untracked child that would otherwise emit nothing —
             // as a tagged terminal event rather than silence.
-            logger.debug(`Page deleted (404): ${item.url}`);
+            logger.debug(`Page deleted (404): ${notFoundUrl}`);
             const progress: ScraperProgressEvent = {
               pagesScraped: currentPageCount,
               totalPages: this.effectiveTotal,
               totalDiscovered: this.totalDiscovered,
-              currentUrl: item.url,
+              currentUrl: notFoundUrl,
               depth: item.depth,
               maxDepth: maxDepth,
               result: null,
@@ -333,7 +354,15 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
             await progressCallback(progress);
 
             if (isFatalRootNotFound) {
-              throw new ScraperError(`Root page not found: ${item.url}`, false);
+              // Tagged above; the generic exception handler below must not
+              // re-tag this exact error instance as "fetch-failed" once it
+              // is caught after this throw.
+              const notFoundError = new ScraperError(
+                `Root page not found: ${item.url}`,
+                false,
+              );
+              this.taggedTerminalErrors.add(notFoundError);
+              throw notFoundError;
             }
 
             if (!isRefreshDeletion) {
@@ -423,22 +452,36 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
             throw error;
           }
 
-          // Tag the acquisition/conversion exception as a terminal event
-          // before any failure-threshold throw below, and before the root
-          // (depth 0) rethrow — a consumer that dedupes this tagged event
-          // against the same error re-thrown out of `scrape()` needs to see
-          // it here first, for root failures too.
-          await progressCallback({
-            pagesScraped: this.pageCount,
-            totalPages: this.effectiveTotal,
-            totalDiscovered: this.totalDiscovered,
-            currentUrl: item.url,
-            depth: item.depth,
-            maxDepth,
-            result: null,
-            pageId: item.pageId,
-            outcome: "fetch-failed",
-          });
+          // A 404/etc. branch above may have already tagged this exact error
+          // instance as a terminal event before throwing it (e.g. the fatal
+          // root-404 ScraperError). Re-tagging it here as "fetch-failed" on
+          // top of that would give a consumer two conflicting terminal
+          // events for the same page.
+          const alreadyTagged =
+            error instanceof Error && this.taggedTerminalErrors.has(error);
+
+          if (!alreadyTagged) {
+            // Tag the acquisition/conversion exception as a terminal event
+            // before any failure-threshold throw below, and before the root
+            // (depth 0) rethrow — a consumer that dedupes this tagged event
+            // against the same error re-thrown out of `scrape()` needs to see
+            // it here first, for root failures too. The sanitized message is
+            // carried along so a caller that ignores the error (see
+            // `ignoreErrors` below) does not lose the failure detail — there
+            // would otherwise be no outer exception left to report it.
+            await progressCallback({
+              pagesScraped: this.pageCount,
+              totalPages: this.effectiveTotal,
+              totalDiscovered: this.totalDiscovered,
+              currentUrl: item.url,
+              depth: item.depth,
+              maxDepth,
+              result: null,
+              pageId: item.pageId,
+              outcome: "fetch-failed",
+              errorMessage: sanitizeErrorMessage(error),
+            });
+          }
 
           // Never ignore errors for the root URL (depth 0) - if it fails, the job should fail
           // There's no point in "successfully" completing with 0 documents
@@ -585,6 +628,31 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
   async cleanup(): Promise<void> {
     // No-op by default
   }
+}
+
+/** Longest sanitized error message kept on a tagged progress event, in characters. */
+const MAX_TAGGED_ERROR_MESSAGE_LENGTH = 500;
+
+/**
+ * Matches C0 control characters and DEL. Built from character codes rather
+ * than literal escapes to keep the pattern unambiguous in source.
+ */
+const CONTROL_CHARACTER_PATTERN = new RegExp(
+  `[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`,
+  "g",
+);
+
+/**
+ * Reduces an unknown thrown value to a short, safe-to-log error message for a
+ * tagged progress event: control characters stripped, length capped. Never
+ * includes a stack trace or binary content.
+ */
+function sanitizeErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const stripped = raw.replace(CONTROL_CHARACTER_PATTERN, " ").trim();
+  return stripped.length > MAX_TAGGED_ERROR_MESSAGE_LENGTH
+    ? `${stripped.slice(0, MAX_TAGGED_ERROR_MESSAGE_LENGTH)}…`
+    : stripped;
 }
 
 /**

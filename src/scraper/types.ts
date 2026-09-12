@@ -197,4 +197,13 @@ export interface ScraperProgressEvent {
    * do not read this property are unaffected.
    */
   outcome?: "not-modified" | "not-found" | "fetch-failed";
+  /**
+   * Sanitized error message for an `outcome: "fetch-failed"` event — a
+   * per-page acquisition/conversion exception's text, control characters
+   * stripped and length-capped, never a raw stack trace or binary content.
+   * Absent for 304/404 tags and for ordinary progress, since those are not
+   * exceptions. Additive: existing consumers that do not read it are
+   * unaffected.
+   */
+  errorMessage?: string;
 }

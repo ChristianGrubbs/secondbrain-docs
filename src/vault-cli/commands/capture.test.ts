@@ -121,6 +121,7 @@ function unrestrictedConfig(): AppConfig {
           ...DEFAULT_CONFIG.scraper.security.fileAccess,
           mode: "unrestricted",
           followSymlinks: true,
+          includeHidden: true,
         },
         network: {
           ...DEFAULT_CONFIG.scraper.security.network,
@@ -176,7 +177,7 @@ function envelope(): {
     skipped?: string;
   }>;
   cancelled: boolean;
-  runError?: string;
+  run_error?: string;
   exitCode: number;
 } {
   return JSON.parse(out.join("\n"));
@@ -402,20 +403,23 @@ describe("sb-docs capture: local Markdown and document fixtures", () => {
     process.exitCode = 0;
   });
 
-  it("publishes a local document (PDF) converted to Markdown", async () => {
+  it("publishes a local document (PDF) converted to recognizable Markdown", async () => {
     const pdfFixture = path.resolve(__dirname, "../../../test/fixtures/sample.pdf");
     expect(fs.existsSync(pdfFixture)).toBe(true);
 
     await runCapture([pdfFixture, "--json"]);
 
+    expect(process.exitCode).toBe(0);
     const report = envelope();
+    expect(report.exitCode).toBe(0);
     expect(report.outcomes).toHaveLength(1);
-    // A PDF that converts successfully publishes; if extraction produces no
-    // usable text the outcome still reports something rather than crashing.
-    expect(["published", undefined]).toContain(report.outcomes[0].publication?.status);
-    if (report.outcomes[0].publication !== undefined) {
-      expect(report.outcomes[0].index).toBe("not-attempted");
-    }
+    const outcome = report.outcomes[0];
+    expect(outcome.publication?.status).toBe("published");
+    expect(outcome.index).toBe("not-attempted");
+    // sample.pdf is RFC 2549, "IP over Avian Carriers with Quality of
+    // Service" — a stable, known string proving real text was extracted
+    // rather than an empty/placeholder conversion.
+    expect(outcome.publication?.markdown).toContain("Avian Carriers");
     process.exitCode = 0;
   });
 });
@@ -444,6 +448,88 @@ describe("sb-docs capture: bounded multi-page HTTP crawl", () => {
       expect(outcome.publication?.status).toBe("published");
       expect(outcome.index).toBe("not-attempted");
     }
+    process.exitCode = 0;
+  });
+
+  it("publishes the root and records a linked child 404 as a skipped outcome, exit 2", async () => {
+    const base = "https://sb-docs-fixture-404.test";
+    nock(base)
+      .get("/")
+      .reply(
+        200,
+        `<html><body><h1>Root</h1><a href="${base}/missing">Missing</a></body></html>`,
+        { "Content-Type": "text/html" },
+      )
+      .get("/missing")
+      .reply(404, "not found");
+
+    await runCapture([`${base}/`, "--max-pages", "5", "--max-depth", "1", "--json"]);
+
+    const report = envelope();
+    expect(report.exitCode).toBe(2);
+    expect(report.outcomes).toHaveLength(2);
+    const root = report.outcomes.find((o) => o.sourceUrl === `${base}/`);
+    const missing = report.outcomes.find((o) => o.sourceUrl === `${base}/missing`);
+    expect(root?.publication?.status).toBe("published");
+    expect(missing?.skipped).toBe("not-found");
+    process.exitCode = 0;
+  });
+
+  it("reports a fatal root 404 as one skipped outcome and one run_error, exit 1", async () => {
+    const base = "https://sb-docs-fixture-root-404.test";
+    nock(base).get("/").reply(404, "not found");
+
+    await runCapture([`${base}/`, "--json"]);
+
+    const report = envelope();
+    expect(report.exitCode).toBe(1);
+    expect(report.outcomes).toHaveLength(1);
+    expect(report.outcomes[0].skipped).toBe("not-found");
+    expect(report.run_error).toBeDefined();
+    expect(report.run_error).toContain("Root page not found");
+    process.exitCode = 0;
+  });
+});
+
+describe("sb-docs capture: command-scoped cancellation", () => {
+  it("exits 130 on SIGINT, preserving outcomes published before the abort", async () => {
+    const fake = {
+      scrape: async (
+        _options: ScraperOptions,
+        progressCallback: (event: ReturnType<typeof fakeContentEvent>) => Promise<void>,
+        signal?: AbortSignal,
+      ) => {
+        await progressCallback(
+          fakeContentEvent({ currentUrl: "https://example.com/", depth: 0 }),
+        );
+        // Simulate a real Ctrl-C: the process-level SIGINT handler the
+        // command registers should call the controller's abort(), which
+        // this fake scraper then observes and reacts to exactly as a real
+        // ScraperService would.
+        process.emit("SIGINT");
+        await new Promise<void>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error("Scraping cancelled during batch processing"));
+            return;
+          }
+          signal?.addEventListener("abort", () => {
+            reject(new Error("Scraping cancelled during batch processing"));
+          });
+          setTimeout(resolve, 50);
+        });
+      },
+    };
+    const scraperService = fake as unknown as ScraperService;
+    const publisher: Publisher = { publish: async () => published() };
+
+    await runCapture(["https://example.com/", "--json"], { scraperService, publisher });
+
+    expect(process.exitCode).toBe(130);
+    const report = envelope();
+    expect(report.exitCode).toBe(130);
+    expect(report.cancelled).toBe(true);
+    expect(report.outcomes).toHaveLength(1);
+    expect(report.outcomes[0].publication?.status).toBe("published");
     process.exitCode = 0;
   });
 });
