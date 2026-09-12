@@ -46,6 +46,25 @@ export type CapturePageOutcome = {
 /** Exit codes matching the product contract in the migration plan. */
 export type CaptureExitCode = 0 | 1 | 2 | 130;
 
+/**
+ * Final counts derived from the keyed outcomes, one bucket per terminal
+ * status plus the total page count. Every outcome falls into exactly one
+ * bucket besides `total`: a publication's `status` (published / unchanged /
+ * replaced / conflict), a skip tag (not-modified / not-found / fetch-failed),
+ * or a plain publish error that carried no skip tag.
+ */
+export interface CaptureCounts {
+  total: number;
+  published: number;
+  unchanged: number;
+  replaced: number;
+  conflict: number;
+  notModified: number;
+  notFound: number;
+  fetchFailed: number;
+  error: number;
+}
+
 /** The full result of one capture run. */
 export interface CaptureResult {
   /**
@@ -56,6 +75,8 @@ export interface CaptureResult {
    * silently overwriting one another.
    */
   outcomes: CapturePageOutcome[];
+  /** Final counts by terminal status, derived from `outcomes`. */
+  counts: CaptureCounts;
   /** True when the run ended via cancellation (signal abort). */
   cancelled: boolean;
   /**
@@ -103,6 +124,63 @@ function isFullyClean(outcome: CapturePageOutcome): boolean {
 }
 
 /**
+ * Tallies final counts by terminal status from the keyed outcomes. Each
+ * outcome is classified by exactly one of: its publication's status, its
+ * skip tag, or (if neither is present) a plain publish error.
+ *
+ * @param outcomes The capture run's keyed page outcomes.
+ * @returns Per-status counts plus the total number of outcomes.
+ */
+function deriveCounts(outcomes: CapturePageOutcome[]): CaptureCounts {
+  const counts: CaptureCounts = {
+    total: outcomes.length,
+    published: 0,
+    unchanged: 0,
+    replaced: 0,
+    conflict: 0,
+    notModified: 0,
+    notFound: 0,
+    fetchFailed: 0,
+    error: 0,
+  };
+
+  for (const outcome of outcomes) {
+    if (outcome.publication !== undefined) {
+      switch (outcome.publication.status) {
+        case "published":
+          counts.published++;
+          break;
+        case "unchanged":
+          counts.unchanged++;
+          break;
+        case "replaced":
+          counts.replaced++;
+          break;
+        case "conflict":
+          counts.conflict++;
+          break;
+      }
+    } else if (outcome.skipped !== undefined) {
+      switch (outcome.skipped) {
+        case "not-modified":
+          counts.notModified++;
+          break;
+        case "not-found":
+          counts.notFound++;
+          break;
+        case "fetch-failed":
+          counts.fetchFailed++;
+          break;
+      }
+    } else if (outcome.error !== undefined) {
+      counts.error++;
+    }
+  }
+
+  return counts;
+}
+
+/**
  * Derives the process exit code from accumulated page outcomes.
  *
  * Exit 0 requires every page to be fully clean and no separate run error.
@@ -111,8 +189,11 @@ function isFullyClean(outcome: CapturePageOutcome): boolean {
  * or any failure alongside at least one useful page. Exit 1 means nothing
  * useful came out of the run at all. Cancellation always wins as 130,
  * including when earlier pages published successfully.
+ *
+ * Exported for direct table-driven testing of the publication-state matrix
+ * (published/unchanged/replaced/conflict × linked/pending MOC).
  */
-function deriveExitCode(
+export function deriveExitCode(
   outcomes: CapturePageOutcome[],
   cancelled: boolean,
   runError: string | undefined,
@@ -276,6 +357,7 @@ export async function capture(
   const outcomes = [...pages.values()];
   return {
     outcomes,
+    counts: deriveCounts(outcomes),
     cancelled,
     ...(runError === undefined ? {} : { run_error: runError }),
     exitCode: deriveExitCode(outcomes, cancelled, runError),

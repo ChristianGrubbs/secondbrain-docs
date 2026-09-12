@@ -5,6 +5,7 @@
  */
 
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -176,11 +177,45 @@ function envelope(): {
     error?: string;
     skipped?: string;
   }>;
+  counts: {
+    total: number;
+    published: number;
+    unchanged: number;
+    replaced: number;
+    conflict: number;
+    notModified: number;
+    notFound: number;
+    fetchFailed: number;
+    error: number;
+  };
   cancelled: boolean;
   run_error?: string;
   exitCode: number;
 } {
   return JSON.parse(out.join("\n"));
+}
+
+/** Starts a real HTTP server on an ephemeral loopback port for one test. */
+function startFixtureServer(
+  handler: http.RequestListener,
+): Promise<{ server: http.Server; baseUrl: string }> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer(handler);
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        server.close();
+        reject(new Error("failed to bind fixture server to an ephemeral port"));
+        return;
+      }
+      resolve({ server, baseUrl: `http://127.0.0.1:${address.port}` });
+    });
+  });
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve) => server.close(() => resolve()));
 }
 
 describe("normalizeCaptureInput", () => {
@@ -488,6 +523,91 @@ describe("sb-docs capture: bounded multi-page HTTP crawl", () => {
     expect(report.run_error).toBeDefined();
     expect(report.run_error).toContain("Root page not found");
     process.exitCode = 0;
+  });
+});
+
+describe("sb-docs capture: real localhost fixture-server integration", () => {
+  // Nock intercepts at the module level rather than a real socket. These
+  // cases exercise an actual listening server and a real request over the
+  // loopback interface, so the full network path (DNS/connect/HTTP parsing)
+  // is real, matching how upstream e2e suites like
+  // test/refresh-pipeline-e2e.test.ts exercise the scraper.
+  it("publishes the root and records an untracked child 404 as not-found over a real socket, exit 2", async () => {
+    const { server, baseUrl } = await startFixtureServer((req, res) => {
+      if (req.url === "/") {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(
+          `<html><body><h1>Root</h1><a href="${baseUrl}/gone">Gone</a></body></html>`,
+        );
+        return;
+      }
+      if (req.url === "/gone") {
+        res.writeHead(404);
+        res.end("not found");
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    try {
+      await runCapture([`${baseUrl}/`, "--max-pages", "5", "--max-depth", "1", "--json"]);
+
+      const report = envelope();
+      expect(report.exitCode).toBe(2);
+      expect(report.run_error).toBeUndefined();
+      expect(report.outcomes).toHaveLength(2);
+      const root = report.outcomes.find((o) => o.sourceUrl === `${baseUrl}/`);
+      const gone = report.outcomes.find((o) => o.sourceUrl === `${baseUrl}/gone`);
+      expect(root?.publication?.status).toBe("published");
+      expect(gone?.skipped).toBe("not-found");
+      expect(report.counts).toEqual({
+        total: 2,
+        published: 1,
+        unchanged: 0,
+        replaced: 0,
+        conflict: 0,
+        notModified: 0,
+        notFound: 1,
+        fetchFailed: 0,
+        error: 0,
+      });
+      process.exitCode = 0;
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports a fatal root 404 over a real socket as one skipped outcome and one run_error, exit 1", async () => {
+    const { server, baseUrl } = await startFixtureServer((_req, res) => {
+      res.writeHead(404);
+      res.end("not found");
+    });
+
+    try {
+      await runCapture([`${baseUrl}/`, "--json"]);
+
+      const report = envelope();
+      expect(report.exitCode).toBe(1);
+      expect(report.outcomes).toHaveLength(1);
+      expect(report.outcomes[0].skipped).toBe("not-found");
+      expect(report.run_error).toBeDefined();
+      expect(report.run_error).toContain("Root page not found");
+      expect(report.counts).toEqual({
+        total: 1,
+        published: 0,
+        unchanged: 0,
+        replaced: 0,
+        conflict: 0,
+        notModified: 0,
+        notFound: 1,
+        fetchFailed: 0,
+        error: 0,
+      });
+      process.exitCode = 0;
+    } finally {
+      await closeServer(server);
+    }
   });
 });
 

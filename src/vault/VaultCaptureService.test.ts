@@ -9,7 +9,12 @@ import type { QueueItem, ScraperOptions, ScraperProgressEvent } from "../scraper
 import type { ProgressCallback } from "../types";
 import { loadConfig } from "../utils/config";
 import type { Publication, Publisher, SourceDocument } from "./types";
-import { type CaptureDependencies, capture } from "./VaultCaptureService";
+import {
+  type CaptureDependencies,
+  type CapturePageOutcome,
+  capture,
+  deriveExitCode,
+} from "./VaultCaptureService";
 
 /** Minimal fake `ScraperService` that emits caller-supplied progress events. */
 class FakeScraperService {
@@ -140,6 +145,19 @@ describe("capture", () => {
     expect(root?.index).toBe("not-attempted");
     expect(child?.error).toBe("vault write failed");
     expect(child?.index).toBe("not-attempted");
+
+    // Partial success: one published page, one plain publish error.
+    expect(result.counts).toEqual({
+      total: 2,
+      published: 1,
+      unchanged: 0,
+      replaced: 0,
+      conflict: 0,
+      notModified: 0,
+      notFound: 0,
+      fetchFailed: 0,
+      error: 1,
+    });
   });
 
   it("returns exit 1 when every page fails to publish", async () => {
@@ -167,6 +185,19 @@ describe("capture", () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.outcomes.every((o) => o.error === "vault unreachable")).toBe(true);
+
+    // All-failed: two plain publish errors, nothing useful.
+    expect(result.counts).toEqual({
+      total: 2,
+      published: 0,
+      unchanged: 0,
+      replaced: 0,
+      conflict: 0,
+      notModified: 0,
+      notFound: 0,
+      fetchFailed: 0,
+      error: 2,
+    });
   });
 
   it("returns exit 1 when the crawl produces no page content at all", async () => {
@@ -420,6 +451,20 @@ describe("capture", () => {
     expect(notFound).toBeDefined();
     expect(fetchFailed).toBeDefined();
     expect(fetchFailed?.error).toBe("second distinct failure");
+
+    // Deduplicated-event case: two distinct terminal statuses for one page,
+    // each counted once rather than merged or dropped.
+    expect(result.counts).toEqual({
+      total: 2,
+      published: 0,
+      unchanged: 0,
+      replaced: 0,
+      conflict: 0,
+      notModified: 0,
+      notFound: 1,
+      fetchFailed: 1,
+      error: 0,
+    });
   });
 
   it("carries the sanitized error message from a tagged fetch-failed event into the outcome", async () => {
@@ -538,6 +583,19 @@ describe("capture", () => {
     expect(result.outcomes.every((o) => o.publication?.status === "published")).toBe(
       true,
     );
+
+    // Full success: every page published, nothing else.
+    expect(result.counts).toEqual({
+      total: 3,
+      published: 3,
+      unchanged: 0,
+      replaced: 0,
+      conflict: 0,
+      notModified: 0,
+      notFound: 0,
+      fetchFailed: 0,
+      error: 0,
+    });
   });
 
   it("exits 130 on cancellation and preserves outcomes published before the abort", async () => {
@@ -804,5 +862,54 @@ describe("capture with a real BaseScraperStrategy", () => {
     expect(root?.publication?.status).toBe("published");
     expect(child?.skipped).toBe("not-found");
     expect(result.exitCode).toBe(2);
+  });
+});
+
+describe("deriveExitCode", () => {
+  function outcomeWith(publication: Publication): CapturePageOutcome {
+    return {
+      sourceUrl: "https://example.com/",
+      depth: 0,
+      index: "not-attempted",
+      publication,
+    };
+  }
+
+  function publicationOf(
+    status: Publication["status"],
+    moc: Publication["moc"],
+  ): Publication {
+    return { status, path: "x.md", markdown: "# x", digest: "d", moc };
+  }
+
+  it.each([
+    ["published", "linked", 0],
+    ["unchanged", "linked", 0],
+    ["replaced", "linked", 0],
+    ["conflict", "linked", 2],
+    ["published", "pending", 2],
+    ["unchanged", "pending", 2],
+    ["replaced", "pending", 2],
+    ["conflict", "pending", 2],
+  ] as const)(
+    "a single %s publication with moc %s yields exit code %d",
+    (status, moc, expectedExitCode) => {
+      const outcome = outcomeWith(publicationOf(status, moc));
+      expect(deriveExitCode([outcome], false, undefined)).toBe(expectedExitCode);
+    },
+  );
+
+  it("returns exit 1 for an empty outcome list", () => {
+    expect(deriveExitCode([], false, undefined)).toBe(1);
+  });
+
+  it("returns exit 130 when cancelled, even with an otherwise fully clean outcome", () => {
+    const outcome = outcomeWith(publicationOf("published", "linked"));
+    expect(deriveExitCode([outcome], true, undefined)).toBe(130);
+  });
+
+  it("returns exit 2 when a run error accompanies an otherwise fully clean outcome", () => {
+    const outcome = outcomeWith(publicationOf("published", "linked"));
+    expect(deriveExitCode([outcome], false, "unexpected failure")).toBe(2);
   });
 });
