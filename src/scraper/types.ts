@@ -185,4 +185,25 @@ export interface ScraperProgressEvent {
   pageId?: number;
   /** Indicates this page was deleted (404 during refresh or broken link) */
   deleted?: boolean;
+  /**
+   * Tags a terminal event that carries no content: a 304 response, a 404
+   * response, or a per-page acquisition/conversion exception. Emitted
+   * regardless of whether the item would otherwise count toward
+   * `pagesScraped` (see the `shouldCount` logic in `BaseScraperStrategy`), so
+   * a consumer that needs the truthful per-page outcome — not just the pages
+   * that happened to be counted — can distinguish "unchanged", "gone" and
+   * "failed" without guessing from a null `result`. Directory discovery and
+   * ordinary in-progress events never carry this tag. Existing consumers that
+   * do not read this property are unaffected.
+   */
+  outcome?: "not-modified" | "not-found" | "fetch-failed";
+  /**
+   * Sanitized error message for an `outcome: "fetch-failed"` event — a
+   * per-page acquisition/conversion exception's text, control characters
+   * stripped and length-capped, never a raw stack trace or binary content.
+   * Absent for 304/404 tags and for ordinary progress, since those are not
+   * exceptions. Additive: existing consumers that do not read it are
+   * unaffected.
+   */
+  errorMessage?: string;
 }

@@ -34,6 +34,11 @@ describe("createVaultCli", () => {
     expect(help).toContain("doctor");
   });
 
+  it("registers the capture command", async () => {
+    const help = await createVaultCli([]).getHelp();
+    expect(help).toContain("capture");
+  });
+
   it("rejects an unknown command instead of exiting zero doing nothing", async () => {
     // `.strict()` can only reject a stray positional once a real command is
     // registered, which `doctor` now is.

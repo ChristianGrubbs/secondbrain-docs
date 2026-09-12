@@ -9,11 +9,13 @@
  */
 
 import yargs, { type Argv } from "yargs";
+import { type CaptureDeps, createCaptureCommand } from "./commands/capture";
 import { createDoctorCommand, type DoctorDeps } from "./commands/doctor";
 
 /** Injected dependencies for the commands this program registers. */
 export interface VaultCliDeps {
   doctor?: DoctorDeps;
+  capture?: CaptureDeps;
 }
 
 /**
@@ -30,6 +32,7 @@ export function createVaultCli(argv: string[], deps: VaultCliDeps = {}): Argv {
     .scriptName("sb-docs")
     .usage("Usage: $0 <command> [options]")
     .version(__APP_VERSION__)
+    .command(createCaptureCommand(deps.capture))
     .command(createDoctorCommand(deps.doctor))
     .strict()
     .help()
