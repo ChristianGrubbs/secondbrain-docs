@@ -416,6 +416,45 @@ describe("sb-docs capture: exit codes", () => {
   });
 });
 
+describe("sb-docs capture: plain (non-JSON) output", () => {
+  it("surfaces the sanitized cause of an ignored child acquisition failure", async () => {
+    // Root succeeds; a child is tagged fetch-failed (ignoreErrors swallowed
+    // the thrown exception upstream) and carries a sanitized error message.
+    const fake = {
+      scrape: async (
+        _options: ScraperOptions,
+        progressCallback: (event: unknown) => Promise<void>,
+      ) => {
+        await progressCallback(
+          fakeContentEvent({ currentUrl: "https://example.com/", depth: 0 }),
+        );
+        await progressCallback({
+          pagesScraped: 1,
+          totalPages: 2,
+          totalDiscovered: 2,
+          currentUrl: "https://example.com/child",
+          depth: 1,
+          maxDepth: 1,
+          result: null,
+          outcome: "fetch-failed",
+          errorMessage: "connection reset while fetching child",
+        });
+      },
+    };
+    const scraperService = fake as unknown as ScraperService;
+    const publisher: Publisher = { publish: async () => published() };
+
+    // No --json: exercise the plain-text report path.
+    await runCapture(["https://example.com/"], { scraperService, publisher });
+
+    expect(process.exitCode).toBe(2);
+    const errText = err.join("\n");
+    expect(errText).toContain("https://example.com/child");
+    expect(errText).toContain("connection reset while fetching child");
+    process.exitCode = 0;
+  });
+});
+
 describe("sb-docs capture: local Markdown and document fixtures", () => {
   it("publishes full Markdown from a local file:// Markdown source with no embedding key", async () => {
     const sourceDir = makeTempDir("sb-docs-capture-source-");

@@ -210,6 +210,14 @@ function report(
       );
     } else if (outcome.skipped !== undefined) {
       sinks.stdout(`${outcome.skipped} ${outcome.sourceUrl}`);
+      // A "fetch-failed" skip can carry a sanitized acquisition/conversion
+      // error message (see ScraperProgressEvent.errorMessage) — surface it
+      // too, since it is otherwise unreachable: this branch, not the
+      // `outcome.error` branch below, is the one that fires for a skipped
+      // outcome.
+      if (outcome.error !== undefined) {
+        sinks.stderr(`❌ ${outcome.sourceUrl}: ${outcome.error}`);
+      }
     } else if (outcome.error !== undefined) {
       sinks.stderr(`❌ ${outcome.sourceUrl}: ${outcome.error}`);
     }
