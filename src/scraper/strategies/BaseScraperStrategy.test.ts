@@ -483,7 +483,18 @@ describe("BaseScraperStrategy", () => {
       "Test error",
     );
     expect(strategy.processItem).toHaveBeenCalledTimes(1);
-    expect(progressCallback).not.toHaveBeenCalled();
+    // The per-page exception is tagged as a terminal event before the root
+    // (depth 0) rethrow, so a consumer sees the failure even though the
+    // overall scrape ultimately rejects.
+    expect(progressCallback).toHaveBeenCalledTimes(1);
+    expect(progressCallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentUrl: "https://example.com/",
+        depth: 0,
+        result: null,
+        outcome: "fetch-failed",
+      }),
+    );
   });
 
   it("should count non-refresh child NOT_FOUND as a terminal failure but continue crawling", async () => {
@@ -532,11 +543,19 @@ describe("BaseScraperStrategy", () => {
     // for the rate-based threshold, but does not abort the crawl on its own.
     await expect(strategy.scrape(options, progressCallback)).resolves.not.toThrow();
 
-    // progressCallback should have been called for root + valid page (not the 404 page)
+    // progressCallback fires for root, valid, and now also the untracked 404
+    // (tagged, not counted toward pagesScraped) so a consumer never has to
+    // infer that a child failed from silence alone.
     const calls = progressCallback.mock.calls.map((c) => c[0].currentUrl);
     expect(calls).toContain("https://example.com/");
     expect(calls).toContain("https://example.com/valid");
-    expect(calls).not.toContain("https://example.com/missing");
+    expect(calls).toContain("https://example.com/missing");
+
+    const missingCall = progressCallback.mock.calls.find(
+      (c) => c[0].currentUrl === "https://example.com/missing",
+    );
+    expect(missingCall?.[0].outcome).toBe("not-found");
+    expect(missingCall?.[0].result).toBeNull();
   });
 
   it("should deduplicate URLs and avoid processing the same URL twice", async () => {
@@ -1424,6 +1443,51 @@ describe("BaseScraperStrategy", () => {
       );
       expect(progress304).toBeDefined();
       expect(progress304![0].result).toBeNull();
+      expect(progress304![0].outcome).toBe("not-modified");
+    });
+
+    it("should tag an untracked (non-refresh) 304 response even though it is not counted", async () => {
+      const options: ScraperOptions = {
+        url: "https://example.com/",
+        library: "test",
+        version: "1.0.0",
+        maxPages: 2,
+        maxDepth: 1,
+      };
+      const progressCallback = vi.fn<ProgressCallback<ScraperProgressEvent>>();
+
+      strategy.processItem.mockImplementation(async (item: QueueItem) => {
+        if (item.url === "https://example.com/") {
+          return {
+            content: {
+              textContent: "root",
+              metadata: {},
+              links: [],
+              errors: [],
+              chunks: [],
+            },
+            links: ["https://example.com/page1"],
+            status: FetchStatus.SUCCESS,
+          };
+        }
+        // page1 is discovered fresh (no pageId) and returns 304 — shouldCount
+        // is false for this item, but the tagged event must still fire.
+        return {
+          links: [],
+          status: FetchStatus.NOT_MODIFIED,
+        };
+      });
+
+      await strategy.scrape(options, progressCallback);
+
+      const progress304 = progressCallback.mock.calls.find(
+        (call) => call[0].currentUrl === "https://example.com/page1",
+      );
+      expect(progress304).toBeDefined();
+      expect(progress304![0].outcome).toBe("not-modified");
+      expect(progress304![0].result).toBeNull();
+      // Count semantics are unchanged: this item was never counted.
+      expect(progress304![0].pagesScraped).toBe(1);
     });
 
     it("should call progressCallback with deleted=true for 404 responses", async () => {
@@ -1470,6 +1534,7 @@ describe("BaseScraperStrategy", () => {
       expect(progress404).toBeDefined();
       expect(progress404![0].deleted).toBe(true);
       expect(progress404![0].result).toBeNull();
+      expect(progress404![0].outcome).toBe("not-found");
     });
 
     it("should include pageId in progress for refresh operations", async () => {

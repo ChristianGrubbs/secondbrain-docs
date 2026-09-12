@@ -266,18 +266,21 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
           if (result.status === FetchStatus.NOT_MODIFIED) {
             // File/page hasn't changed, skip processing but count as processed
             logger.debug(`Page unchanged (304): ${item.url}`);
-            if (shouldCount) {
-              await progressCallback({
-                pagesScraped: currentPageCount,
-                totalPages: this.effectiveTotal,
-                totalDiscovered: this.totalDiscovered,
-                currentUrl: item.url,
-                depth: item.depth,
-                maxDepth: maxDepth,
-                result: null,
-                pageId: item.pageId,
-              });
-            }
+            // Emitted regardless of shouldCount so a consumer needing the
+            // truthful per-page outcome sees every 304, not just the ones
+            // that happened to be counted toward pagesScraped. This runs
+            // before ensureFailureRateWithinThreshold below, which can throw.
+            await progressCallback({
+              pagesScraped: currentPageCount,
+              totalPages: this.effectiveTotal,
+              totalDiscovered: this.totalDiscovered,
+              currentUrl: item.url,
+              depth: item.depth,
+              maxDepth: maxDepth,
+              result: null,
+              pageId: item.pageId,
+              outcome: "not-modified",
+            });
             this.recordChildPageCompletion(item, result);
             ensureFailureRateWithinThreshold();
             throwIfBatchAborted();
@@ -299,12 +302,37 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
             // and a dead entry there shouldn't abort a scrape whose real root URL
             // resolved fine (see llmstxt-discovery spec: llms.txt link failures
             // are not supposed to fail the overall scrape).
-            if (
+            const isFatalRootNotFound =
               item.depth === 0 &&
               !item.fromLlmsTxt &&
               !isRefreshDeletion &&
-              !hasNewFallbackQueueItem
-            ) {
+              !hasNewFallbackQueueItem;
+
+            // File/page was deleted. Emitted regardless of shouldCount, and
+            // before both the fatal-root throw below and
+            // ensureFailureRateWithinThreshold, so a consumer sees every 404 —
+            // including an untracked child that would otherwise emit nothing —
+            // as a tagged terminal event rather than silence.
+            logger.debug(`Page deleted (404): ${item.url}`);
+            const progress: ScraperProgressEvent = {
+              pagesScraped: currentPageCount,
+              totalPages: this.effectiveTotal,
+              totalDiscovered: this.totalDiscovered,
+              currentUrl: item.url,
+              depth: item.depth,
+              maxDepth: maxDepth,
+              result: null,
+              pageId: item.pageId,
+              outcome: "not-found",
+            };
+
+            if (isRefreshDeletion) {
+              progress.deleted = true;
+            }
+
+            await progressCallback(progress);
+
+            if (isFatalRootNotFound) {
               throw new ScraperError(`Root page not found: ${item.url}`, false);
             }
 
@@ -314,27 +342,6 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
             }
 
             throwIfBatchAborted();
-
-            // File/page was deleted, count as processed
-            logger.debug(`Page deleted (404): ${item.url}`);
-            if (shouldCount) {
-              const progress: ScraperProgressEvent = {
-                pagesScraped: currentPageCount,
-                totalPages: this.effectiveTotal,
-                totalDiscovered: this.totalDiscovered,
-                currentUrl: item.url,
-                depth: item.depth,
-                maxDepth: maxDepth,
-                result: null,
-                pageId: item.pageId,
-              };
-
-              if (isRefreshDeletion) {
-                progress.deleted = true;
-              }
-
-              await progressCallback(progress);
-            }
             return fallbackQueueItems;
           }
 
@@ -415,6 +422,23 @@ export abstract class BaseScraperStrategy implements ScraperStrategy {
           ) {
             throw error;
           }
+
+          // Tag the acquisition/conversion exception as a terminal event
+          // before any failure-threshold throw below, and before the root
+          // (depth 0) rethrow — a consumer that dedupes this tagged event
+          // against the same error re-thrown out of `scrape()` needs to see
+          // it here first, for root failures too.
+          await progressCallback({
+            pagesScraped: this.pageCount,
+            totalPages: this.effectiveTotal,
+            totalDiscovered: this.totalDiscovered,
+            currentUrl: item.url,
+            depth: item.depth,
+            maxDepth,
+            result: null,
+            pageId: item.pageId,
+            outcome: "fetch-failed",
+          });
 
           // Never ignore errors for the root URL (depth 0) - if it fails, the job should fail
           // There's no point in "successfully" completing with 0 documents
