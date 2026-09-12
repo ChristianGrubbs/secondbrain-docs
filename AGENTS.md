@@ -131,6 +131,10 @@ Unit + integration tests live next to the code they cover (`src/foo.ts` ↔ `src
 | `vector-search-e2e.test.ts` | Full pipeline: scrape → split → embed → index → search | MSW-mocked OpenAI | yes |
 | `github-private-repo-e2e.test.ts` | Auth flow for private GitHub repo scraping | `GITHUB_TOKEN`; skips otherwise | yes (skips if no token) |
 | `docker-e2e.test.ts` | Production image: non-root user, Chromium present, Playwright scrape, Xberg PDF, bind-mounted docs folder recursively indexed via `file:///` | Docker daemon; `DOCKER_IMAGE_TAG` to reuse a prebuilt image | **no** — `npm run test:docker` |
+| `vault-cli-e2e.test.ts` | Fork-local: spawns the built `dist/vault-cli.js` (`sb-docs`) directly and asserts zero `net.Server.prototype.listen` calls | prior `npm run build` (see `docs/fork-boundary.md`) | yes |
+| `vault-publish-e2e.test.ts` | Fork-local: real `obsidian-cli` publication into a throwaway vault via `OBSIDIAN_VAULT`; asserts the live vault is untouched | `~/ai-stack/bin/obsidian-cli`; skips otherwise | yes (skips if absent) |
+
+The fork-local unit and integration suites (`src/vault/*.test.ts`, `src/vault-cli/**/*.test.ts`) follow the single-file policy above and run in the default `npm test`.
 
 Notes:
 - The "live" and "docker" suites are excluded from `npm test` / `npm run test:e2e` because they need external network or a Docker daemon. CI runs `docker-e2e.test.ts` in a dedicated `docker-test` job.

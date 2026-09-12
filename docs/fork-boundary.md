@@ -18,15 +18,27 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | Path | Role |
 | --- | --- |
 | `src/vault-cli/index.ts` | `createVaultCli(argv, deps): Argv` — the restricted yargs program |
+| `src/vault-cli/commands/capture.ts` | `sb-docs capture <input>` — URL, local path or bounded crawl into the vault; SIGINT-bridged `AbortController`; `--json` envelope |
+| `src/vault-cli/commands/capture.test.ts` | Unit and integration contract for the capture command (real `node:http` fixture server, `file://` Markdown and PDF) |
 | `src/vault-cli/commands/doctor.ts` | `sb-docs doctor` — capture state report and `--adopt` |
 | `src/vault-cli/commands/doctor.test.ts` | Unit contract for the doctor command |
+| `src/vault/VaultCaptureService.ts` | `capture()` — awaits the publisher inside the upstream progress callback; outcomes keyed by final URL + depth + terminal status; `counts`, `run_error`, exit 0/2/1/130 |
+| `src/vault/VaultCaptureService.test.ts` | Unit contract for outcome keying, dedup, cancellation and exit codes |
+| `src/vault/VaultPublisher.ts` | `VaultPublisher` — create / unchanged / replace (CAS) / conflict publication of one source note plus one MOC link, recovery of interrupted journal entries |
+| `src/vault/VaultPublisher.test.ts` | Unit contract for the publisher |
 | `src/vault/PublicationJournal.ts` | Journal, ownership records, per-source lock, JSONL logger |
 | `src/vault/PublicationJournal.test.ts` | Unit contract for that durable state |
 | `src/vault/discovery.ts` | `discoverSources` — recursive `source_id` scan that freezes note paths |
 | `src/vault/discovery.test.ts` | Unit contract for discovery |
+| `src/vault/ObsidianCli.ts` | Argument-array subprocess wrapper over `obsidian-cli`, note bytes on stdin |
+| `src/vault/ObsidianCli.test.ts` | Unit contract for the process wrapper |
+| `src/vault/identity.ts` | `source_id`, collection paths, filename and link sanitisation |
+| `src/vault/render.ts` | Source-note and collection-index rendering, semantic digest, frontmatter parsing |
+| `src/vault/types.ts` | `SourceDocument`, `Publication`, `Publisher`, `CliRunner` |
 | `src/vault-cli/main.ts` | Executable entry, built to `dist/vault-cli.js` |
 | `src/vault-cli/index.test.ts` | Unit contract for the program shape |
 | `test/vault-cli-e2e.test.ts` | Process-level checks against the built executable |
+| `test/vault-publish-e2e.test.ts` | Real `obsidian-cli` publication into a throwaway vault via `OBSIDIAN_VAULT`; asserts the live vault is untouched |
 | `test/fixtures/vault-cli/no-listen-guard.mjs` | `net.Server.prototype.listen` recorder used by that suite |
 | `test/fixtures/vault/lock-holder.ts` | Child process that holds a real per-source lock (multiprocess lock tests) |
 | `test/fixtures/vault/publish-crash.ts` | Child process that publishes and SIGKILLs itself at a chosen journal phase |
@@ -36,6 +48,8 @@ Upstream files changed, and nothing else:
 
 - `package.json` — added the `sb-docs` bin mapping alongside `docs-mcp-server`.
 - `vite.config.ts` — added the `vault-cli` library entry, and generalized the `preserve-shebang` plugin from the hardcoded `index.js` to every chunk in `executableChunks`.
+- `src/scraper/types.ts` — additive optional fields on `ScraperProgressEvent`: `outcome` (`"not-modified" | "not-found" | "fetch-failed"`) and a sanitized `errorMessage`. Existing consumers ignore both.
+- `src/scraper/strategies/BaseScraperStrategy.ts` (and its test) — emits tagged terminal events for 304, 404 and per-page acquisition or conversion exceptions regardless of `shouldCount`, using the final `result.url`; a fatal root 404 is tagged exactly once. Page-count and failure-threshold semantics are unchanged.
 
 ## Rules this fork keeps
 
