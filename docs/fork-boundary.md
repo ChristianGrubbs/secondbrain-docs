@@ -53,6 +53,10 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `test/fixtures/vault/publish-crash.ts` | Child process that publishes and SIGKILLs itself at a chosen journal phase |
 | `test/vault-index-e2e.test.ts` | Process-level capture / search / read / reindex against the built executable, including a held index lock |
 | `test/fixtures/vault/index-lock-holder.ts` | Child process that holds the state-level index lock (process-level index tests) |
+| `test/vault-capture-e2e.test.ts` | Task 6 (6A/6B) format/behavior qualification (F01-F20), real-CLI first-capture bootstrapping (C01-C04), process-boundary exit codes (X03), and subprocess/vault-access measurements (M01-M02), all against the built executable and a real `obsidian-cli` |
+| `test/fixtures/vault-capture/` | Deterministic fixtures for the F-rows: `local-notes.md` + `pixel.png` (Markdown + local image), `table.pdf` (+ `generate-table-pdf.mjs` generator), `mixed-dir/` (three-file directory capture), `plain.txt`, `source-code.py` |
+| `docs/migration-qualification.md` | The Task 6 row-by-row qualification report this suite backs |
+| `scripts/live-check-vault.mjs` | Runs the live (network-dependent) rows against an explicitly designated throwaway vault and prints a JSON summary; used by Task 7 |
 | `docs/fork-boundary.md` | This file |
 
 Upstream files changed, and nothing else:
@@ -61,6 +65,9 @@ Upstream files changed, and nothing else:
 - `vite.config.ts` — added the `vault-cli` library entry, and generalized the `preserve-shebang` plugin from the hardcoded `index.js` to every chunk in `executableChunks`.
 - `src/scraper/types.ts` — additive optional fields on `ScraperProgressEvent`: `outcome` (`"not-modified" | "not-found" | "fetch-failed"`) and a sanitized `errorMessage`. Existing consumers ignore both.
 - `src/scraper/strategies/BaseScraperStrategy.ts` (and its test) — emits tagged terminal events for 304, 404 and per-page acquisition or conversion exceptions regardless of `shouldCount`, using the final `result.url`; a fatal root 404 is tagged exactly once. Page-count and failure-threshold semantics are unchanged.
+- `src/scraper/strategies/GitHubScraperStrategy.ts` (and its test) — Task 6 qualification fix (row F03): a single GitHub blob URL given directly as the capture root is now fetched and processed in place at depth 0 instead of re-announcing itself as a "discovered" link, which `BaseScraperStrategy`'s pre-seeded `visited` set permanently deduped, silently producing zero outcomes at any `--max-depth`/`--max-pages`.
+- `src/scraper/fetcher/BrowserFetcher.ts` (and its test) — Task 6 qualification fix (row X03): `chromium.launch()` now passes `handleSIGINT: false`, `handleSIGTERM: false`, `handleSIGHUP: false` so Playwright's own signal handlers no longer race and win against `sb-docs capture`'s own SIGINT handler, which previously left a real Ctrl-C during a browser-rendered capture exiting 130 with no JSON envelope ever printed.
+- `src/vault-cli/commands/capture.ts` / `capture.test.ts` and `src/vault-cli/commands/search.ts` / `search.test.ts` — Task 6 qualification fix: each subcommand now calls `.version(false)` so yargs' reserved top-level `--version` flag no longer silently swallows the subcommand's own `--version <label>` string option.
 
 ## Rules this fork keeps
 
