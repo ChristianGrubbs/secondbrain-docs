@@ -230,4 +230,36 @@ describe("sb-docs search", () => {
       /--limit must be positive/,
     );
   });
+
+  it(// Regression for a 2026-09-13 qualification finding: yargs reserves the
+  // "version" key for its own top-level --version flag (registered in
+  // createVaultCli via `.version(__APP_VERSION__)`), so without disabling
+  // it per-command `search --version <label>` silently dropped <label> and
+  // every search ran against the unversioned ("") source instead.
+  "passes a --version value through to the index query, not swallowed by yargs' reserved version flag", async () => {
+    let capturedVersion: string | undefined;
+    const fakeIndex = {
+      search: async (query: { version: string }) => {
+        capturedVersion = query.version;
+        return { status: "ok", results: [], omitted: [], refreshed: 0 };
+      },
+    };
+
+    await createVaultCli(["search", "anything", "--version", "v1", "--json"], {
+      search: {
+        stateDir,
+        vaultPath: vaultDir,
+        cli: new ObsidianCli(vault.run),
+        appConfig: loadConfig(),
+        stdout: (line) => out.push(line),
+        stderr: (line) => err.push(line),
+        index: fakeIndex as unknown as VaultIndex,
+      },
+    })
+      .exitProcess(false)
+      .fail(false)
+      .parseAsync();
+
+    expect(capturedVersion).toBe("v1");
+  });
 });

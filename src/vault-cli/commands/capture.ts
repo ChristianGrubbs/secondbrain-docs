@@ -82,6 +82,15 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
     describe: "Capture a URL, local file, or bounded crawl into the vault",
     builder: (argv) =>
       argv
+        // yargs reserves the "version" key for its own top-level
+        // --version/-v flag (registered once in `createVaultCli`). Without
+        // disabling it here, `capture --version <label>` silently drops
+        // <label> — the flag is coerced by yargs' built-in boolean version
+        // handling before this command's own string option ever sees it.
+        // Disabling per-command restores this subcommand's `--version` as a
+        // plain string option while leaving `sb-docs --version` (no
+        // subcommand) working via the global registration.
+        .version(false)
         .positional("input", {
           type: "string",
           demandOption: true,

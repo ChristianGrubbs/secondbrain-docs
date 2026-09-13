@@ -71,6 +71,10 @@ export function createSearchCommand(deps: SearchDeps = {}): CommandModule {
     describe: "Search the saved vault documents this tool has captured",
     builder: (argv) =>
       argv
+        // See the matching comment in commands/capture.ts: yargs' global
+        // --version flag reserves the "version" key, so this subcommand's
+        // own string --version would otherwise be silently dropped.
+        .version(false)
         .positional("query", {
           type: "string",
           demandOption: true,
