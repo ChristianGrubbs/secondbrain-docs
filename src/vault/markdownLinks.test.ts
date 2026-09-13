@@ -282,29 +282,51 @@ describe("markdownLinks", () => {
     // -- not quadratically -- from 128KB to 256KB, so a regression back
     // to the round-10 shape fails this test.
     "scans repeated nested unterminated openers ending in one valid link with linear, not quadratic, cost", () => {
-      function timeScan(openerCount: number) {
+      // MINOR 1 (2026-09-13 Codex frontier review round 12, scoped): a
+      // single sample is too noisy at this scale -- the scan itself is
+      // sub-millisecond, so `Math.max(sample * 3, 30)` degenerated into a
+      // fixed 30ms ceiling (a much slower quadratic regression, e.g. 2ms
+      // vs 8ms, would still false-pass against it) while a single
+      // descheduled sample could just as easily false-fail. Repeating the
+      // cached scan until the aggregate clearly rises above timer noise
+      // (or a fixed iteration cap) and taking the MINIMUM per-iteration
+      // time gives a robust statistic: the minimum is never inflated by a
+      // GC pause or a descheduled tick, but a real algorithmic slowdown
+      // still raises it on every iteration.
+      function timeScanRobust(openerCount: number) {
         const chunk = `${"[[".repeat(openerCount)}valid]]`;
         countLinksTo({ markdown: chunk, target: "valid" }); // warm the parse cache
-        const start = performance.now();
-        const result = countLinksTo({ markdown: chunk, target: "valid" });
-        return { result, elapsedMs: performance.now() - start, bytes: chunk.length };
+
+        let result: number | undefined;
+        let minMs = Number.POSITIVE_INFINITY;
+        let aggregateMs = 0;
+        let iterations = 0;
+        while (aggregateMs < 20 && iterations < 50) {
+          const start = performance.now();
+          result = countLinksTo({ markdown: chunk, target: "valid" });
+          const elapsedMs = performance.now() - start;
+          aggregateMs += elapsedMs;
+          minMs = Math.min(minMs, elapsedMs);
+          iterations += 1;
+        }
+        return { result, minMs, bytes: chunk.length, iterations };
       }
 
-      const at128k = timeScan(64000);
+      const at128k = timeScanRobust(64000);
       expect(at128k.bytes).toBeGreaterThan(120000);
       expect(at128k.result).toBe(1);
-      expect(at128k.elapsedMs).toBeLessThan(200);
+      expect(at128k.minMs).toBeLessThan(200);
 
-      const at256k = timeScan(128000);
+      const at256k = timeScanRobust(128000);
       expect(at256k.bytes).toBeGreaterThan(240000);
       expect(at256k.result).toBe(1);
-      expect(at256k.elapsedMs).toBeLessThan(200);
+      expect(at256k.minMs).toBeLessThan(200);
 
       // Linear cost roughly doubles from 128KB to 256KB; a quadratic
       // regression would roughly QUADRUPLE it. Allow generous headroom
-      // (~3x) for timer noise on a doubled input while still failing a
-      // genuine quadratic regression.
-      expect(at256k.elapsedMs).toBeLessThan(Math.max(at128k.elapsedMs * 3, 30));
+      // (~3x) on the robust minimum -- no fixed floor needed now that the
+      // statistic itself is stable across repeated samples.
+      expect(at256k.minMs).toBeLessThan(at128k.minMs * 3);
     });
   });
 
@@ -473,13 +495,27 @@ describe("markdownLinks", () => {
 
       const presentStart = performance.now();
       expect(countLinksTo({ markdown: mocForPresent, target: presentTarget })).toBe(1);
-      expect(performance.now() - presentStart).toBeLessThan(10000);
+      const presentColdMs = performance.now() - presentStart;
+      expect(presentColdMs).toBeLessThan(10000);
 
-      // Same exact markdown string again -- the single-entry cache must
-      // make this dramatically cheaper than the cold parse above.
-      const cachedStart = performance.now();
-      expect(countLinksTo({ markdown: mocForPresent, target: presentTarget })).toBe(1);
-      expect(performance.now() - cachedStart).toBeLessThan(2000);
+      // MINOR 2 (2026-09-13 Codex frontier review round 12, scoped): the
+      // widened 2000ms absolute ceiling alone no longer proves the
+      // single-entry cache is actually being hit, since a genuinely COLD
+      // parse (~1.3-1.4s nominal, more under full-suite load) already
+      // fits under it -- a silently lost/bypassed cache would still pass.
+      // Require the cached call to be materially faster than the cold
+      // parse it immediately follows (by a generous relative factor, not
+      // just an absolute cap), using the minimum of a few repeated cached
+      // samples so scheduler noise on one sample can't cause a false
+      // failure.
+      let minCachedMs = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 5; i++) {
+        const cachedStart = performance.now();
+        expect(countLinksTo({ markdown: mocForPresent, target: presentTarget })).toBe(1);
+        minCachedMs = Math.min(minCachedMs, performance.now() - cachedStart);
+      }
+      expect(minCachedMs).toBeLessThan(2000);
+      expect(minCachedMs).toBeLessThan(presentColdMs / 10);
     });
 
     it(// MINOR (2026-09-13 Codex frontier review round 6, third pass): a
