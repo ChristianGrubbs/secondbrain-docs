@@ -424,6 +424,252 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR 1+2 (2026-09-13 Codex frontier review, round 6, scoped): the
+    // hand-rolled fence stripper only recognized a fence starting at column
+    // 0; CommonMark allows a fence indented 1-3 spaces.
+    "rejects a MOC whose only mention of the target is inside a fence indented 1-3 spaces",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-TAU-1019");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Example:\n  \`\`\`\n  - [[${target}]]\n  \`\`\`\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-TAU-1019"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // A 4+-space-indented block is CommonMark's *indented* code block, a
+    // different construct from a fence entirely, and must be stripped too.
+    "rejects a MOC whose only mention of the target is inside a 4+-space-indented code block",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-UPSILON-1020");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Example:\n\n    - [[${target}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-UPSILON-1020"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // CommonMark requires a closing fence line to contain nothing but the
+    // fence characters (optionally trailing whitespace); a line with
+    // trailing text does NOT close the fence, so a link between it and the
+    // real closing fence is still code, and only the real link after the
+    // true close counts.
+    "counts exactly one real link when a fence's bogus closing line (with trailing text) does not actually close it",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-PHI-1021");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `\`\`\`\n- [[${target}]]\n\`\`\` trailing\n\`\`\`\nreal: [[${target}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-PHI-1021"],
+        collection: "collection",
+        query: "FACT-PHI-1021",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // CommonMark: a backtick-fenced code block's info string must not
+    // itself contain a backtick -- such a line is not a valid fence opener
+    // at all, so the following content (including a real link) is ordinary
+    // prose, not code.
+    "counts exactly one real link when a backtick opener's info string itself contains backticks (not a valid fence)",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-CHI-1022");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        "``` `info` \n" + `real: [[${target}]]\n` + "```\n",
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-CHI-1022"],
+        collection: "collection",
+        query: "FACT-CHI-1022",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // The hand-rolled stripper's inline-span regex only matched a
+    // single-backtick pair on one line; a multi-backtick-delimited span
+    // was not recognized as one unit.
+    "rejects a MOC whose only mention of the target is inside a multi-backtick inline code span",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-PSI-1023");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `See \`\` [[${target}]] \`\` above.\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-PSI-1023"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // The hand-rolled stripper operated one line at a time, so an inline
+    // code span spanning a line break was invisible to it.
+    "rejects a MOC whose only mention of the target is inside a multiline inline code span",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-OMEGA-1024");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `See \`\n[[${target}]]\n\` above.\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-OMEGA-1024"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // A double-backtick-delimited span containing a literal single backtick
+    // inside it -- a "mismatched delimiter run" the hand-rolled
+    // single-backtick-pair regex could misjudge the boundary of.
+    "rejects a MOC whose only mention of the target is inside a mismatched-delimiter-run inline code span",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-ALPHA2-1025");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `See \`\` code \` still code, [[${target}]] \`\` here.\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-ALPHA2-1025"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // Text that looks like a fence marker, but appears inline with no
+    // matching closing backtick run anywhere in the same paragraph, is an
+    // unmatched backtick run -- CommonMark treats it as literal text, not a
+    // code span and never a block-level fence (fences only open at the
+    // start of a line). The real link on the same line must still count.
+    "counts exactly one real link when fence-looking text appears inline with no matching close",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-BETA2-1026");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Note: \`\`\`\`\` marks a fence, e.g. real: [[${target}]].\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-BETA2-1026"],
+        collection: "collection",
+        query: "FACT-BETA2-1026",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

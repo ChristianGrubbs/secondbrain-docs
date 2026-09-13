@@ -57,18 +57,21 @@ export function mocLinkTarget(notePath) {
  * would satisfy without a single navigable link (MAJOR 1, 2026-09-13 Codex
  * frontier review, round 4).
  *
- * Fenced code blocks (both ``` and ~~~ styles) and inline code spans are
- * stripped before counting, by the ONE shared implementation
- * `src/vault/markdownLinks.mjs` also uses -- not a second, independently
- * drifting copy that only handled backtick fences (MAJOR 2, 2026-09-13
- * Codex frontier review, round 5).
+ * Fenced code blocks (any indentation, backtick or tilde) and inline code
+ * spans (any backtick run length, single- or multi-line) are excluded from
+ * matching by a real CommonMark parse, done by the ONE shared
+ * implementation `src/vault/markdownLinks.mjs` also uses -- not a second,
+ * independently-drifting hand-rolled stripper (MAJOR 2, 2026-09-13 Codex
+ * frontier review, round 5; MAJOR 1+2, round 6 scoped re-review: the
+ * hand-rolled stripper itself was not CommonMark-correct, replaced with
+ * `remark`/`unified`).
  *
  * @param moc The MOC note's Markdown.
  * @param target Vault path of the note, without its `.md` extension.
  * @returns The number of distinct `[[target]]`/`[[target|alias]]` matches.
  */
 export function countMocLinksTo(moc, target) {
-  return countLinksTo(moc, target);
+  return countLinksTo({ markdown: moc, target });
 }
 
 /**

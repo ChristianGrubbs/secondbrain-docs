@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
-import { stripCodeAndInlineSpans } from "./markdownLinks.mjs";
+import { countLinksTo } from "./markdownLinks.mjs";
 import { ObsidianCli } from "./ObsidianCli";
 import { PublicationJournal } from "./PublicationJournal";
 import { renderSourceNote } from "./render";
@@ -206,16 +206,18 @@ function makeTempDir(prefix: string): string {
 }
 
 /**
- * Counts index lines that live-link a note path, using the same shared
- * fence/inline-code stripper the publisher itself uses (MAJOR 2, 2026-09-13
- * Codex frontier review round 5) -- not a test-local re-implementation that
- * only strips backtick fences and would misclassify a link mentioned inside
- * a tilde fence or inline code span as live.
+ * Reports one placeholder entry per real link, using the exact same shared,
+ * CommonMark-correct implementation the publisher itself uses (MAJOR 2,
+ * 2026-09-13 Codex frontier review round 5; MAJOR 1+2, round 6 scoped
+ * re-review: the shared implementation itself is now a real `remark` parse,
+ * not a hand-rolled line-based stripper) -- not a test-local
+ * re-implementation that could itself drift from what the publisher
+ * actually does. Kept as an array-returning helper (rather than switching
+ * every call site to `expect(countLinksTo(...)).toBe(n)`) so every existing
+ * `.toHaveLength(n)` assertion keeps working unchanged.
  */
-function linksTo(index: string, target: string): string[] {
-  return stripCodeAndInlineSpans(index)
-    .split("\n")
-    .filter((line) => line.includes(`[[${target}`));
+function linksTo(index: string, target: string): unknown[] {
+  return Array.from({ length: countLinksTo({ markdown: index, target }) });
 }
 
 beforeEach(() => {
@@ -1035,6 +1037,150 @@ describe("VaultPublisher review regressions", () => {
       cli.notes.set(
         indexPath,
         `# Source Captures\n\n## Sources\n\nSee the example \`[[${target}]]\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 1+2 (2026-09-13 Codex frontier review round 6, scoped): a
+    // fence indented 1-3 spaces was invisible to the round-5 hand-rolled
+    // stripper, so a mention inside one was wrongly counted as a live
+    // link. The publisher must still add the real one.
+    "does not count a link inside a fence indented 1-3 spaces as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n  \`\`\`\n  - [[${target}]]\n  \`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    // A 4+-space-indented block is CommonMark's *indented* code block, a
+    // different construct from a fence entirely -- checked at the module
+    // level (`markdownLinks.test.ts`) and the contract level
+    // (`scripts/lib/qualification-contract.test.ts`). Deliberately not
+    // repeated as a full publish/insert round-trip here:
+    // `insertUnderHeading` inserts the new real link as a flat list item
+    // immediately under the heading, and CommonMark then reparses the
+    // *pre-existing* 4-space-indented line as a nested list item
+    // continuing that same list (not an indented code block) once it
+    // directly follows a list item -- a genuine, correct reparse of the
+    // resulting document, not a defect in link counting, so it would not
+    // be a meaningful end-to-end fixture for "was this mention hidden".
+
+    it(// CommonMark requires a closing fence line to contain nothing but the
+    // fence characters (optionally trailing whitespace); a bogus closer
+    // with trailing text does not close the fence, so the already-real
+    // link placed after the true close is recognized as already linked
+    // and must not be duplicated.
+    "recognizes a real link after a fence whose bogus closing line (with trailing text) did not actually close it", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n\`\`\`\n- [[${target}]]\n\`\`\` trailing\n\`\`\`\n- [[${target}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// CommonMark: a backtick-fenced code block's info string must not
+    // itself contain a backtick -- such a line is not a valid fence
+    // opener, so the real link right after it is ordinary prose and is
+    // already linked; the publisher must not duplicate it.
+    "recognizes a real link after a backtick opener whose info string itself contains backticks (not a valid fence)", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n\`\`\` \`info\` \n- [[${target}]]\n\`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// The round-5 hand-rolled stripper's inline-span regex only matched a
+    // single-backtick pair on one line; a multi-backtick-delimited span
+    // was not recognized as one unit.
+    "does not count a link inside a multi-backtick inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\` [[${target}]] \`\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// The round-5 hand-rolled stripper operated one line at a time, so an
+    // inline code span spanning a line break was invisible to it.
+    "does not count a link inside a multiline inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\n[[${target}]]\n\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// A double-backtick-delimited span containing a literal single
+    // backtick inside it -- a "mismatched delimiter run" the hand-rolled
+    // single-backtick-pair regex could misjudge the boundary of.
+    "does not count a link inside a mismatched-delimiter-run inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\` code \` still code, [[${target}]] \`\` here.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Text that looks like a fence marker, but appears inline with no
+    // matching closing backtick run anywhere in the same paragraph, is an
+    // unmatched backtick run -- CommonMark treats it as literal text, so
+    // the real link on the same line is already linked and must not be
+    // duplicated.
+    "recognizes a real link on the same line as fence-looking text with no matching close", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nNote: \`\`\`\`\` marks a fence, e.g. [[${target}]].\n`,
       );
 
       const republished = await publisher.publish(makeDocument());

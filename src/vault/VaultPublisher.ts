@@ -916,7 +916,7 @@ export class VaultPublisher implements Publisher {
 
     if (index !== null) {
       if (!index.split("\n").includes(SOURCES_HEADING)) return "pending";
-      if (hasLinkTo(index, target)) return "linked";
+      if (hasLinkTo({ markdown: index, target })) return "linked";
     }
 
     try {

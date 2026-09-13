@@ -5,84 +5,96 @@
  * two independently-drifting copies (MAJOR 2, 2026-09-13 Codex frontier
  * review round 5).
  *
- * Round 4's `stripCodeFences` only recognized backtick (```) fences and did
- * nothing about tilde (~~~) fences or inline code spans, so a target
- * mentioned only inside a `~~~` block or a `` `[[...]]` `` inline code span
- * was still counted as a real link. That is a real product bug in the
- * publisher too, not just a qualification-tooling gap: `VaultPublisher`'s
- * `hasLinkTo` used the exact same limited stripper, so it could believe a
- * code-example mention was already a live link and skip adding the real
- * one — leaving a published note with zero navigable MOC links.
+ * Round 5's hand-rolled line-based fence/inline-span stripper was not
+ * CommonMark-correct (MAJOR 1+2, 2026-09-13 Codex frontier review round 6,
+ * scoped): it missed fences indented 1-3 spaces, accepted a closing fence
+ * line with trailing non-whitespace as if it closed the fence, accepted a
+ * backtick opener whose info string itself contained backticks (which
+ * CommonMark says is NOT a valid fence), and its same-line
+ * single-backtick-pair inline-span regex mishandled multi-backtick and
+ * multiline spans and mismatched delimiter runs. Rather than keep extending
+ * a hand-rolled parser to chase each new CommonMark edge case, this parses
+ * the Markdown with the `remark`/`unified` toolchain already in the
+ * dependency tree (see `package.json`'s `remark`/`remark-parse`/`unified`
+ * entries, also used by `src/splitter/SemanticMarkdownSplitter.ts`) to an
+ * mdast tree, and counts wikilink syntax only in the parts of that tree
+ * that are real prose -- never inside a `code` (fenced or indented) or
+ * `inlineCode` node.
  *
- * This implementation strips both fence styles (respecting CommonMark's
- * fence-closing rule: a fence only closes on a line starting with the same
- * character, repeated at least as many times as the opener) and inline code
- * spans, before counting wikilink syntax.
+ * Verified by probe (see `src/vault/markdownLinks.test.ts`): remark's core
+ * `remark-parse` (no wikilink plugin installed) treats `[[target]]` /
+ * `[[target|alias]]` as ordinary literal text -- it is not special syntax
+ * to remark, so it always survives into a `text` node's `value` verbatim,
+ * which is exactly what this module's regex matches against.
  */
+
+import remarkParse from "remark-parse";
+import { unified } from "unified";
+import { visit } from "unist-util-visit";
+
+/** One parser instance, reused across calls (parsing is the expensive part). */
+const processor = unified().use(remarkParse);
 
 /**
- * Removes fenced code blocks (backtick or tilde, 3+ characters, with a
- * closing fence requiring the same character and at least as many repeats)
- * and inline code spans (`` `...` ``) from `markdown`, so neither can be
- * mistaken for live prose/links.
- *
- * @param {string} markdown
- * @returns {string} `markdown` with all code fences and inline code spans removed.
+ * mdast node types whose direct (non-code) text content this module treats
+ * as one contiguous span for matching -- so a wikilink split across
+ * adjacent text nodes by an emphasis, strong or link node (e.g.
+ * `[[collection/*Fixture*]]`) is still reassembled and matched as one
+ * string, scoped to a single block so unrelated paragraphs can never be
+ * concatenated into a false match.
  */
-export function stripCodeAndInlineSpans(markdown) {
-  const lines = markdown.split("\n");
-  const kept = [];
-  /** @type {string | null} */
-  let fenceChar = null;
-  let fenceLen = 0;
+const TEXT_CONTAINER_TYPES = new Set(["paragraph", "heading", "tableCell"]);
 
-  for (const line of lines) {
-    const fenceMatch = line.match(/^(`{3,}|~{3,})/);
-
-    if (fenceChar !== null) {
-      // Inside a fence: only a line starting with the same character,
-      // repeated at least as many times as the opener, closes it.
-      if (fenceMatch && fenceMatch[1][0] === fenceChar && fenceMatch[1].length >= fenceLen) {
-        fenceChar = null;
-        fenceLen = 0;
-      }
-      continue;
-    }
-
-    if (fenceMatch) {
-      fenceChar = fenceMatch[1][0];
-      fenceLen = fenceMatch[1].length;
-      continue;
-    }
-
-    kept.push(line.replace(/`[^`]*`/g, ""));
+/**
+ * Recursively collects the visible (non-code) text of one phrasing-content
+ * node. `code` and `inlineCode` nodes are skipped entirely -- their `value`
+ * is never included, so a target mentioned only inside one can never be
+ * mistaken for -- or, in the publisher, suppress -- a real link.
+ *
+ * @param {import("mdast").Node} node
+ * @returns {string}
+ */
+function collectVisibleText(node) {
+  if (node.type === "code" || node.type === "inlineCode") return "";
+  if (node.type === "text" || node.type === "html") return node.value ?? "";
+  if (Array.isArray(node.children)) {
+    return node.children.map(collectVisibleText).join("");
   }
-
-  return kept.join("\n");
+  return "";
 }
 
 /**
  * Counts real wikilink references to `target` in `markdown`
- * (`[[target]]`/`[[target|alias]]`), after removing fenced code blocks and
- * inline code spans so an example mention never counts as a live link.
+ * (`[[target]]`/`[[target|alias]]`), using a real CommonMark parse so
+ * fenced code (any indentation, any fence character run length), indented
+ * code blocks, and inline code spans (any backtick run length, single- or
+ * multi-line) are never mistaken for prose, however they are written.
  *
- * @param {string} markdown
- * @param {string} target Vault path of the note, without its `.md` extension.
+ * @param options.markdown The Markdown to search.
+ * @param options.target Vault path of the note, without its `.md` extension.
  * @returns {number} The number of distinct `[[target]]`/`[[target|alias]]` matches.
  */
-export function countLinksTo(markdown, target) {
+export function countLinksTo({ markdown, target }) {
   const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`, "g");
-  return (stripCodeAndInlineSpans(markdown).match(pattern) ?? []).length;
+
+  const tree = processor.parse(markdown);
+  let count = 0;
+  visit(tree, (node) => {
+    if (TEXT_CONTAINER_TYPES.has(node.type)) {
+      count += (collectVisibleText(node).match(pattern) ?? []).length;
+    }
+  });
+  return count;
 }
 
 /**
  * Reports whether `markdown` links to `target`, with or without an alias.
  *
- * @param {string} markdown
- * @param {string} target Vault path of the note, without its `.md` extension.
+ * @param options.markdown The Markdown to search.
+ * @param options.target Vault path of the note, without its `.md` extension.
  * @returns {boolean}
  */
-export function hasLinkTo(markdown, target) {
-  return countLinksTo(markdown, target) > 0;
+export function hasLinkTo({ markdown, target }) {
+  return countLinksTo({ markdown, target }) > 0;
 }
