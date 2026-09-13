@@ -21,6 +21,7 @@ import type { CliResult, SourceDocument } from "./types";
 import {
   IndexContentError,
   type IndexEntry,
+  type IndexManifestEntry,
   IndexVerificationError,
   STORE_ENCODING_ID,
   VaultIndex,
@@ -877,6 +878,118 @@ describe("VaultIndex", () => {
       expect(inbox.results[0].digest).toBe(sha256(inboxNote.markdown));
       expect(other.results.map((r) => r.vault_path)).toEqual([otherNote.path]);
       expect(other.results[0].digest).toBe(sha256(otherNote.markdown));
+      expect(vault.writes).toEqual([]);
+    });
+
+    it(// R12/R13: the same "rebuild A, then B, delete only derived index
+    // data, reconstruct both" shape as above, but combined with three
+    // things that must all survive it at once: a manually edited note
+    // (general behavior already covered standalone by "indexes a manually
+    // edited note as it now stands"), a conflict candidate that must stay
+    // excluded (standalone: "excludes conflict candidates from what it
+    // indexes"), and case-distinct version identities that must stay
+    // distinct (standalone: the "version identity" describe block). This
+    // index never fetches an original external source — it only ever
+    // reads saved vault bytes — so "deny the original fetch" is satisfied
+    // by construction: `vault.writes` stays empty throughout.
+    "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)", async () => {
+      const vault = new FakeVault();
+      const { inboxNote, otherNote } = twoCollections(vault);
+
+      // A human edits the OTHER collection's note directly in the vault.
+      vault.notes.set(
+        otherNote.path,
+        otherNote.markdown.replace(/toolboxical/g, "handeditedtoolbox"),
+      );
+
+      // A conflict candidate parked under Source Capture Updates, offered
+      // only through an explicit inventory (the only way it could ever be
+      // seen), which must stay excluded through the whole reconstruction.
+      const candidate = `${SOURCE_UPDATES_PATH}/aaaaaaaaaaaa-0123456789ab.md`;
+      vault.notes.set(
+        candidate,
+        otherNote.markdown.replace(/toolboxical/g, "rejectedcandidate"),
+      );
+
+      // Case-distinct version identities of one URL in COLLECTION.
+      const url = "https://example.com/case-distinct-recon";
+      const upperVersion = sourceNote({
+        url,
+        title: "Case Distinct Recon",
+        body: body("uppercasereconium"),
+        version: "Release",
+      });
+      const lowerVersion = sourceNote({
+        url,
+        title: "Case Distinct Recon",
+        body: body("lowercasereconium"),
+        version: "release",
+      });
+      vault.notes.set(upperVersion.path, upperVersion.markdown);
+      vault.notes.set(lowerVersion.path, lowerVersion.markdown);
+
+      const first = makeIndex(vault);
+      await first.rebuild({ collection: COLLECTION, inventory: [candidate] });
+      await first.rebuild({ collection: OTHER, inventory: [candidate] });
+      await first.shutdown();
+
+      fs.rmSync(path.join(stateDir, "index"), { recursive: true, force: true });
+
+      const second = makeIndex(vault);
+      await second.rebuild({ collection: COLLECTION, inventory: [candidate] });
+      await second.rebuild({ collection: OTHER, inventory: [candidate] });
+
+      // Inspect manifests directly before any search can lazily repair.
+      expect(
+        second
+          .manifestEntries(COLLECTION)
+          .map((e) => e.vaultPath)
+          .sort(),
+      ).toEqual([inboxNote.path, upperVersion.path, lowerVersion.path].sort());
+      expect(second.manifestEntries(OTHER).map((e) => e.vaultPath)).toEqual([
+        otherNote.path,
+      ]);
+
+      // The manual edit survived reconstruction with its new content.
+      const edited = await second.search({
+        query: "handeditedtoolbox",
+        collection: OTHER,
+      });
+      expect(edited.results.map((r) => r.vault_path)).toEqual([otherNote.path]);
+      expect(edited.results[0].digest).toBe(
+        sha256(vault.notes.get(otherNote.path) ?? ""),
+      );
+
+      // The conflict candidate never entered any index.
+      const rejected = await second.search({
+        query: "rejectedcandidate",
+        collection: OTHER,
+      });
+      expect(rejected.results).toEqual([]);
+
+      // The two case-distinct versions stayed distinct documents, each
+      // answerable only by its own version label.
+      const upperHit = await second.search({
+        query: "uppercasereconium",
+        collection: COLLECTION,
+        version: "Release",
+      });
+      expect(upperHit.results.map((r) => r.vault_path)).toEqual([upperVersion.path]);
+      const lowerHit = await second.search({
+        query: "lowercasereconium",
+        collection: COLLECTION,
+        version: "release",
+      });
+      expect(lowerHit.results.map((r) => r.vault_path)).toEqual([lowerVersion.path]);
+      const crossed = await second.search({
+        query: "lowercasereconium",
+        collection: COLLECTION,
+        version: "Release",
+      });
+      expect(crossed.results).toEqual([]);
+
+      // No original-source fetch of any kind — everything came from saved
+      // vault bytes already in the fake vault.
       expect(vault.writes).toEqual([]);
     });
 
@@ -2167,11 +2280,16 @@ describe("VaultIndex", () => {
      * damaged state repairs whichever note the writer is holding, and only a
      * sibling can show that the rest were lost.
      */
+    /** Collection kept entirely healthy alongside the one that gets damaged. */
+    const OTHER_COLLECTION = "other-healthy-collection";
+
     async function twoIndexed(): Promise<{
       vault: FakeVault;
       index: VaultIndex;
       touched: ReturnType<typeof sourceNote>;
       sibling: ReturnType<typeof sourceNote>;
+      otherCollectionNote: ReturnType<typeof sourceNote>;
+      otherCollectionManifestBefore: IndexManifestEntry[];
     }> {
       const vault = new FakeVault();
       const [touched, sibling] = ["touchable", "siblingual"].map((phrase) => {
@@ -2184,10 +2302,41 @@ describe("VaultIndex", () => {
         return note;
       });
 
+      // A second, entirely separate collection with its own note. Damage
+      // applied to `COLLECTION` below must never reach this one — proving
+      // that requires a real second index, not just an assertion of intent.
+      const otherCollectionNote = sourceNote({
+        url: "https://example.com/untouchable",
+        title: "untouchable",
+        body: body("untouchable"),
+        collection: OTHER_COLLECTION,
+      });
+      vault.notes.set(otherCollectionNote.path, otherCollectionNote.markdown);
+
       const index = makeIndex(vault);
       const report = await index.rebuild({ collection: COLLECTION });
       expect(report.notesIndexed).toBe(2);
-      return { vault, index, touched, sibling };
+      const otherReport = await index.rebuild({ collection: OTHER_COLLECTION });
+      expect(otherReport.notesIndexed).toBe(1);
+      const otherCollectionManifestBefore = index.manifestEntries(OTHER_COLLECTION);
+
+      return {
+        vault,
+        index,
+        touched,
+        sibling,
+        otherCollectionNote,
+        otherCollectionManifestBefore,
+      };
+    }
+
+    /** Asserts `OTHER_COLLECTION`'s manifest is byte-for-byte unchanged (untouched by damage/repair of `COLLECTION`). */
+    function expectOtherCollectionUntouched(
+      index: VaultIndex,
+      before: IndexManifestEntry[],
+    ): void {
+      const after = index.manifestEntries(OTHER_COLLECTION);
+      expect(after).toEqual(before);
     }
 
     /** Every way a generation can be damaged, applied to the active one. */
@@ -2272,9 +2421,10 @@ describe("VaultIndex", () => {
     ];
 
     it.each(damages)(
-      "keeps both notes searchable after an upsert meets %s",
+      "keeps both notes searchable after an upsert meets %s (R01-R09, upsert path)",
       async (_name, damage) => {
-        const { index, touched, sibling } = await twoIndexed();
+        const { index, touched, sibling, otherCollectionManifestBefore } =
+          await twoIndexed();
         await index.shutdown();
         damage(index);
 
@@ -2282,7 +2432,8 @@ describe("VaultIndex", () => {
         const result = await index.upsert(entryFor(touched));
         expect(result.status).toBe("indexed");
 
-        // Both, not just the one the writer was holding.
+        // Both, not just the one the writer was holding, and each with its
+        // digest intact — recovery must reconstruct real entries, not stubs.
         for (const note of [touched, sibling]) {
           const response = await index.search({
             query: note.document.title,
@@ -2293,14 +2444,26 @@ describe("VaultIndex", () => {
             `${note.document.title} should still be searchable`,
           ).toEqual([note.path]);
         }
-        expect(index.manifestEntries(COLLECTION)).toHaveLength(2);
+        const entries = index.manifestEntries(COLLECTION);
+        expect(entries).toHaveLength(2);
+        for (const note of [touched, sibling]) {
+          const entry = entries.find((e) => e.vaultPath === note.path);
+          expect(entry?.digest, `${note.path} should have a digest`).toBe(
+            sha256(note.markdown),
+          );
+        }
+
+        // A second, healthy collection must be completely unaffected by
+        // damage to and repair of this one.
+        expectOtherCollectionUntouched(index, otherCollectionManifestBefore);
       },
     );
 
     it.each(damages)(
-      "recovers the same way for a reader after %s",
+      "recovers the same way for a reader after %s (R01-R09, search path)",
       async (_name, damage) => {
-        const { index, touched, sibling } = await twoIndexed();
+        const { index, touched, sibling, otherCollectionManifestBefore } =
+          await twoIndexed();
         await index.shutdown();
         damage(index);
 
@@ -2311,12 +2474,18 @@ describe("VaultIndex", () => {
           collection: COLLECTION,
         });
         expect(response.results.map((r) => r.vault_path)).toEqual([touched.path]);
-        expect(
-          index
-            .manifestEntries(COLLECTION)
-            .map((e) => e.vaultPath)
-            .sort(),
-        ).toEqual([touched.path, sibling.path].sort());
+        const entries = index.manifestEntries(COLLECTION);
+        expect(entries.map((e) => e.vaultPath).sort()).toEqual(
+          [touched.path, sibling.path].sort(),
+        );
+        for (const note of [touched, sibling]) {
+          const entry = entries.find((e) => e.vaultPath === note.path);
+          expect(entry?.digest, `${note.path} should have a digest`).toBe(
+            sha256(note.markdown),
+          );
+        }
+
+        expectOtherCollectionUntouched(index, otherCollectionManifestBefore);
       },
     );
 
@@ -2349,6 +2518,211 @@ describe("VaultIndex", () => {
         collection: COLLECTION,
       });
       expect(other.results).toEqual([]);
+    });
+
+    it(// R11: a genuinely never-built collection (no pointer, no generations,
+    // no notes) and a healthy collection given an honest no-hit query both
+    // legitimately answer `status: "ok"` with empty results — there is
+    // nothing to find in either case. A damaged collection that *does*
+    // have notes must never join them: it recovers the real notes via
+    // rebuild instead of silently reporting empty, which the `damages`
+    // table above already proves for every one of the nine shapes. This
+    // test puts all three envelopes side by side so the distinction is
+    // explicit in one place rather than implied across separate tests.
+    "distinguishes never-built, honest miss and damaged-with-notes (R11)", async () => {
+      // 1. Never-built: nothing has ever indexed this collection, and the
+      // vault has no notes in it either.
+      const neverBuiltVault = new FakeVault();
+      const neverBuiltIndex = makeIndex(neverBuiltVault);
+      const neverBuilt = await neverBuiltIndex.search({
+        query: "anything",
+        collection: "genuinely-never-built",
+      });
+      expect(neverBuilt.status).toBe("ok");
+      expect(neverBuilt.results).toEqual([]);
+      expect(neverBuiltIndex.manifestEntries("genuinely-never-built")).toEqual([]);
+
+      // 2. Healthy + honest miss: the collection is indexed and undamaged;
+      // the query simply matches nothing.
+      const { index: healthyIndex, touched, sibling } = await twoIndexed();
+      const honestMiss = await healthyIndex.search({
+        query: "no-such-phrase-appears-anywhere-4471",
+        collection: COLLECTION,
+      });
+      expect(honestMiss.status).toBe("ok");
+      expect(honestMiss.results).toEqual([]);
+      // The notes are still there — a miss on this query is not damage.
+      expect(
+        healthyIndex
+          .manifestEntries(COLLECTION)
+          .map((e) => e.vaultPath)
+          .sort(),
+      ).toEqual([touched.path, sibling.path].sort());
+
+      // 3. Damaged, but WITH real notes on disk: must never collapse to
+      // the same "ok + empty" shape as (1) or (2) — it must recover them.
+      const { index: damagedIndex, touched: damagedTouched } = await twoIndexed();
+      await damagedIndex.shutdown();
+      fs.rmSync(path.join(damagedIndex.collectionRoot(COLLECTION), "current.json"));
+      const damagedResult = await damagedIndex.search({
+        query: damagedTouched.document.title,
+        collection: COLLECTION,
+      });
+      expect(damagedResult.results.map((r) => r.vault_path)).toEqual([
+        damagedTouched.path,
+      ]);
+      expect(damagedResult.results).not.toEqual([]);
+    });
+  });
+
+  describe("known coverage limits (6D, recorded — never a detection pass)", () => {
+    it(// D01: post-promotion FTS/document divergence at unchanged row count
+    // is a deliberately accepted, undetected limit (Task 5 review, MOC
+    // log 2026-09-13). This probe mutates `documents_fts` content directly
+    // — bypassing the upstream triggers that normally keep it and
+    // `documents` in sync — while leaving row counts on both tables
+    // unchanged, then proves search answers from the (now-wrong) FTS
+    // content without noticing the divergence. This is the coverage limit
+    // itself, run and recorded, not a passing detection test.
+    "does NOT detect documents_fts content diverging from documents at an unchanged row count (D01, accepted limit)", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/ftsdivergence",
+        title: "Fts Divergence",
+        body: body("genuinecontentphrase"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+
+      const genDir = activeGenerationDir(index);
+      const dbPath = path.join(genDir, "documents.db");
+      const before = new Database(dbPath, { readonly: true });
+      const documentsCountBefore = (
+        before.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number }
+      ).n;
+      before.close();
+
+      const db = new Database(dbPath);
+      try {
+        // Directly rewrite the FTS row's content, bypassing the trigger
+        // that keeps it in sync with `documents`. Row counts on both
+        // tables are unchanged before and after.
+        db.prepare(
+          "UPDATE documents_fts SET content = ? WHERE rowid = (SELECT MIN(rowid) FROM documents_fts)",
+        ).run("completely different diverged content, not what documents holds");
+      } finally {
+        db.close();
+      }
+
+      const after = new Database(dbPath, { readonly: true });
+      const documentsCountAfter = (
+        after.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number }
+      ).n;
+      const ftsCountAfter = (
+        after.prepare("SELECT COUNT(*) AS n FROM documents_fts").get() as { n: number }
+      ).n;
+      after.close();
+      // Row counts on both tables are exactly as they were — the shape
+      // this limit is specifically about.
+      expect(documentsCountAfter).toBe(documentsCountBefore);
+      expect(ftsCountAfter).toBe(documentsCountBefore);
+
+      // The accepted limit: search answers from the diverged FTS content
+      // without detecting or flagging the mismatch. Neither the original
+      // phrase nor the injected one is asserted to reliably win — only
+      // that no error, warning-carrying omission, or corruption signal is
+      // raised. This is the recorded gap, not a passing detection test.
+      const response = await index.search({
+        query: "genuinecontentphrase",
+        collection: COLLECTION,
+      });
+      expect(response.status).toBe("ok");
+      // No omission entry describes this as detected corruption.
+      expect(response.omitted).toEqual([]);
+    });
+
+    it(// D02: generation pruning is best-effort. Make a stale (superseded)
+    // generation directory unremovable, rebuild again, and assert: the
+    // active generation and its results are unaffected, the removal
+    // failure does not fail the rebuild, and a later rebuild's pruning
+    // pass retries removal (rather than the failure being durable/fatal).
+    "logs and tolerates a generation-pruning removal failure without losing the active generation (D02)", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/pruningfailure",
+        title: "Pruning Failure",
+        body: body("prunefailphrase"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      const firstGeneration = activeGeneration(index);
+      const firstGenerationDir = path.join(
+        index.collectionRoot(COLLECTION),
+        "generations",
+        firstGeneration,
+      );
+
+      // Make the now-stale generation directory unremovable: replace it
+      // with a read-only file at the same path so an `rm -rf`-style
+      // removal fails cleanly instead of throwing something unrelated.
+      // (chmod 000 on a directory is not reliably enforced for the owning
+      // user on every filesystem; a file where a directory is expected is
+      // a portable way to make removal fail.)
+      await index.shutdown();
+
+      vault.notes.set(
+        note.path,
+        note.markdown.replace(/prunefailphrase/g, "prunefailphrasev2"),
+      );
+      const secondIndex = makeIndex(vault);
+      await secondIndex.rebuild({ collection: COLLECTION });
+      const secondGeneration = activeGeneration(secondIndex);
+      expect(secondGeneration).not.toBe(firstGeneration);
+
+      // Simulate the stale generation being unremovable at the moment
+      // pruning runs, by making its directory read-only before the next
+      // rebuild's pruning pass attempts removal. (The prior generation
+      // directory `firstGenerationDir` is what pruning would try to
+      // remove once it is no longer active.)
+      fs.chmodSync(firstGenerationDir, 0o555);
+
+      vault.notes.set(
+        note.path,
+        note.markdown.replace(/prunefailphrase/g, "prunefailphrasev3"),
+      );
+      await secondIndex.rebuild({ collection: COLLECTION });
+      const thirdGeneration = activeGeneration(secondIndex);
+      expect(thirdGeneration).not.toBe(secondGeneration);
+
+      // The active generation and its results are unaffected by the
+      // pruning failure — no exact retained-generation count is asserted.
+      const response = await secondIndex.search({
+        query: "prunefailphrasev3",
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(fs.existsSync(firstGenerationDir)).toBe(true);
+
+      // Restore permissions and prove a later rebuild's pruning pass
+      // retries and this time succeeds (no durable-state deletion — only
+      // the derived, superseded generation directory).
+      fs.chmodSync(firstGenerationDir, 0o755);
+      vault.notes.set(
+        note.path,
+        note.markdown.replace(/prunefailphrase/g, "prunefailphrasev4"),
+      );
+      await secondIndex.rebuild({ collection: COLLECTION });
+      expect(fs.existsSync(firstGenerationDir)).toBe(false);
+
+      const final = await secondIndex.search({
+        query: "prunefailphrasev4",
+        collection: COLLECTION,
+      });
+      expect(final.results.map((r) => r.vault_path)).toEqual([note.path]);
     });
   });
 });
