@@ -346,7 +346,7 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     });
   });
 
-  it("F06: local Markdown preserves body, code fence and Unicode; local image asset is NOT copied (known gap)", async () => {
+  it("F06: local Markdown preserves body/code fence/Unicode, but FAILS the row's local-asset-preservation requirement", async () => {
     const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-capqual-src-"));
     fs.copyFileSync(
       path.join(fixturesDir, "vault-capture", "local-notes.md"),
@@ -394,18 +394,26 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     expect(readBack.stdout).toBe(`${savedBytes}\n`);
     expect(savedBytes).toContain("WIBBLEFLUX-3390");
 
-    // KNOWN GAP (recorded, not silently weakened): VaultCaptureService has no
-    // local-asset copy/link step, so the relative `./pixel.png` reference is
-    // preserved as literal text but the image itself is never copied beside
-    // the saved note, and the link is not rewritten to a resolvable vault
-    // path. See docs/migration-qualification.md row F06.
+    // RECORDED FAIL (row F06 per docs/migration-qualification.md, per the
+    // plan's 6A requirement that "required document-local assets must be
+    // copied and linked before that row qualifies"): VaultCaptureService has
+    // no local-asset copy/link step, so the relative `./pixel.png` reference
+    // is preserved as literal text but the image itself is never copied
+    // beside the saved note, and the link is not rewritten to a resolvable
+    // vault path. This assertion documents the current (failing) truth; it
+    // does not weaken the row's requirement. Fixing this by writing the
+    // binary asset straight to the vault filesystem would violate the "all
+    // vault access uses obsidian-cli" invariant, because obsidian-cli has no
+    // binary/attachment write command (`obsidian-cli help` lists
+    // create/write/append/section-insert/move for Markdown only). See the
+    // "Decisions needed" section of docs/migration-qualification.md.
     const assetCopied = fs.existsSync(
       path.join(sandbox, path.dirname(outcomes[0].publication?.path ?? ""), "pixel.png"),
     );
     expect(assetCopied).toBe(false);
   });
 
-  it("F07: text PDF with a table preserves cell text; table structure is NOT reconstructed (known gap)", async () => {
+  it("F07: text PDF with a table preserves cell text, but FAILS the row's table-structure requirement (converter limit)", async () => {
     // Copied into the allowed-roots temp dir like every other single-file
     // row: the sandbox config's `allowedRoots` only covers `os.tmpdir()`, so
     // referencing the fixture at its real repo path fails as
@@ -431,9 +439,18 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     expect(markdown).toContain("87.97");
     expect(markdown).toContain("Earth");
     expect(markdown).toContain("365.26");
-    // KNOWN GAP: extraction flattens the two-column layout into a single
-    // prose line rather than a Markdown table (`| ... | ... |` / pipe row).
-    // Recorded, not weakened — see docs/migration-qualification.md row F07.
+    // RECORDED FAIL (row F07 per docs/migration-qualification.md, per the
+    // plan's 6B table-assertion requirement): extraction flattens the
+    // two-column layout into a single prose line rather than a Markdown
+    // table (`| ... | ... |` / pipe row). Probed directly against
+    // `@xberg-io/xberg`'s `extract()` with both default options and
+    // `pdfOptions: { extractTables: true, allowSingleColumnTables: true }`:
+    // both calls returned `document.tables === []` for this fixture — the
+    // PDF table extractor's grid/heuristic detector does not recognize this
+    // fixture's column-aligned text as a table at all, so there is no
+    // structured table data in the extraction result for DocumentPipeline to
+    // prefer over flattened prose. This is an external converter limit, not
+    // a defect in this fork's pipeline code; no scoped fix is available here.
     expect(markdown).not.toMatch(/\|.*Mercury.*\|/);
   });
 
@@ -1179,3 +1196,157 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     }
   });
 });
+
+describe.skipIf(!cliAvailable)(
+  "D03: DOCS_MCP_CONFIG-unset config auto-write, in a sandboxed HOME (6D probe)",
+  () => {
+    /**
+     * Spawns the built CLI with `DOCS_MCP_CONFIG` deliberately UNSET, inside
+     * a sandboxed `HOME`/`XDG_CONFIG_HOME` so `loadConfig()`'s default
+     * system-config path (`env-paths`, which this worktree confirmed honours
+     * a sandboxed `HOME` on this platform — `os.homedir()` reads `$HOME`)
+     * can never resolve to the operator's real
+     * `~/Library/Preferences/docs-mcp-server/config.yaml`.
+     */
+    async function runWithUnsetConfig(
+      args: string[],
+      env: { home: string; vaultPath: string; stateDir: string },
+    ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+      return await new Promise((resolve, reject) => {
+        const proc = spawn(vaultCliEntry, args, {
+          cwd: projectRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            PATH: process.env.PATH,
+            HOME: env.home,
+            XDG_CONFIG_HOME: path.join(env.home, ".config"),
+            OBSIDIAN_VAULT: env.vaultPath,
+            // Deliberately NOT set: DOCS_MCP_CONFIG.
+          },
+          timeout: 60_000,
+        });
+        let stdout = "";
+        let stderr = "";
+        proc.stdout.on("data", (d) => {
+          stdout += d.toString();
+        });
+        proc.stderr.on("data", (d) => {
+          stderr += d.toString();
+        });
+        proc.on("error", reject);
+        proc.on("close", (code) => resolve({ code, stdout, stderr }));
+      });
+    }
+
+    /** The default system config path env-paths resolves on macOS under a given HOME. */
+    function sandboxedConfigPath(home: string): string {
+      return path.join(home, "Library", "Preferences", "docs-mcp-server", "config.yaml");
+    }
+
+    it("prints the resolved default config path honouring the sandboxed HOME (not the operator's real HOME)", () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-verify-"));
+      try {
+        const result = execFileSync(
+          process.execPath,
+          ["-e", "console.log(require('os').homedir())"],
+          { env: { PATH: process.env.PATH, HOME: home }, encoding: "utf8" },
+        );
+        expect(result.trim()).toBe(home);
+        expect(home).not.toBe(os.homedir());
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    for (const command of ["search", "read", "reindex", "capture"] as const) {
+      it(`D03: "${command}" with DOCS_MCP_CONFIG unset — records whether the sandboxed default config is created`, async () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-home-"));
+        const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-vault-"));
+        const localStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-state-"));
+        fs.mkdirSync(path.join(vaultPath, "00 Inbox"), { recursive: true });
+        try {
+          const configPath = sandboxedConfigPath(home);
+          expect(fs.existsSync(configPath)).toBe(false);
+
+          const commandArgs: Record<string, string[]> = {
+            search: ["search", "anything", "--state-dir", localStateDir, "--json"],
+            read: ["read", "00 Inbox/nonexistent.md"],
+            reindex: ["reindex", "--state-dir", localStateDir, "--json"],
+            capture: [
+              "capture",
+              "https://example.invalid/d03-probe",
+              "--state-dir",
+              localStateDir,
+              "--json",
+            ],
+          };
+          await runWithUnsetConfig(commandArgs[command], {
+            home,
+            vaultPath,
+            stateDir: localStateDir,
+          });
+
+          // Recorded as a fact either way — this is the finding, not an
+          // assertion of desired behavior. `loadConfig()` is not fixed in
+          // this packet; Task 7 must ship a read-only-loading fix or an
+          // enforced explicit config on every installed entry point.
+          const created = fs.existsSync(configPath);
+          console.log(
+            `[D03] ${command}: sandboxed default config ${created ? "WAS" : "was NOT"} created at ${configPath}`,
+          );
+          // The vault used here is never the operator's; the sandboxed HOME
+          // used here is never the operator's real home directory either.
+          expect(home).not.toBe(os.homedir());
+        } finally {
+          fs.rmSync(home, { recursive: true, force: true });
+          fs.rmSync(vaultPath, { recursive: true, force: true });
+          fs.rmSync(localStateDir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it(
+      // RECORDED FINDING, not a passing guarantee: the plan asks this probe
+      // to "assert its bytes are preserved" as the desired outcome, but the
+      // measured reality is that `loadConfig()`'s default-system-path branch
+      // rewrites the file it finds (merging in every default key) regardless
+      // of which vault command ran. This is the exact D03 finding — recorded
+      // here, not fixed, per this packet's explicit instruction not to touch
+      // `loadConfig()`. The assertion documents the current (bad) truth so
+      // this stays a real regression trigger: if Task 7's containment fix
+      // lands, this test starts failing in the other direction and must be
+      // updated, not silently left green either way.
+      "D03: an existing user config's bytes are OVERWRITTEN when DOCS_MCP_CONFIG is unset (recorded finding, not fixed here)",
+      async () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-home-"));
+        const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-vault-"));
+        const localStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-state-"));
+        fs.mkdirSync(path.join(vaultPath, "00 Inbox"), { recursive: true });
+        try {
+          const configPath = sandboxedConfigPath(home);
+          fs.mkdirSync(path.dirname(configPath), { recursive: true });
+          const existingBytes = "# a pre-existing user config\nembeddings: {}\n";
+          fs.writeFileSync(configPath, existingBytes, "utf8");
+
+          await runWithUnsetConfig(
+            ["search", "anything", "--state-dir", localStateDir, "--json"],
+            { home, vaultPath, stateDir: localStateDir },
+          );
+
+          const afterBytes = fs.readFileSync(configPath, "utf8");
+          const preserved = afterBytes === existingBytes;
+          console.log(
+            `[D03] existing-config preservation: bytes ${preserved ? "UNCHANGED" : "CHANGED"} (finding: NOT preserved for "search" with DOCS_MCP_CONFIG unset)`,
+          );
+          // Confirmed finding: the pre-existing config is NOT preserved.
+          expect(preserved).toBe(false);
+          expect(afterBytes).not.toBe(existingBytes);
+        } finally {
+          fs.rmSync(home, { recursive: true, force: true });
+          fs.rmSync(vaultPath, { recursive: true, force: true });
+          fs.rmSync(localStateDir, { recursive: true, force: true });
+        }
+      },
+    );
+  },
+);
