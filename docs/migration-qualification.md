@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-eight further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9
-and 10 — see those sections near the end). Task 6 as a whole is **not
+nine further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9,
+10 and 11 — see those sections near the end). Task 6 as a whole is **not
 accepted**: F06 fails on an unresolved operator decision, F07 fails on a
 confirmed external converter limit, and D01/D03 are confirmed limits/defects
 deliberately left unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **152 files / 2457 tests passed**, exit 0 both times.
+head, run twice: **152 files / 2466 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -363,7 +363,7 @@ Packet 10 (Codex scoped re-review round 8 fixes, BLOCKER resolved):
 - `npm run typecheck` — clean (no errors).
 - `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
 - `npm run build` — clean.
-- `npx vitest run src/vault/markdownLinks.test.ts` — **38 passed / 38** (12 new cases: 5 Markdown-escape/character-reference fixtures, 1 imageReference fragmentation fixture, 2 U+E000-target fixtures, 1 cache-sequence regression, plus the performance test's absent-case ceiling widened from <50ms to <3000ms to reflect the always-parse design).
+- `npx vitest run src/vault/markdownLinks.test.ts` — **38 passed / 38** (**corrected by packet 11, MINOR 2**: 9 new cases -- 5 Markdown-escape/character-reference fixtures, 1 imageReference fragmentation fixture, 2 U+E000-target fixtures, 1 cache-sequence regression -- plus the existing benchmark test modified in place, not a new test, to use two distinct MOC strings with its absent-case ceiling widened from <50ms to <3000ms to reflect the always-parse design).
 - `npx vitest run src/vault/VaultPublisher.test.ts` — **90 passed / 90** (3 new end-to-end regressions: escaped-hyphen link, character-reference link, and U+E000-target link all recognized as already-linked, no duplicate inserted).
 - `npx vitest run scripts/lib/qualification-contract.test.ts` — **34 passed / 34** (3 new acceptance cases: escaped-hyphen target, character-reference target, U+E000-containing target).
 - `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
@@ -622,6 +622,25 @@ Both majors were verified test-first, including a direct reproduction of the
 U+E000 collision against the pre-fix sentinel-character implementation
 (returned 1, confirmed the bug, before switching to the array-of-runs
 design). See "Verification run log" for the exact commands and the two
+full-suite runs required for this packet.
+
+## Packet 11: Codex scoped re-review round 9 fixes (2026-09-13)
+
+A scoped Codex re-review (label `task6-qualification-r9-scoped`) of the
+packet-10 diff (`fed86b6...814dad7`) confirmed the round-8 core fix sound (no
+raw shortcut, structural runs, cache, exact target prefix, benchmark) and
+returned 1 major + 2 minor findings, all addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR | The wikilink regex's alias group (`(\|[^\]]*)?`, predates this branch) stops at the FIRST `]`. An alias written with a backslash-escaped bracket (`Foo\]Bar`, which remark resolves to a literal `]`) or an HTML character reference (`&#93;`, also resolves to `]`) made the whole `[[target\|alias]]` pattern fail to find its real `]]` closer, returning 0 -- the publisher would then insert a duplicate note, or the contract would wrongly reject an already-qualified note. Fixed by replacing the alias group with `(?:(?!\]\]).)*` (an "s"-flag lazy scan that matches any character, including a lone `]`, and stops only right before the real closing `]]`); the target portion is untouched -- still an exact, escaped match. Confirmed no regression across the existing suite (duplicate-link rejection, malformed-syntax rejection, and the longer-sibling-prefix rejection all still pass unchanged). | `src/vault/markdownLinks.test.ts` (3 new cases: escaped-bracket alias, character-referenced-bracket alias, and a case proving the alias's literal `]` does not swallow trailing document text past the real `]]`), `src/vault/VaultPublisher.test.ts` (2 new end-to-end duplicate-prevention regressions), `scripts/lib/qualification-contract.test.ts` (2 new acceptance cases) |
+| MINOR 1 | The `imageReference` fragmentation regression added at the unit level in packet 10 lacked matching coverage at the publisher and contract levels. | `src/vault/VaultPublisher.test.ts` (1 new end-to-end regression: a pseudo-link fragmented by an image reference is not a live link, and the publisher still adds the real one), `scripts/lib/qualification-contract.test.ts` (1 new rejection case) |
+| MINOR 2 | `docs/migration-qualification.md`'s packet-10 verification-run-log entry over-counted the new/changed `markdownLinks.test.ts` tests (claimed 12; the diff added 9 new cases plus modified the existing benchmark test in place, not 12 new tests), and `markdownLinks.test.ts:165`'s `const PUA = ...` line held a literal `U+E000` glyph typed through an earlier edit-tool call rather than an explicit escape sequence, contradicting the fork's own "no literal private-use glyphs in source" discipline established across this whole review chain. Corrected the packet-10 test-count line directly (see "Verification run log"), and converted the literal glyph to an explicit `\uE000` JS/TS escape sequence (verified byte-for-byte: the file had exactly one literal `U+E000` character before this fix, zero after, and it was never a NUL byte at any point). | `src/vault/markdownLinks.test.ts:165` (now `const PUA = "\uE000";`); packet-10's own verification-run-log entry, corrected in place |
+
+The MAJOR finding was verified test-first: the escaped-bracket and
+character-referenced-bracket alias fixtures both returned 0 against the
+pre-fix regex (confirmed via a standalone script) before the alias-group
+fix landed. See "Verification run log" for the exact commands and the two
 full-suite runs required for this packet.
 
 ## What this packet does not claim
