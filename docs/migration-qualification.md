@@ -1,13 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-a further reviewer-driven correction round (packet 3 — see that section near
-the end). Task 6 as a whole is **not accepted**: F06 fails on an unresolved
-operator decision, F07 fails on a confirmed external converter limit, and
-D01/D03 are confirmed limits/defects deliberately left unfixed per this
-packet's scope. See `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for
-the full task definition and acceptance criteria. Final full-suite result on
-this branch's head: **149 files / 2346 tests passed**, exit 0.
+two further reviewer-driven correction rounds (packets 3 and 4 — see those
+sections near the end). Task 6 as a whole is **not accepted**: F06 fails on an
+unresolved operator decision, F07 fails on a confirmed external converter
+limit, and D01/D03 are confirmed limits/defects deliberately left unfixed per
+this packet's scope. See `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md`
+for the full task definition and acceptance criteria. Final full-suite result
+on this branch's head, run twice: **150 files / 2364 tests passed**, exit 0
+both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -116,7 +117,7 @@ The unit-level missing-directory diagnostics required by 6B (`not a directory` v
 | X01 | Partial/useful-but-incomplete capture — exit 2 | pass (reused) | F11's process-level test IS this row: a manual edit conflict on recapture asserts `run.code === 2`, `publication.status === "conflict"`, and the human edit plus the original sentinel both survive in the saved note |
 | X02 | All-failed/no-useful-publication — exit 1 | pass (reused) | F12's process-level test IS this row: a 404 root asserts `run.code === 1` and `envelope.run_error` is set |
 | X03 | Cancelled via SIGINT — exit 130 | pass, after a genuine defect fix (Defect 3 below) | Test "X03: SIGINT cancellation exits 130 and preserves outcomes published before the abort"; root page publishes, then a real OS-level `SIGINT` is sent mid-fetch of a deliberately slow child page; `run.code === 130`, `envelope.cancelled === true`, ≥1 published outcome, and the root's saved note remains independently searchable after cancellation |
-| X03b | SIGINT/SIGTERM/SIGHUP browser-cleanup (MAJOR 1 addition, packet 3) | pass | Three new `it.each` tests, "SIGINT/SIGTERM/SIGHUP during a browser-rendered capture leaves no Chromium descendants or leaked temp profile dirs": for each signal, live Chromium pids are recorded via `pgrep -f ms-playwright` at signal time, and none remain alive after a grace period; no new `*playwright*`-named temp profile directory is left behind |
+| X03b | SIGINT/SIGTERM/SIGHUP browser-cleanup (MAJOR 1 addition, packet 3; rewritten packet 4, MAJOR B) | pass (unverified before this packet's rewrite -- the packet-3 version used a machine-wide `pgrep` snapshot that the coordinator's independent run demonstrated flaking under vitest parallelism, and let the fixture page complete naturally) | `it.each` "SIGINT/SIGTERM/SIGHUP during a browser-rendered capture leaves no Chromium descendants or a leaked temp profile dir": the fixture page never responds (cannot complete naturally); Chromium descendants are found by walking real `ps` ancestry from the child's own pid; the actual `--user-data-dir` is checked for leaks; SIGINT's exit code (130) and SIGTERM/SIGHUP's host-survives-while-browser-is-reaped outcome are asserted. Plus a negative control ("a genuinely leaked descendant is detected as still alive by the same check") proving the detection logic itself would catch a real leak. |
 
 Publication exceptions not incrementing the upstream acquisition-failure counter
 is covered by existing `VaultCaptureService.test.ts` unit evidence (not
@@ -274,6 +275,18 @@ Packet 3 (Codex frontier review fixes):
 - `npm test` (full suite, exact final commit) — **149 files / 2346 tests passed**, exit 0.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 3's edits.
 
+Packet 4 (Codex frontier review round 2 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **12 passed / 12** (dotted-child, dotted-symlink and negative-control regression cases added).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **9 passed / 9** (new file: well-formed pass plus 8 rejection cases).
+- `npx vitest run src/scraper/fetcher/BrowserFetcher.test.ts` — **14 passed / 14** (new negative-control-support test for the env hook).
+- `npx vitest run src/vault/VaultIndex.test.ts` — **96 passed / 96** (R12/R13 rewritten with database inspection, whitespace-distinct version, and a new deleted-database ordering case).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **40 passed / 40** (wall time ~132s -- faster than packet 3 despite more tests, because the rewritten signal-cleanup tests poll for real state instead of fixed delays).
+- **Full `npm test` run TWICE** on the exact final commit, per the coordinator's addendum (their independent run had found the packet-3 SIGTERM test flaking under parallelism): run 1 — **150 files / 2364 tests passed**, exit 0; run 2 — **150 files / 2364 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 4's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -319,8 +332,8 @@ manifest vault-path membership.
 | R09 | Unreadable database (search + upsert) | pass | `damages[8]` |
 | R10 | Process-level representatives: malformed pointer, deleted pointer, malformed manifest row, deleted database, through `search` and a `capture` that triggers `upsert` | pass | `test/vault-index-e2e.test.ts` describe "R10: process-level damaged-index representatives (search and upsert)", 8 test cases (4 shapes × search/upsert); membership inspected via `readIndexState` directly (manifest + `documents` row count), not top-N search |
 | R11 | Never-built vs. honest miss vs. damaged-with-notes, distinguished | pass | `VaultIndex.test.ts` "distinguishes never-built, honest miss and damaged-with-notes (R11)": all three envelopes checked side by side; never-built and honest-miss both legitimately `status: ok` + empty; damaged-with-notes recovers real results and is asserted `not.toEqual([])` |
-| R12 | Two collections (A, B): rebuild A, then B, delete only derived index data, reconstruct both; manifests inspected before any search | pass | `VaultIndex.test.ts` "reconstructs every collection after the whole index is deleted" (pre-existing, cited) plus the new "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)" |
-| R13 | Full index loss with saved notes present, vs. a never-built control; manual edits preserved; conflict candidates excluded; case/whitespace-distinct version identities stay distinct | pass | Same new test as R12. This index never fetches an original external source — only saved vault bytes — so "deny the original fetch" is satisfied by construction (`vault.writes` stays empty throughout); recorded rather than separately probed |
+| R12 | Two collections (A, B) each with multiple notes: rebuild A, then B, delete only derived index data, reconstruct both; manifest AND database (identities/chunks) AND saved-byte digests inspected before any search; extended to a deleted-database ordering case | pass (round-2 corrected; previously manifest-only, single-note-per-collection — see Packet 4, MAJOR D) | `VaultIndex.test.ts` "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)" plus the new "a deleted database after a two-collection reconstruction is caught by direct inspection, not masked by search (R12/R13)" |
+| R13 | Full index loss with saved notes present, vs. a never-built control; manual edits preserved; conflict candidates excluded; case- AND whitespace-distinct (`"Release"`/`"release"`/`" Release"`) version identities stay distinct | pass (round-2 corrected: whitespace-distinct version added — see Packet 4, MAJOR D) | Same tests as R12. This index never fetches an original external source — only saved vault bytes — so "deny the original fetch" is satisfied by construction (`vault.writes` stays empty throughout) |
 | R14 | Generation-construction failure mid-build: no bad promotion, prior generation unchanged | pass (pre-existing coverage, cited) | `VaultIndex.test.ts` `describe("failures after a generation has begun")`: "keeps the prior generation when indexing fails part way through", "keeps the prior generation when verification rejects what was persisted" |
 | R15 | Held index lock: capture exits 0 with `index: pending`; search/reindex fail visibly; release + rebuild recovers | pass (pre-existing coverage, cited) | `test/vault-index-e2e.test.ts` `describe("with the index lock held by another process")` plus "picks up the pending note on the next reindex" |
 | R16 | A note edited, renamed, or deleted while its update waits under a held lock; the reindex/search outcome describes the actual state | pass | `test/vault-index-e2e.test.ts` new describe "R16: a note edited/renamed/deleted while its update waits under a held index lock", 3 test cases: edit → new content searchable, old content gone; rename → found at new path via source-identity discovery, not the pending path; delete → search returns zero results and reindex still reports `status: "rebuilt"` (never a stale "indexed" claim for a vanished note) |
@@ -373,6 +386,27 @@ All eight are addressed on this branch:
 | MAJOR 6 | The throwaway-vault guard is extracted into `scripts/lib/vault-guard.mjs`, canonicalizes the supplied destination (catching symlink aliases), and handles an absent live vault without throwing. | `scripts/lib/vault-guard.mjs`, `.test.ts` |
 | MINOR 7 | `ObsidianCli.ts` emits a `vault.cli_invoked` JSONL event per subprocess, classified list/read/write; M01/M02 report those counts separately from lock/upsert counts. | `src/vault/ObsidianCli.ts`, `test/vault-capture-e2e.test.ts` M01/M02 |
 | MINOR 8 | D03 asserts the expected created/not-created outcome per command and that each process reached its command handler, not just logs. | `test/vault-capture-e2e.test.ts` D03 |
+
+## Packet 4: Codex frontier review round 2 fixes (2026-09-13)
+
+Codex round 2 (label `task6-qualification-r2`) on `8a6b85f...1f378b8` returned
+issues-found with 4 major + 1 minor. Findings 2, 4 and 7 from round 1 were
+confirmed closed and the R01-R09 ordering fix confirmed sound. All five new
+findings are addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR A | `isInsideLiveVault` treated any relative path starting with the two characters `".."` as outside, so a real child named e.g. `..qualification-probe` was misclassified as outside (and live-check could have captured *inside* the live vault). Now only `relative === ".."` or `relative.startsWith(".." + path.sep)` counts as outside. Added existing/nonexistent dotted-child fixtures, a dotted symlink alias, and a negative control reproducing the old bug side by side with the fix. | `scripts/lib/vault-guard.mjs`, `.test.ts` |
+| MAJOR B | The SIGINT/SIGTERM/SIGHUP cleanup tests previously (a) let the fixture page complete naturally, satisfying the test even with a no-op cleanup; (b) used a machine-wide `pgrep -f ms-playwright` snapshot, which the coordinator's independent full-`npm test` run demonstrated flaking under vitest parallelism when other suites launch Chromium concurrently; (c) never checked the actual `--user-data-dir` or asserted signal delivery. Rewritten: the fixture page never responds (cannot complete naturally); Chromium descendants are found by walking `ps -axo pid,ppid,command` ancestry from THIS child's own pid; the actual `--user-data-dir` argument is extracted and checked for leaks; SIGINT's delivered exit code (130) is asserted, and SIGTERM/SIGHUP assert the host process itself stays alive while only the browser is reaped. Full `npm test` run twice at the end (see Verification run log) to directly address the coordinator's flakiness finding. | `test/vault-capture-e2e.test.ts` X-rows |
+| MAJOR C | F11 checked only two surviving substrings after the conflict (other manual bytes could vanish undetected); C04 checked exit codes and folder count without qualifying either saved note; F20 omitted frontmatter identity checks; `scripts/live-check-vault.mjs` duplicated a weaker, independently-drifting contract. The shared contract is now one module, `scripts/lib/qualification-contract.mjs` (`qualifyNote`), used by both the suite (`assertQualifiedNote` delegates to it) and `live-check-vault.mjs`; F11 asserts exact whole-note byte equality for the post-edit state plus retrieval after the conflict, and qualifies the initial publication too; C04 qualifies both outcomes fully; F20's per-member loop now runs the full contract. Unit tests for `qualifyNote` include malformed-metadata and wrong-digest fixtures proving the contract rejects them. | `scripts/lib/qualification-contract.mjs`, `.test.ts`; `test/vault-capture-e2e.test.ts` F11/C04/F20; `scripts/live-check-vault.mjs` |
+| MAJOR D | R12/R13 inspected only manifests before searches (never the database), seeded only one note in the second collection, and tested case-distinct but not whitespace-distinct versions. Now inspects database rows/digests for both collections (each seeded with 2+ notes) before any search, adds a `" Release"` (leading-whitespace) version alongside `"Release"`/`"release"`, and extends the missing-database ordering fixture to the two-collection reconstruction path. | `src/vault/VaultIndex.test.ts` |
+| MINOR E | The D03 `read` probe used a nonexistent note path and a weak "stderr doesn't look like a yargs error" check that trivially passes on empty stderr; the sandboxed `HOME` also relocates `OBSIDIAN_CLI_PATH`, so an unaddressed ENOENT could masquerade as "note not found" (mitigated already by `symlinkObsidianCliInto`, but not proven). Now seeds a real note and asserts `read` returns its complete bytes with exit 0; a new negative-control test breaks the obsidian-cli symlink and confirms `read` fails visibly (nonzero exit, not the seeded content) rather than being silently absorbed. | `test/vault-capture-e2e.test.ts` D03 |
+
+Row-status honesty per the coordinator's instruction: **R12/R13 and the
+SIGINT/SIGTERM/SIGHUP process rows (X03/X03b) were unverified prior to this
+packet's fixes**; they are recorded as pass above and in the R-row/X-row
+tables only because the rewritten assertions in this packet now pass. See
+"Verification run log" for the exact commands and the two full-suite runs.
 
 ## What this packet does not claim
 
