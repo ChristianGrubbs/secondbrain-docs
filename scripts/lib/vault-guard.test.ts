@@ -94,4 +94,72 @@ describe("vault-guard", () => {
 
     expect(isInsideLiveVault(sibling, liveVault)).toBe(false);
   });
+
+  it(
+    // MAJOR A (2026-09-13 Codex frontier review, round 2): a real *existing*
+    // child of the live vault whose own name starts with ".." must still be
+    // reported as inside. `path.relative(liveVault, liveVault/"..qualification-probe")`
+    // returns the literal string "..qualification-probe", which the old
+    // `!relative.startsWith("..")` check misclassified as parent traversal
+    // (outside) -- exactly backwards, since this path is INSIDE the live
+    // vault.
+    "reports true for an existing child whose own name starts with '..'",
+    () => {
+      const liveVault = path.join(scratch, "live-vault");
+      const dottedChild = path.join(liveVault, "..qualification-probe");
+      fs.mkdirSync(dottedChild, { recursive: true });
+
+      expect(isInsideLiveVault(dottedChild, liveVault)).toBe(true);
+      expect(() => assertNotLiveVault(dottedChild, liveVault)).toThrow(/live vault/);
+    },
+  );
+
+  it(
+    "reports true for a NOT-YET-CREATED child whose own name starts with '..'",
+    () => {
+      const liveVault = path.join(scratch, "live-vault");
+      fs.mkdirSync(liveVault);
+      const dottedChild = path.join(liveVault, "..qualification-probe");
+
+      expect(isInsideLiveVault(dottedChild, liveVault)).toBe(true);
+    },
+  );
+
+  it(
+    // Negative control: proves the finding is real by reproducing the old,
+    // buggy string-prefix check side by side with the fixed one on the same
+    // fixture. The old logic reports this dangerous case as OUTSIDE
+    // (false); the fixed `isInsideLiveVault` reports it correctly as
+    // INSIDE (true).
+    "the old startsWith('..') string-prefix check would have missed this (regression demonstration)",
+    () => {
+      const liveVault = path.join(scratch, "live-vault");
+      const dottedChild = path.join(liveVault, "..qualification-probe");
+      fs.mkdirSync(dottedChild, { recursive: true });
+
+      const relative = path.relative(fs.realpathSync(liveVault), fs.realpathSync(dottedChild));
+      const oldBuggyIsInside = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+
+      expect(oldBuggyIsInside).toBe(false);
+      expect(isInsideLiveVault(dottedChild, liveVault)).toBe(true);
+    },
+  );
+
+  it("catches a symlink alias whose own name starts with '..'", () => {
+    const liveVault = path.join(scratch, "live-vault");
+    fs.mkdirSync(liveVault);
+    const dottedAlias = path.join(scratch, "..alias-into-live-vault");
+    fs.symlinkSync(liveVault, dottedAlias);
+
+    expect(isInsideLiveVault(dottedAlias, liveVault)).toBe(true);
+  });
+
+  it("does not misclassify a genuine parent-traversal path as inside", () => {
+    const liveVault = path.join(scratch, "nested", "live-vault");
+    fs.mkdirSync(liveVault, { recursive: true });
+    const outsideViaTraversal = path.join(scratch, "sibling-of-nested");
+    fs.mkdirSync(outsideViaTraversal, { recursive: true });
+
+    expect(isInsideLiveVault(outsideViaTraversal, liveVault)).toBe(false);
+  });
 });

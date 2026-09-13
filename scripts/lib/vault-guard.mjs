@@ -73,10 +73,18 @@ export function isInsideLiveVault(candidatePath, liveVaultPath) {
 
   const candidateReal = resolveNearestExistingAncestor(candidatePath);
   const relative = path.relative(liveVaultReal, candidateReal);
-  // `path.relative` starting with ".." (or being an absolute path on
-  // Windows-style drive mismatches, not relevant on POSIX) means outside;
-  // an empty string means an exact match (the live vault itself).
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  // MAJOR A (2026-09-13 Codex frontier review, round 2): a real *child* of
+  // the live vault whose own name happens to start with ".." (e.g.
+  // "..qualification-probe") produces a `path.relative` result like
+  // "..qualification-probe" — a literal string prefix match on ".." was
+  // wrongly treating that as parent traversal (outside) when it is actually
+  // inside. Only `".."` exactly, or a value starting with `".." + path.sep`
+  // (an actual "up a level, then into X" traversal), means outside. An
+  // empty string means an exact match (the live vault itself); an absolute
+  // `relative` (Windows drive-mismatch shape, not reachable on POSIX) is
+  // never treated as inside.
+  const isParentTraversal = relative === ".." || relative.startsWith(`..${path.sep}`);
+  return relative === "" || (!isParentTraversal && !path.isAbsolute(relative));
 }
 
 /**
