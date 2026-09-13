@@ -884,20 +884,29 @@ describe("VaultIndex", () => {
       expect(vault.writes).toEqual([]);
     });
 
-    it(// R12/R13: the same "rebuild A, then B, delete only derived index
-    // data, reconstruct both" shape as above, but combined with three
-    // things that must all survive it at once: a manually edited note
-    // (general behavior already covered standalone by "indexes a manually
-    // edited note as it now stands"), a conflict candidate that must stay
-    // excluded (standalone: "excludes conflict candidates from what it
-    // indexes"), and case-distinct version identities that must stay
-    // distinct (standalone: the "version identity" describe block). This
-    // index never fetches an original external source — it only ever
-    // reads saved vault bytes — so "deny the original fetch" is satisfied
-    // by construction: `vault.writes` stays empty throughout.
+    it(// R12/R13 (2026-09-13 Codex frontier review, round 2): the same
+    // "rebuild A, then B, delete only derived index data, reconstruct
+    // both" shape as above, but combined with everything that must all
+    // survive it at once: a manually edited note, a conflict candidate
+    // that must stay excluded, case-distinct AND whitespace-distinct
+    // version identities, and -- before any search runs -- direct
+    // database inspection (not only manifests) of BOTH collections, each
+    // seeded with multiple notes. This index never fetches an original
+    // external source -- it only ever reads saved vault bytes -- so
+    // "deny the original fetch" is satisfied by construction:
+    // `vault.writes` stays empty throughout.
     "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)", async () => {
       const vault = new FakeVault();
       const { inboxNote, otherNote } = twoCollections(vault);
+
+      // A second note in OTHER, so OTHER is genuinely multi-note too.
+      const otherSibling = sourceNote({
+        url: "https://example.com/toolbox-sibling",
+        title: "Toolbox Sibling",
+        body: body("toolboxsibling"),
+        collection: OTHER,
+      });
+      vault.notes.set(otherSibling.path, otherSibling.markdown);
 
       // A human edits the OTHER collection's note directly in the vault.
       vault.notes.set(
@@ -914,7 +923,8 @@ describe("VaultIndex", () => {
         otherNote.markdown.replace(/toolboxical/g, "rejectedcandidate"),
       );
 
-      // Case-distinct version identities of one URL in COLLECTION.
+      // Case-distinct AND whitespace-distinct version identities of one
+      // URL in COLLECTION.
       const url = "https://example.com/case-distinct-recon";
       const upperVersion = sourceNote({
         url,
@@ -928,8 +938,15 @@ describe("VaultIndex", () => {
         body: body("lowercasereconium"),
         version: "release",
       });
+      const whitespaceVersion = sourceNote({
+        url,
+        title: "Case Distinct Recon",
+        body: body("whitespacereconium"),
+        version: " Release",
+      });
       vault.notes.set(upperVersion.path, upperVersion.markdown);
       vault.notes.set(lowerVersion.path, lowerVersion.markdown);
+      vault.notes.set(whitespaceVersion.path, whitespaceVersion.markdown);
 
       const first = makeIndex(vault);
       await first.rebuild({ collection: COLLECTION, inventory: [candidate] });
@@ -943,17 +960,44 @@ describe("VaultIndex", () => {
       await second.rebuild({ collection: OTHER, inventory: [candidate] });
 
       // Inspect manifests directly before any search can lazily repair.
-      expect(
-        second
-          .manifestEntries(COLLECTION)
-          .map((e) => e.vaultPath)
-          .sort(),
-      ).toEqual([inboxNote.path, upperVersion.path, lowerVersion.path].sort());
-      expect(second.manifestEntries(OTHER).map((e) => e.vaultPath)).toEqual([
-        otherNote.path,
-      ]);
+      const collectionEntries = second.manifestEntries(COLLECTION);
+      const otherEntries = second.manifestEntries(OTHER);
+      expect(collectionEntries.map((e) => e.vaultPath).sort()).toEqual(
+        [
+          inboxNote.path,
+          upperVersion.path,
+          lowerVersion.path,
+          whitespaceVersion.path,
+        ].sort(),
+      );
+      expect(otherEntries.map((e) => e.vaultPath).sort()).toEqual(
+        [otherNote.path, otherSibling.path].sort(),
+      );
 
-      // The manual edit survived reconstruction with its new content.
+      // Database identities/chunks AND saved-byte digests for BOTH
+      // collections, inspected before any search.
+      const collectionDbRows = storedChunks(second, COLLECTION);
+      const otherDbRows = storedChunks(second, OTHER);
+      expect(collectionDbRows.length).toBeGreaterThanOrEqual(collectionEntries.length);
+      expect(otherDbRows.length).toBeGreaterThanOrEqual(otherEntries.length);
+      for (const [note, entries] of [
+        [inboxNote, collectionEntries],
+        [upperVersion, collectionEntries],
+        [lowerVersion, collectionEntries],
+        [whitespaceVersion, collectionEntries],
+        [otherNote, otherEntries],
+        [otherSibling, otherEntries],
+      ] as const) {
+        const savedBytes = vault.notes.get(note.path) ?? "";
+        const entry = entries.find((e) => e.vaultPath === note.path);
+        expect(entry?.digest, `${note.path} manifest digest`).toBe(sha256(savedBytes));
+      }
+      // The manual edit's new content is reflected in the manifest digest
+      // (not the pre-edit body) -- inspected directly, before search.
+      const otherNoteEntry = otherEntries.find((e) => e.vaultPath === otherNote.path);
+      expect(otherNoteEntry?.digest).toBe(sha256(vault.notes.get(otherNote.path) ?? ""));
+
+      // Only now, per-note queries, as independent confirmation.
       const edited = await second.search({
         query: "handeditedtoolbox",
         collection: OTHER,
@@ -970,8 +1014,8 @@ describe("VaultIndex", () => {
       });
       expect(rejected.results).toEqual([]);
 
-      // The two case-distinct versions stayed distinct documents, each
-      // answerable only by its own version label.
+      // The three version-distinct documents stayed distinct, each
+      // answerable only by its own exact version label.
       const upperHit = await second.search({
         query: "uppercasereconium",
         collection: COLLECTION,
@@ -984,16 +1028,66 @@ describe("VaultIndex", () => {
         version: "release",
       });
       expect(lowerHit.results.map((r) => r.vault_path)).toEqual([lowerVersion.path]);
+      const whitespaceHit = await second.search({
+        query: "whitespacereconium",
+        collection: COLLECTION,
+        version: " Release",
+      });
+      expect(whitespaceHit.results.map((r) => r.vault_path)).toEqual([
+        whitespaceVersion.path,
+      ]);
       const crossed = await second.search({
         query: "lowercasereconium",
         collection: COLLECTION,
         version: "Release",
       });
       expect(crossed.results).toEqual([]);
+      const crossedWhitespace = await second.search({
+        query: "whitespacereconium",
+        collection: COLLECTION,
+        version: "Release",
+      });
+      expect(crossedWhitespace.results).toEqual([]);
 
       // No original-source fetch of any kind — everything came from saved
       // vault bytes already in the fake vault.
       expect(vault.writes).toEqual([]);
+    });
+
+    it(// R12/R13 extension (2026-09-13 Codex frontier review, round 2):
+    // extends the missing-database ordering fixture to the two-collection
+    // reconstruction path -- valid manifests naming a generation whose
+    // database has been deleted must be caught by direct inspection
+    // (throwing when read), not silently repaired by a `search` call that
+    // ran first.
+    "a deleted database after a two-collection reconstruction is caught by direct inspection, not masked by search (R12/R13)", async () => {
+      const vault = new FakeVault();
+      const { inboxNote, otherNote } = twoCollections(vault);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      await index.rebuild({ collection: OTHER });
+      await index.shutdown();
+
+      // Manifests are valid and intact; only the OTHER collection's
+      // database file is gone.
+      fs.rmSync(path.join(activeGenerationDir(index, OTHER), "documents.db"));
+
+      expect(index.manifestEntries(OTHER).map((e) => e.vaultPath)).toEqual([
+        otherNote.path,
+      ]);
+      expect(() => storedChunks(index, OTHER)).toThrow();
+
+      // COLLECTION is untouched throughout.
+      expect(index.manifestEntries(COLLECTION).map((e) => e.vaultPath)).toEqual([
+        inboxNote.path,
+      ]);
+      expect(storedChunks(index, COLLECTION).length).toBeGreaterThan(0);
+
+      // Only now does a search on OTHER repair it.
+      const repaired = await index.search({ query: "toolboxical", collection: OTHER });
+      expect(repaired.results.map((r) => r.vault_path)).toEqual([otherNote.path]);
+      expect(() => storedChunks(index, OTHER)).not.toThrow();
     });
 
     it("keeps a capture into one collection out of the other's index", async () => {
