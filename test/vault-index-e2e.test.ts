@@ -700,9 +700,11 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
         expect((envelopeOf(run).results as unknown[]).length).toBeGreaterThan(0);
 
         // Full membership after repair, inspected directly — not inferred
-        // from a top-N search hit.
+        // from a top-N search hit. Both manifest identities and database
+        // row count are checked (readIndexState reads both).
         const after = readIndexState("inbox");
         expect(after.vaultPaths).toEqual(before.vaultPaths);
+        expect(after.chunkRows).toBeGreaterThanOrEqual(before.chunkRows);
       }, 120_000);
 
       it.each(CASES)(
@@ -735,6 +737,7 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
           for (const priorPath of before.vaultPaths) {
             expect(after.vaultPaths).toContain(priorPath);
           }
+          expect(after.chunkRows).toBeGreaterThan(before.chunkRows);
 
           const found = await runVaultCli([
             "search",
