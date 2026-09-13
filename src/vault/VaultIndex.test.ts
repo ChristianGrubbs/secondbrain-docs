@@ -176,8 +176,11 @@ function pendingGenerationDir(index: VaultIndex, collection = COLLECTION): strin
 }
 
 /** Reads every stored chunk of the active generation, straight from SQLite. */
-function storedChunks(index: VaultIndex): { content: string; metadata: string }[] {
-  const file = path.join(activeGenerationDir(index), "documents.db");
+function storedChunks(
+  index: VaultIndex,
+  collection = COLLECTION,
+): { content: string; metadata: string }[] {
+  const file = path.join(activeGenerationDir(index, collection), "documents.db");
   const db = new Database(file, { readonly: true });
   try {
     return db.prepare("SELECT content, metadata FROM documents").all() as {
@@ -2290,6 +2293,7 @@ describe("VaultIndex", () => {
       sibling: ReturnType<typeof sourceNote>;
       otherCollectionNote: ReturnType<typeof sourceNote>;
       otherCollectionManifestBefore: IndexManifestEntry[];
+      otherCollectionDbRowsBefore: number;
     }> {
       const vault = new FakeVault();
       const [touched, sibling] = ["touchable", "siblingual"].map((phrase) => {
@@ -2319,6 +2323,7 @@ describe("VaultIndex", () => {
       const otherReport = await index.rebuild({ collection: OTHER_COLLECTION });
       expect(otherReport.notesIndexed).toBe(1);
       const otherCollectionManifestBefore = index.manifestEntries(OTHER_COLLECTION);
+      const otherCollectionDbRowsBefore = storedChunks(index, OTHER_COLLECTION).length;
 
       return {
         vault,
@@ -2327,6 +2332,7 @@ describe("VaultIndex", () => {
         sibling,
         otherCollectionNote,
         otherCollectionManifestBefore,
+        otherCollectionDbRowsBefore,
       };
     }
 
@@ -2334,9 +2340,14 @@ describe("VaultIndex", () => {
     function expectOtherCollectionUntouched(
       index: VaultIndex,
       before: IndexManifestEntry[],
+      dbRowsBefore: number,
     ): void {
       const after = index.manifestEntries(OTHER_COLLECTION);
       expect(after).toEqual(before);
+      // Database rows too, not only the manifest: a repair that touched the
+      // wrong collection's on-disk store could still leave its manifest
+      // looking untouched.
+      expect(storedChunks(index, OTHER_COLLECTION).length).toBe(dbRowsBefore);
     }
 
     /** Every way a generation can be damaged, applied to the active one. */
@@ -2421,10 +2432,22 @@ describe("VaultIndex", () => {
     ];
 
     it.each(damages)(
+      // MAJOR 5 (2026-09-13 Codex frontier review): manifest AND database
+      // are inspected directly, immediately after `upsert` resolves and
+      // BEFORE any `search` call runs. `search` itself repairs damage it
+      // finds, so calling it first could make an incomplete writer-side
+      // repair look complete by silently finishing the job the assertions
+      // are supposed to be checking. Only after those direct checks do
+      // per-note queries run, as a second, independent confirmation.
       "keeps both notes searchable after an upsert meets %s (R01-R09, upsert path)",
       async (_name, damage) => {
-        const { index, touched, sibling, otherCollectionManifestBefore } =
-          await twoIndexed();
+        const {
+          index,
+          touched,
+          sibling,
+          otherCollectionManifestBefore,
+          otherCollectionDbRowsBefore,
+        } = await twoIndexed();
         await index.shutdown();
         damage(index);
 
@@ -2432,8 +2455,31 @@ describe("VaultIndex", () => {
         const result = await index.upsert(entryFor(touched));
         expect(result.status).toBe("indexed");
 
-        // Both, not just the one the writer was holding, and each with its
-        // digest intact — recovery must reconstruct real entries, not stubs.
+        // Manifest and database, inspected directly, before any search.
+        const entries = index.manifestEntries(COLLECTION);
+        expect(entries).toHaveLength(2);
+        for (const note of [touched, sibling]) {
+          const entry = entries.find((e) => e.vaultPath === note.path);
+          expect(entry?.digest, `${note.path} should have a digest`).toBe(
+            sha256(note.markdown),
+          );
+        }
+        // Every manifest entry has real chunk rows behind it in the
+        // database — not just a manifest claim with nothing backing it.
+        expect(storedChunks(index, COLLECTION).length).toBeGreaterThanOrEqual(
+          entries.reduce((sum, e) => sum + e.chunkCount, 0),
+        );
+
+        // A second, healthy collection must be completely unaffected by
+        // damage to and repair of this one — manifest and database rows.
+        expectOtherCollectionUntouched(
+          index,
+          otherCollectionManifestBefore,
+          otherCollectionDbRowsBefore,
+        );
+
+        // Only now, per-note queries, as independent confirmation that the
+        // already-verified state is genuinely answerable.
         for (const note of [touched, sibling]) {
           const response = await index.search({
             query: note.document.title,
@@ -2444,26 +2490,19 @@ describe("VaultIndex", () => {
             `${note.document.title} should still be searchable`,
           ).toEqual([note.path]);
         }
-        const entries = index.manifestEntries(COLLECTION);
-        expect(entries).toHaveLength(2);
-        for (const note of [touched, sibling]) {
-          const entry = entries.find((e) => e.vaultPath === note.path);
-          expect(entry?.digest, `${note.path} should have a digest`).toBe(
-            sha256(note.markdown),
-          );
-        }
-
-        // A second, healthy collection must be completely unaffected by
-        // damage to and repair of this one.
-        expectOtherCollectionUntouched(index, otherCollectionManifestBefore);
       },
     );
 
     it.each(damages)(
       "recovers the same way for a reader after %s (R01-R09, search path)",
       async (_name, damage) => {
-        const { index, touched, sibling, otherCollectionManifestBefore } =
-          await twoIndexed();
+        const {
+          index,
+          touched,
+          sibling,
+          otherCollectionManifestBefore,
+          otherCollectionDbRowsBefore,
+        } = await twoIndexed();
         await index.shutdown();
         damage(index);
 
@@ -2474,6 +2513,8 @@ describe("VaultIndex", () => {
           collection: COLLECTION,
         });
         expect(response.results.map((r) => r.vault_path)).toEqual([touched.path]);
+        // Manifest and database, inspected directly, right after the single
+        // repairing search call and before any further query.
         const entries = index.manifestEntries(COLLECTION);
         expect(entries.map((e) => e.vaultPath).sort()).toEqual(
           [touched.path, sibling.path].sort(),
@@ -2484,10 +2525,64 @@ describe("VaultIndex", () => {
             sha256(note.markdown),
           );
         }
+        expect(storedChunks(index, COLLECTION).length).toBeGreaterThanOrEqual(
+          entries.reduce((sum, e) => sum + e.chunkCount, 0),
+        );
 
-        expectOtherCollectionUntouched(index, otherCollectionManifestBefore);
+        expectOtherCollectionUntouched(
+          index,
+          otherCollectionManifestBefore,
+          otherCollectionDbRowsBefore,
+        );
       },
     );
+
+    it(// MAJOR 5 fixture (2026-09-13 Codex frontier review): proves the
+    // ordering the two `it.each` blocks above now use actually matters,
+    // by constructing exactly the case it guards against. `search`
+    // silently repairs whatever damage it finds — so if a test called
+    // `search` before inspecting the manifest/database, a writer path
+    // that left the on-disk artifact fragile (present but not truly
+    // durable/complete) would be invisible: the search's own repair would
+    // have already fixed it by the time anything looked. Inspecting
+    // immediately after the writer call, before any search, is what
+    // makes that kind of incompleteness observable at all.
+    "an incomplete writer-left artifact is caught by direct inspection, but invisible after search has already repaired it", async () => {
+      const { index, touched, sibling } = await twoIndexed();
+      await index.shutdown();
+      // Force upsert to rebuild via a full-generation write (deleted
+      // database is one of the nine damage shapes above).
+      fs.rmSync(path.join(activeGenerationDir(index), "documents.db"));
+
+      const result = await index.upsert(entryFor(touched));
+      expect(result.status).toBe("indexed");
+
+      // Simulate the writer path having left something fragile behind:
+      // the manifest/pointer look fine, but the database backing them is
+      // gone again (e.g. a write that reported success without the
+      // underlying file having been durably flushed). Direct inspection
+      // catches this immediately.
+      fs.rmSync(path.join(activeGenerationDir(index), "documents.db"));
+      expect(() => storedChunks(index, COLLECTION)).toThrow();
+
+      // But a search call, run first, would have silently rebuilt it —
+      // hiding the very thing direct inspection was there to catch.
+      const response = await index.search({
+        query: touched.document.title,
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([touched.path]);
+      // After search's own repair, direct inspection no longer sees any
+      // problem — proof that checking only after a search would have
+      // missed the incompleteness this test just demonstrated.
+      expect(() => storedChunks(index, COLLECTION)).not.toThrow();
+      expect(
+        index
+          .manifestEntries(COLLECTION)
+          .map((e) => e.vaultPath)
+          .sort(),
+      ).toEqual([touched.path, sibling.path].sort());
+    });
 
     it("still starts a collection from empty when nothing has ever indexed it", async () => {
       const vault = new FakeVault();
