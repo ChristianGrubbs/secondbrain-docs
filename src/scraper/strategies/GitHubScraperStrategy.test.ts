@@ -397,7 +397,15 @@ describe("GitHubScraperStrategy", () => {
       expect(result.links).toEqual([]);
     });
 
-    it("should handle single blob file URLs with strict scoping", async () => {
+    it(// Regression for a 2026-09-13 qualification finding (F03): a blob URL
+    // given directly as the capture root must be fetched and processed at
+    // depth 0, not merely re-announced as a "discovered" link. Emitting
+    // `item.url` itself as a link is a no-op forever, because
+    // BaseScraperStrategy seeds `visited` with the root URL before the
+    // crawl begins, so that self-referential link is deduped and never
+    // revisited — capture of a bare GitHub blob URL previously produced
+    // zero outcomes at any --max-depth/--max-pages.
+    "should fetch and process a single blob file URL directly at depth 0, not merely re-discover it", async () => {
       const blobOptions = {
         ...options,
         url: "https://github.com/owner/repo/blob/main/README.md",
@@ -406,8 +414,10 @@ describe("GitHubScraperStrategy", () => {
       const result = await strategy.processItem(item, blobOptions);
 
       expect(result.status).toBe(FetchStatus.SUCCESS);
-      // Strict scoping: blob URL should index ONLY that file, not discover wiki
-      expect(result.links).toEqual(["https://github.com/owner/repo/blob/main/README.md"]);
+      // Strict scoping: blob URL indexes ONLY that file (no further links)
+      // and its content comes back on this same depth-0 result.
+      expect(result.links).toEqual([]);
+      expect(result.content).toBeDefined();
     });
 
     it("should mark legacy github-file:// URLs as NOT_FOUND", async () => {

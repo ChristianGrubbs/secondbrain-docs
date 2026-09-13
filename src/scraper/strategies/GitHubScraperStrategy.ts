@@ -614,23 +614,23 @@ export class GitHubScraperStrategy extends BaseScraperStrategy {
 
       const discoveredLinks: string[] = [];
 
-      // Handle single file (blob) URLs - strict scoping: index ONLY the file
+      // Handle single file (blob) URLs - strict scoping: index ONLY the file.
+      // Fetch and process the content directly here rather than returning a
+      // "discovered" link equal to `item.url`: BaseScraperStrategy seeds
+      // `visited` with the root URL before the crawl starts (see
+      // BaseScraperStrategy.ts around processQueue's initial-queue setup),
+      // so a self-referential link identical to the just-processed root is
+      // permanently deduped and never revisited at depth 1 regardless of
+      // `--max-depth`/`--max-pages`. Before this fix, capturing a bare GitHub
+      // blob URL (e.g. `.../blob/main/package.json`) as the entry point
+      // silently produced zero outcomes (exit 1, no run_error) at any depth.
       if ("isBlob" in repoInfo && repoInfo.isBlob && repoInfo.filePath) {
-        const { branch = "main", filePath } = repoInfo;
+        const { filePath } = repoInfo;
         logger.debug(
           `Single file URL detected: ${owner}/${repo}/${filePath} - indexing file only`,
         );
 
-        // Generate HTTPS blob URL for storage
-        discoveredLinks.push(
-          `https://github.com/${owner}/${repo}/blob/${branch}/${filePath}`,
-        );
-
-        return {
-          url: item.url,
-          links: discoveredLinks,
-          status: FetchStatus.SUCCESS,
-        };
+        return await this.repoProcessor.process(item, options, headers, signal);
       }
 
       // Discover wiki URL for full repo scrapes (will be processed by GitHubWikiScraperStrategy)
