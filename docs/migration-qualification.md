@@ -1,10 +1,10 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-eleven further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9,
-10, 11, 12 and 13 — see those sections near the end). Task 6 as a whole is
-**not accepted**: F06 fails on an unresolved operator decision, F07 fails on
-a confirmed external converter limit, and D01/D03 are confirmed
+twelve further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9,
+10, 11, 12, 13 and 14 — see those sections near the end). Task 6 as a whole
+is **not accepted**: F06 fails on an unresolved operator decision, F07 fails
+on a confirmed external converter limit, and D01/D03 are confirmed
 limits/defects deliberately left unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
@@ -427,6 +427,22 @@ Packet 13 (Codex scoped re-review round 11 fixes):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2476 tests passed**, exit 0; run 2 — **152 files / 2476 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes or PUA glyphs introduced by packet 13's edits.
 
+Packet 14 (Codex scoped re-review round 12 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean (no fixes needed).
+- `npx vitest run src/vault/markdownLinks.test.ts` — **46 passed / 46** (same test count; both fixed tests are hardened in place, not added/removed). Stability-checked with 5 consecutive standalone runs of the scaling test and 3 of the cache-detection test, all passing.
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **94 passed / 94** (unaffected).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **38 passed / 38** (unaffected).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (unaffected).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected).
+- Both minors are test-harness robustness fixes only -- no change to `markdownLinks.mjs`'s scanner logic, consistent with the reviewer's own exhaustive equivalence probe (14,648,436 input/target combinations, no mismatch) confirming that logic already correct.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2476 tests passed**, exit 0; run 2 — **152 files / 2476 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes or PUA glyphs introduced by packet 14's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -729,6 +745,25 @@ measured ~68ms against the pre-fix round-10 scanner and ~0.25ms against the
 new single-pass scanner in the same process, at the same input size. See
 "Verification run log" for the exact commands and the two full-suite runs
 required for this packet.
+
+## Packet 14: Codex scoped re-review round 12 fixes (2026-09-13)
+
+A scoped Codex re-review (label `task6-qualification-r12-scoped`) of the
+packet-13 diff (`408acdd...28e90df`) confirmed the single-pass scanner
+correct via an exhaustive equivalence probe over 14,648,436 input/target
+combinations (no mismatch) and the fixture matrix complete. Returned 2 minor
+findings, both about test-harness robustness rather than the scanner logic
+itself, addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MINOR 1 | The scaling assertion `Math.max(at128k.elapsedMs * 3, 30)` degenerated to a fixed 30ms ceiling because the scan itself is sub-millisecond -- a much slower quadratic regression (e.g. 2ms at 128KB, 8ms at 256KB) would still false-pass against a 30ms floor, while a single descheduled sample could just as easily false-fail. Fixed by repeating the cached scan until the aggregate clearly rises above timer noise (or a 50-iteration cap) and taking the MINIMUM per-iteration time as the statistic: the minimum is never inflated by a GC pause or a descheduled tick, but a genuine algorithmic slowdown still raises it on every iteration. The ratio assertion (256KB ≤ 3x 128KB) now runs on that robust statistic with no artificial floor; the absolute 200ms cap per size is kept. | `src/vault/markdownLinks.test.ts` (`timeScanRobust` replacing the single-sample `timeScan`); stability-checked with 5 consecutive standalone runs, all passing |
+| MINOR 2 | The round-13 widened 2000ms cached-call ceiling no longer detects a lost or bypassed single-entry parse cache, since a genuinely COLD parse (~1.3-1.4s nominal) already fits comfortably under that ceiling -- a silent cache regression would still pass. Fixed by recording the immediately-preceding cold-present duration in the same test and requiring the cached call to be materially faster by a generous relative factor (cached < cold / 10), using the minimum of 5 repeated cached samples so scheduler noise on any one sample can't cause a false failure; the absolute 2000ms ceiling is kept as a secondary check. | `src/vault/markdownLinks.test.ts` (the cached-call section of the large-flat-list-MOC benchmark); stability-checked with 3 consecutive standalone runs, all passing |
+
+Both fixes are test-harness hardening only -- no change to `markdownLinks.mjs`
+itself, consistent with the reviewer's confirmation that the scanner logic is
+already correct. See "Verification run log" for the exact commands and the
+two full-suite runs required for this packet.
 
 ## What this packet does not claim
 
