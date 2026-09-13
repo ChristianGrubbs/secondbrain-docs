@@ -173,7 +173,7 @@ to make this look faster, so none was added.
 - `npx vitest run src/scraper/strategies/GitHubScraperStrategy.test.ts` — **38 passed / 38** (includes the corrected blob-URL unit test).
 - `npx vitest run src/scraper/fetcher/BrowserFetcher.test.ts` — **12 passed / 12** (includes the new signal-handling regression).
 - Combined targeted run — `npx vitest run src/vault-cli/commands/capture.test.ts src/vault-cli/commands/search.test.ts src/vault/ObsidianCli.test.ts` — **37 passed / 37**.
-- `npm test` (full suite) — **pending in this report**; run and record before this branch is proposed for merge (baseline at `75501fa` was 147 files / 2280 tests; this packet adds 1 new e2e file (`vault-capture-e2e.test.ts`, 29 tests), 1 new unit test in `GitHubScraperStrategy.test.ts`, 1 new unit test in `BrowserFetcher.test.ts`, and 2 regression tests already present in `capture.test.ts`/`search.test.ts` from before this packet).
+- `npm test` (full suite) — **148 files / 2312 tests passed**, exit 0 (baseline at `75501fa` was 147 files / 2280 tests; this packet adds 1 new e2e file — `vault-capture-e2e.test.ts`, 29 tests — plus 1 new unit test in `GitHubScraperStrategy.test.ts`, 1 new unit test in `BrowserFetcher.test.ts`, and 2 regression tests in `capture.test.ts`/`search.test.ts` that were already present uncommitted in this worktree before this packet started).
 - `git diff --numstat` — no binary blobs beyond the intended fixtures already present under `test/fixtures/vault-capture/` (`pixel.png`, `table.pdf`); no literal NUL bytes introduced in `.ts` sources by this packet's edits.
 
 ## 6C rows (unrun — next packet on this branch)
@@ -208,7 +208,4 @@ to make this look faster, so none was added.
 ## What this packet does not claim
 
 - Task 6 is not accepted; 6C and 6D remain unrun.
-- The full `npm test` suite has not yet been re-run to a final count in this
-  report (see Verification run log); do so before proposing this branch for
-  review/merge.
 - No release candidate (R1) has been packaged; that is 6D/Task 7 scope.
