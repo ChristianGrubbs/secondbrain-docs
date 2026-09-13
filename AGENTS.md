@@ -133,6 +133,7 @@ Unit + integration tests live next to the code they cover (`src/foo.ts` ↔ `src
 | `docker-e2e.test.ts` | Production image: non-root user, Chromium present, Playwright scrape, Xberg PDF, bind-mounted docs folder recursively indexed via `file:///` | Docker daemon; `DOCKER_IMAGE_TAG` to reuse a prebuilt image | **no** — `npm run test:docker` |
 | `vault-cli-e2e.test.ts` | Fork-local: spawns the built `dist/vault-cli.js` (`sb-docs`) directly and asserts zero `net.Server.prototype.listen` calls | prior `npm run build` (see `docs/fork-boundary.md`) | yes |
 | `vault-publish-e2e.test.ts` | Fork-local: real `obsidian-cli` publication into a throwaway vault via `OBSIDIAN_VAULT`; asserts the live vault is untouched | `~/ai-stack/bin/obsidian-cli`; skips otherwise | yes (skips if absent) |
+| `vault-index-e2e.test.ts` | Fork-local: `sb-docs capture`/`search`/`read`/`reindex` against the built executable and a throwaway vault; pending indexing under a held index lock still exits 0, `search`/`reindex` exit nonzero and keep the prior generation, a body phrase is retrievable while the frontmatter content hash is not, and two collections both survive rebuilding either one and reconstructing the whole index | prior `npm run build`; `~/ai-stack/bin/obsidian-cli`; skips otherwise | yes (skips if absent) |
 
 The fork-local unit and integration suites (`src/vault/*.test.ts`, `src/vault-cli/**/*.test.ts`) follow the single-file policy above and run in the default `npm test`.
 
@@ -140,3 +141,4 @@ Notes:
 - The "live" and "docker" suites are excluded from `npm test` / `npm run test:e2e` because they need external network or a Docker daemon. CI runs `docker-e2e.test.ts` in a dedicated `docker-test` job.
 - Suites that "skip gracefully" check for their required env at startup and short-circuit when it's missing — safe to leave in the default run.
 - Fixtures (sample PDF, docx, xlsx, archive, etc.) live in `test/fixtures/`. Reuse them rather than generating new files on the fly.
+- `test/fixtures/vault/` holds the child processes the multiprocess lock suites drive: `lock-holder.ts` (per-source publication lock), `publish-crash.ts` (interrupted publication) and `index-lock-holder.ts` (the single state-level index lock).

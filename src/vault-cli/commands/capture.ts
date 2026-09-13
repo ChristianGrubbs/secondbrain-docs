@@ -6,13 +6,13 @@
  * A plain local path becomes a `file://` URL via `pathToFileURL`; anything
  * that already parses as a URL keeps its upstream-supported identity as-is.
  * Crawl bounds default to one page at depth zero — a bounded or unbounded
- * crawl requires explicit `--max-pages`/`--max-depth`. Every outcome in this
- * task carries `index: "not-attempted"`; Task 5 adds real indexing without
- * changing these exit semantics.
+ * crawl requires explicit `--max-pages`/`--max-depth`.
  *
  * Exit codes follow the product contract: 0 every requested document is
  * published/unchanged and linked, 2 useful-but-incomplete output, 1 nothing
- * useful, 130 cancelled.
+ * useful, 130 cancelled. Indexing runs after publication and never moves that
+ * code: a note that is safely in the vault but not yet retrievable reports
+ * `index: "pending"` and the next `reindex` picks it up.
  */
 
 import { resolve } from "node:path";
@@ -26,7 +26,12 @@ import { loadConfig } from "../../utils/config";
 import { INBOX_COLLECTION, normalizeCollection } from "../../vault/identity";
 import { createObsidianCliRunner, ObsidianCli } from "../../vault/ObsidianCli";
 import type { Publisher } from "../../vault/types";
-import { type CaptureResult, capture } from "../../vault/VaultCaptureService";
+import {
+  type CaptureIndexer,
+  type CaptureResult,
+  capture,
+} from "../../vault/VaultCaptureService";
+import { IndexNoteMissingError, VaultIndex } from "../../vault/VaultIndex";
 import { VaultPublisher } from "../../vault/VaultPublisher";
 
 /** Everything the command needs from the outside world. */
@@ -47,6 +52,11 @@ export interface CaptureDeps {
   scraperService?: ScraperService;
   /** Publisher to drive; defaults to a real `VaultPublisher`. */
   publisher?: Publisher;
+  /**
+   * Index to feed; defaults to a real {@link VaultIndex} sharing the
+   * publisher's state directory. Pass `null` to publish without indexing.
+   */
+  indexer?: CaptureIndexer | null;
 }
 
 /**
@@ -107,6 +117,11 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
           requiresArg: true,
           describe: "Runtime state directory; defaults to the platform location",
         })
+        .option("no-index", {
+          type: "boolean",
+          default: false,
+          describe: "Publish into the vault without touching the search index",
+        })
         .strict(),
 
     handler: async (args) => {
@@ -151,6 +166,37 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
         deps.publisher ??
         new VaultPublisher(cli, { stateDir, vaultPath: vaultPath ?? undefined });
 
+      // Built once per run and shared by every page, so one crawl takes the
+      // index lock per note rather than reopening the store from scratch.
+      const ownedIndex =
+        deps.indexer === undefined && args["no-index"] !== true
+          ? new VaultIndex(cli, {
+              stateDir,
+              vaultPath: vaultPath ?? undefined,
+              appConfig,
+            })
+          : null;
+      const indexer: CaptureIndexer | null =
+        deps.indexer === undefined
+          ? ownedIndex === null
+            ? null
+            : {
+                index: async (entry) => {
+                  const outcome = await ownedIndex.upsert(entry);
+                  if (outcome.status === "missing") {
+                    // Publication succeeded and then the note moved or went
+                    // away while this page queued for the index lock. Nothing
+                    // was indexed, so reporting `indexed` would be a lie the
+                    // next search would have to discover on its own.
+                    throw new IndexNoteMissingError(
+                      `saved note is no longer at ${outcome.path}`,
+                      outcome.path,
+                    );
+                  }
+                },
+              }
+          : deps.indexer;
+
       const options: ScraperOptions = {
         url: requestedUrl,
         library,
@@ -173,10 +219,15 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
       try {
         result = await capture(
           { options, requestedUrl, signal: controller.signal },
-          { scraperService, publisher },
+          {
+            scraperService,
+            publisher,
+            ...(indexer === null ? {} : { indexer }),
+          },
         );
       } finally {
         process.off("SIGINT", onSigint);
+        await ownedIndex?.shutdown();
       }
 
       report(result, { stdout, stderr, json: args.json === true });

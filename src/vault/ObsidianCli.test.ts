@@ -155,4 +155,37 @@ describe("obsidian-cli process boundary", () => {
       fs.rmSync(vault, { recursive: true, force: true });
     },
   );
+  it("reports a directory that does not exist as absent, not as a failure", async () => {
+    // The installed CLI has two phrasings for "no such directory", and only
+    // one was recognised: a path that exists as a file says `not a directory`,
+    // a path with no entry at all says `no such directory for:`. Treating the
+    // second as a hard failure broke the first capture into any collection
+    // outside the inbox, whose parent folder does not exist yet.
+    for (const diagnostic of [
+      "obsidian-cli: not a directory: 30 Tools-Models/Doc Sets",
+      "obsidian-cli: no such directory for: 30 Tools-Models/Doc Sets",
+    ]) {
+      const cli = new ObsidianCli(async () => ({
+        code: 1,
+        stdout: "",
+        stderr: `${diagnostic}\n`,
+      }));
+
+      await expect(cli.listDirectory("30 Tools-Models/Doc Sets")).resolves.toBeNull();
+    }
+  });
+
+  it.runIf(realCliAvailable)(
+    "reports an absent collection parent as absent against the installed CLI",
+    async () => {
+      const vault = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-listdir-"));
+      const cli = new ObsidianCli(
+        createObsidianCliRunner({ vaultPath: vault, cliPath: realCliPath }),
+      );
+
+      await expect(cli.listDirectory("30 Tools-Models/Doc Sets")).resolves.toBeNull();
+
+      fs.rmSync(vault, { recursive: true, force: true });
+    },
+  );
 });

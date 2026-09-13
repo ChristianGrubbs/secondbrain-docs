@@ -28,10 +28,19 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `src/vault/VaultPublisher.test.ts` | Unit contract for the publisher |
 | `src/vault/PublicationJournal.ts` | Journal, ownership records, per-source lock, JSONL logger |
 | `src/vault/PublicationJournal.test.ts` | Unit contract for that durable state |
-| `src/vault/discovery.ts` | `discoverSources` — recursive `source_id` scan that freezes note paths |
+| `src/vault/discovery.ts` | `scanNotes` / `discoverSources` — the one recursive scan, and the `source_id` map that freezes note paths |
 | `src/vault/discovery.test.ts` | Unit contract for discovery |
-| `src/vault/ObsidianCli.ts` | Argument-array subprocess wrapper over `obsidian-cli`, note bytes on stdin |
+| `src/vault/ObsidianCli.ts` | Argument-array subprocess wrapper over `obsidian-cli`, note bytes on stdin; both missing-note and both missing-directory diagnostics read as absent |
 | `src/vault/ObsidianCli.test.ts` | Unit contract for the process wrapper |
+| `src/vault/lock.ts` | `withExclusiveLock` / `readLockHolder` — the one interprocess lock primitive, shared by the per-source publication lock and the state-level index lock |
+| `src/vault/VaultIndex.ts` | `VaultIndex` — `upsert` / `rebuild` / `search` over the saved notes; generations, atomic pointer, derived manifest |
+| `src/vault/VaultIndex.test.ts` | Unit and integration contract for the derived index, against a real SQLite store |
+| `src/vault-cli/commands/search.ts` | `sb-docs search <query>` — FTS retrieval with digest verification and stale refresh |
+| `src/vault-cli/commands/search.test.ts` | Unit contract for the search command |
+| `src/vault-cli/commands/read.ts` | `sb-docs read <note-path>` — the complete note through `obsidian-cli`, never chunk reassembly |
+| `src/vault-cli/commands/read.test.ts` | Unit contract for the read command |
+| `src/vault-cli/commands/reindex.ts` | `sb-docs reindex` — rebuilds a collection's index from saved notes into a fresh generation |
+| `src/vault-cli/commands/reindex.test.ts` | Unit contract for the reindex command |
 | `src/vault/identity.ts` | `source_id`, collection paths, filename and link sanitisation |
 | `src/vault/render.ts` | Source-note and collection-index rendering, semantic digest, frontmatter parsing |
 | `src/vault/types.ts` | `SourceDocument`, `Publication`, `Publisher`, `CliRunner` |
@@ -42,6 +51,8 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `test/fixtures/vault-cli/no-listen-guard.mjs` | `net.Server.prototype.listen` recorder used by that suite |
 | `test/fixtures/vault/lock-holder.ts` | Child process that holds a real per-source lock (multiprocess lock tests) |
 | `test/fixtures/vault/publish-crash.ts` | Child process that publishes and SIGKILLs itself at a chosen journal phase |
+| `test/vault-index-e2e.test.ts` | Process-level capture / search / read / reindex against the built executable, including a held index lock |
+| `test/fixtures/vault/index-lock-holder.ts` | Child process that holds the state-level index lock (process-level index tests) |
 | `docs/fork-boundary.md` | This file |
 
 Upstream files changed, and nothing else:
@@ -55,6 +66,14 @@ Upstream files changed, and nothing else:
 
 - **No listener from the CLI.** `sb-docs` must never start an MCP, HTTP or worker server. `src/vault-cli/main.ts` reaches none of the upstream server entry points, and `test/vault-cli-e2e.test.ts` asserts that a run records zero `net.Server.prototype.listen` calls.
 - **No upstream default action.** `createVaultCli` never calls `createDefaultAction` or any upstream server command registration. It is a sibling of `createCli`, not a wrapper around it.
+- **One lock primitive.** `src/vault/lock.ts` owns the SQLite `BEGIN EXCLUSIVE` mechanics; `PublicationJournal.withLock` and `VaultIndex.withIndexLock` both delegate to it and neither reimplements it. It is not reentrant, so helpers that run inside a critical section take it as given.
+- **One frontmatter parser.** `parseNoteFrontmatter` in `src/vault/render.ts` is the only one. The migration plan suggested `gray-matter` for indexing; using the existing parser instead keeps the body bytes an index chunk is built from identical to the body bytes publication compares, and adds no dependency.
+- **The index is derived, the vault is not.** Everything under `<stateDir>/index` can be deleted and rebuilt from the notes themselves. Reconciliation removes a vanished note from the index only — never from the vault — and no index path ever writes a note.
+- **One index per collection.** Each collection owns its generations and its pointer under `<stateDir>/index/collections/<key>`, so rebuilding one collection cannot discard another and restoring a deleted index is one `reindex` per collection.
+- **Store identity is injective.** Upstream normalizes versions in two places with two rules — lowercase on write and search, lowercase *and trim* through `normalizeVersionRef` — while source identity is case- and whitespace-sensitive. The index therefore keys its store by `sv` plus a digest of the exact label: hexadecimal, so neither rule can alter it, and injective, so `Release`, `release` and `" Release"` are three documents and none can be answered with another's text. The readable label lives in the manifest, which is what every envelope reports.
+- **An index that cannot answer is never mistaken for one with nothing to say.** A generation is a pointer, a directory, a manifest, a database file, rows inside it, and an encoding those rows are keyed by. One classification checks all six before any caller trusts it; anything short of usable rebuilds from discovery and says which part was missing. Only a writing caller may initialize a collection nothing has ever indexed, and only that case — a generation that exists and is broken is repaired by rebuilding, never by writing one note into it.
+- **The store encoding is fingerprinted, not declared.** `STORE_ENCODING_ID` is a digest of `storeVersion`'s own output over a fixed set of probe labels, recorded in every manifest. Changing the mapping changes the fingerprint in the same commit, so generations written by the old mapping are detected and rebuilt instead of being queried with keys they never held. The manifest version describes the document's shape; this describes what the database beside it is keyed by, and they are checked separately.
+- **Verification samples the splitter's output, not the note.** A Markdown body is converted before it is chunked, so a token in an HTML comment or an unused reference definition exists in the note and in no chunk. Probes are chosen from what was actually persisted, so a probe can only fail when persistence failed.
 - **Upstream semantics stay untouched.** Existing upstream commands, their meanings, the web UI and the MCP source all remain as shipped, so rebases stay cheap.
 - **Both build defines are preserved.** `__APP_VERSION__` and `__POSTHOG_API_KEY__` are still injected, and the native externals list is unchanged.
 
@@ -73,6 +92,15 @@ npm ci
 ```
 
 `npm ci` installs from the lockfile without mutating it. Use `npm install` only for an intentional dependency change.
+
+### Environment
+
+| Variable | Role |
+| --- | --- |
+| `OBSIDIAN_VAULT` | Vault every `obsidian-cli` call operates on. |
+| `SB_DOCS_LOG` | `1`/`true`/`yes` enables the JSONL event log; off by default. |
+| `SB_DOCS_LOG_FILE` | Redirects that log away from `~/Library/Logs/SecondBrainDocs/events.jsonl`, which is what lets a test assert on a run's own events. |
+| `DOCS_MCP_CONFIG` | Upstream's read-only configuration file. Setting it also stops a run rewriting the operator's own `config.yaml`. |
 
 ### Provision the browser
 
@@ -118,6 +146,34 @@ This suite spawns `dist/vault-cli.js` **directly**, not through `node`, so a mis
 
 ```bash
 ./dist/vault-cli.js --help
+```
+
+### Verify retrieval end to end
+
+```bash
+npx vitest run test/vault-index-e2e.test.ts
+```
+
+This suite also requires a prior `npm run build`, plus `~/ai-stack/bin/obsidian-cli`; it skips itself when the CLI is absent. It captures into a throwaway vault named by `OBSIDIAN_VAULT` and asserts the live vault is untouched.
+
+### Delete and rebuild the index
+
+The index is disposable by construction. Deleting it and rebuilding reproduces
+searchable current vault content without fetching a single source:
+
+```bash
+rm -rf "$HOME/Library/Application Support/SecondBrainDocs/index"
+```
+
+```bash
+./dist/vault-cli.js reindex --collection inbox
+```
+
+Run that once per collection: the index is per collection, so rebuilding one
+leaves every other collection's index exactly as it was.
+
+```bash
+./dist/vault-cli.js reindex --collection <other-collection>
 ```
 
 ## Host requirements

@@ -23,8 +23,17 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { sha256 } from "./identity";
+import {
+  DEFAULT_LOCK_POLL_MS,
+  DEFAULT_LOCK_TIMEOUT_MS,
+  type LockHolder,
+  type LockOptions,
+  readLockHolder,
+  withExclusiveLock,
+} from "./lock";
+
+export { type LockOptions, LockTimeoutError } from "./lock";
 
 /** Default durable state location on macOS. */
 export const DEFAULT_STATE_DIR = path.join(
@@ -42,12 +51,6 @@ export const DEFAULT_LOG_FILE = path.join(
   "SecondBrainDocs",
   "events.jsonl",
 );
-
-/** How long an acquirer waits before giving up on a live lock. */
-const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
-
-/** How often an acquirer retries while another holder is live. */
-const DEFAULT_LOCK_POLL_MS = 25;
 
 /** Phases of one note publication, in the order they are reached. */
 export type JournalPhase = "prepared" | "note-written" | "moc-linked" | "complete";
@@ -94,7 +97,13 @@ export const nullLogger: VaultLogger = () => undefined;
 /**
  * Builds a JSONL logger.
  *
- * @param options.filePath Sink path; defaults to {@link DEFAULT_LOG_FILE}.
+ * The sink is a fixed path so a later agent can reconstruct a run from the log
+ * rather than by rerunning it. `SB_DOCS_LOG_FILE` redirects that path, which is
+ * what makes the log itself observable: a process-level test can assert on the
+ * events a run emitted without writing into the operator's own log.
+ *
+ * @param options.filePath Sink path; defaults to `SB_DOCS_LOG_FILE`, then to
+ *   {@link DEFAULT_LOG_FILE}.
  * @param options.enabled Overrides the `SB_DOCS_LOG` environment gate.
  * @param options.runId Correlation id shared by every line of one run.
  * @returns A logger that appends one JSON object per line, or {@link nullLogger}
@@ -107,7 +116,10 @@ export function createJsonlLogger(
     options.enabled ?? ["1", "true", "yes"].includes(process.env.SB_DOCS_LOG ?? "");
   if (!enabled) return nullLogger;
 
-  const filePath = options.filePath ?? DEFAULT_LOG_FILE;
+  const override = process.env.SB_DOCS_LOG_FILE;
+  const filePath =
+    options.filePath ??
+    (override !== undefined && override.length > 0 ? override : DEFAULT_LOG_FILE);
   const runId = options.runId ?? randomUUID();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
@@ -134,14 +146,6 @@ export class StatePathError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "StatePathError";
-  }
-}
-
-/** Another holder kept the per-source lock for longer than we were prepared to wait. */
-export class LockTimeoutError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LockTimeoutError";
   }
 }
 
@@ -276,28 +280,6 @@ function readJson<T>(file: string): T | null {
   } catch {
     return null;
   }
-}
-
-/** Recognizes SQLite's "somebody else holds the lock" failure. */
-function isBusy(error: unknown): boolean {
-  const code = (error as { code?: string }).code;
-  return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT";
-}
-
-/** Options accepted by the per-source lock. */
-export interface LockOptions {
-  /** How long to wait for a lock another process holds. */
-  timeoutMs?: number;
-  /** Base retry interval; the real pause is jittered around it. */
-  pollMs?: number;
-  /**
-   * Called each time the lock is found already held, with the attempt number.
-   *
-   * Contention is otherwise invisible from outside: a caller that eventually
-   * acquires looks exactly like one that never waited. This makes "somebody
-   * else had it" an observable event.
-   */
-  onBusy?: (attempt: number) => void;
 }
 
 /** One per-source lock, as `doctor` reports it. */
@@ -701,96 +683,32 @@ export class PublicationJournal {
   /**
    * Runs `critical` while holding the per-source interprocess lock.
    *
-   * The lock is a SQLite database per source, held open inside a
-   * `BEGIN EXCLUSIVE` transaction for the whole critical section. That
-   * transaction takes a POSIX advisory lock on the file, and the *kernel*
-   * releases it when the holding process ends, however it ends.
+   * The mechanics live in {@link withExclusiveLock}: one SQLite database per
+   * source, held inside a `BEGIN EXCLUSIVE` transaction, released by the kernel
+   * when the holding process ends. This method only chooses *which* file that
+   * is and what to say when the wait runs out — there is exactly one
+   * implementation of the primitive in this fork, shared with the index lock.
    *
-   * That is the entire reason for the choice. Any lock built from `mkdir` plus
-   * a liveness check has the same shape of race at its core: the state you
-   * validate and the state you then act on are two different observations, and
-   * anything can happen in between. Moving that decision into the operating
-   * system removes the question rather than narrowing the window — no owner
-   * file, no pid check, no heartbeat, no staleness window, no reclamation, no
-   * guard, and nothing left behind to clean up after a crash.
-   *
-   * The database stays in SQLite's default rollback-journal mode. WAL is
-   * deliberately not enabled: its readers do not block an exclusive writer the
-   * way this relies on.
-   *
+   * @param sourceId Identity whose lock file is taken.
+   * @param critical Section to run under the lock; its result is returned.
    * @throws LockTimeoutError when the holder outlives the wait.
    */
   async withLock<T>(sourceId: string, critical: () => Promise<T>): Promise<T> {
     const file = this.lockFile(sourceId);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-
-    const deadline = Date.now() + this.lockOptions.timeoutMs;
-    const token = randomUUID();
-    let db: DatabaseType | null = null;
-    let attempt = 0;
-
-    for (;;) {
-      attempt += 1;
-      const handle = new Database(file);
-      try {
-        // Bounded per attempt, so the loop stays in charge of the deadline.
-        const remaining = Math.max(1, deadline - Date.now());
-        handle.pragma(
-          `busy_timeout = ${Math.min(this.lockOptions.pollMs * 5, remaining)}`,
-        );
-        handle.exec("BEGIN EXCLUSIVE");
-        db = handle;
-        break;
-      } catch (error) {
-        handle.close();
-        if (!isBusy(error)) throw error;
-
-        this.lockOptions.onBusy(attempt);
-        this.logger({
-          level: "debug",
-          event: "lock.busy",
-          loc: "PublicationJournal.withLock",
-          ctx: { sourceId, attempt },
-        });
-
-        if (Date.now() >= deadline) {
-          throw new LockTimeoutError(
-            `another capture holds the lock for ${sourceId} (${file})`,
-          );
-        }
-        // Jittered, so two contenders do not retry in lockstep.
-        const pause = this.lockOptions.pollMs * (1 + Math.random());
-        await new Promise((resolve) => setTimeout(resolve, pause));
-      }
-    }
-
-    try {
-      // Everything after the transaction opens belongs inside this block. A
-      // logger is injected, so it can throw, and anything that throws between
-      // acquiring and the cleanup below would leave the connection — and the
-      // lock — open until the process exits.
-      this.logger({
-        level: "debug",
-        event: "lock.acquired",
+    return withExclusiveLock(
+      {
+        file,
+        timeoutMs: this.lockOptions.timeoutMs,
+        pollMs: this.lockOptions.pollMs,
+        onBusy: this.lockOptions.onBusy,
+        logger: this.logger,
         loc: "PublicationJournal.withLock",
         ctx: { sourceId },
-      });
-      this.recordHolder(db, token);
-      return await critical();
-    } finally {
-      // Either ending releases the file lock; the distinction only matters to
-      // the diagnostics row, which nothing depends on.
-      try {
-        db.exec("COMMIT");
-      } catch {
-        try {
-          db.exec("ROLLBACK");
-        } catch {
-          /* the transaction is already gone */
-        }
-      }
-      db.close();
-    }
+        timeoutMessage: `another capture holds the lock for ${sourceId} (${file})`,
+        now: this.now,
+      },
+      critical,
+    );
   }
 
   /** Vault-free location of one source's lock database. */
@@ -799,60 +717,16 @@ export class PublicationJournal {
   }
 
   /**
-   * Records who holds the lock, inside the transaction that holds it.
-   *
-   * This is diagnostics and nothing else: correctness comes from the file lock
-   * the kernel is managing, never from this row.
-   */
-  private recordHolder(db: DatabaseType, token: string): void {
-    db.exec(
-      "CREATE TABLE IF NOT EXISTS lock_holder (id INTEGER PRIMARY KEY CHECK (id = 1), owner_token TEXT NOT NULL, acquired_at TEXT NOT NULL)",
-    );
-    db.prepare(
-      "INSERT INTO lock_holder (id, owner_token, acquired_at) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET owner_token = excluded.owner_token, acquired_at = excluded.acquired_at",
-    ).run(token, this.now().toISOString());
-  }
-
-  /**
    * Reports who last held a source's lock, for `doctor`.
    *
+   * @param sourceId Identity whose lock file is inspected.
    * @returns The recorded holder, or null when there is none or the lock is
    *   busy — a reader cannot see into an exclusive transaction, and waiting for
    *   one would make a diagnostic command block.
    */
-  lockDiagnostics(sourceId: string): { ownerToken: string; acquiredAt: string } | null {
-    const read = this.readLockHolder(this.lockFile(sourceId));
+  lockDiagnostics(sourceId: string): LockHolder | null {
+    const read = readLockHolder(this.lockFile(sourceId));
     return read.busy ? null : read.holder;
-  }
-
-  /**
-   * Reads a lock database's recorded holder without ever waiting for it.
-   *
-   * The busy timeout is zero on purpose. better-sqlite3 defaults to five
-   * seconds, which would make a diagnostic command sit and stare at a capture
-   * that is doing its job; "held right now" is the answer, and it is available
-   * immediately.
-   */
-  private readLockHolder(file: string): {
-    holder: { ownerToken: string; acquiredAt: string } | null;
-    busy: boolean;
-  } {
-    if (!fs.existsSync(file)) return { holder: null, busy: false };
-
-    let db: DatabaseType | null = null;
-    try {
-      db = new Database(file, { readonly: true, timeout: 0 });
-      const row = db
-        .prepare(
-          "SELECT owner_token AS ownerToken, acquired_at AS acquiredAt FROM lock_holder WHERE id = 1",
-        )
-        .get() as { ownerToken: string; acquiredAt: string } | undefined;
-      return { holder: row ?? null, busy: false };
-    } catch (error) {
-      return { holder: null, busy: isBusy(error) };
-    } finally {
-      db?.close();
-    }
   }
 
   /**
@@ -873,7 +747,7 @@ export class PublicationJournal {
     const records: LockRecord[] = [];
     for (const name of names) {
       if (!name.endsWith(".db")) continue;
-      const read = this.readLockHolder(path.join(directory, name));
+      const read = readLockHolder(path.join(directory, name));
       records.push({
         source: name.replace(/\.db$/, ""),
         ownerToken: read.holder?.ownerToken ?? null,

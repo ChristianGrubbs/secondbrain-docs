@@ -69,6 +69,19 @@ export class HeadingNotFoundError extends ObsidianCliError {
 const isNotFound = (stderr: string): boolean =>
   /not a file:|no such directory for:/.test(stderr);
 
+/**
+ * Recognizes the CLI's missing-directory diagnostics.
+ *
+ * `list` has the same two-phrasing problem as `read`, and for the same reason:
+ * a path that exists as a file reports `not a directory`, while a path with no
+ * entry at all reports `no such directory for:`. Only the first was recognized
+ * once, so listing a documentation collection's parent folder before it existed
+ * threw instead of reporting "nothing here" — which made the first capture into
+ * any collection outside the inbox fail against a real vault.
+ */
+const isMissingDirectory = (stderr: string): boolean =>
+  /not a directory|no such directory for:/.test(stderr);
+
 /** Recognizes the CLI's missing-heading diagnostic. */
 const isHeadingNotFound = (stderr: string): boolean => /heading not found/.test(stderr);
 
@@ -255,7 +268,7 @@ export class ObsidianCli {
     assertVaultRelative(path);
     const result = await this.run(["list", path], null);
     if (result.code === 0) return result.stdout.split("\n").filter(Boolean);
-    if (/not a directory/.test(result.stderr)) return null;
+    if (isMissingDirectory(result.stderr)) return null;
     throw toError("list", path, result);
   }
 

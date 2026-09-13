@@ -3,19 +3,24 @@
  *
  * This is deliberately NOT the upstream `createCli`: it registers no default
  * action and no MCP, web or worker command, so invoking it can never start a
- * resident service. Capture, search, read and reindex handlers are registered
- * by later migration tasks; this module owns the shared program shape and the
- * `doctor` command.
+ * resident service. It owns the shared program shape and the five commands the
+ * product contract names: capture, search, read, reindex and doctor.
  */
 
 import yargs, { type Argv } from "yargs";
 import { type CaptureDeps, createCaptureCommand } from "./commands/capture";
 import { createDoctorCommand, type DoctorDeps } from "./commands/doctor";
+import { createReadCommand, type ReadDeps } from "./commands/read";
+import { createReindexCommand, type ReindexDeps } from "./commands/reindex";
+import { createSearchCommand, type SearchDeps } from "./commands/search";
 
 /** Injected dependencies for the commands this program registers. */
 export interface VaultCliDeps {
   doctor?: DoctorDeps;
   capture?: CaptureDeps;
+  search?: SearchDeps;
+  read?: ReadDeps;
+  reindex?: ReindexDeps;
 }
 
 /**
@@ -33,6 +38,9 @@ export function createVaultCli(argv: string[], deps: VaultCliDeps = {}): Argv {
     .usage("Usage: $0 <command> [options]")
     .version(__APP_VERSION__)
     .command(createCaptureCommand(deps.capture))
+    .command(createSearchCommand(deps.search))
+    .command(createReadCommand(deps.read))
+    .command(createReindexCommand(deps.reindex))
     .command(createDoctorCommand(deps.doctor))
     .strict()
     .help()
