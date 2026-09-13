@@ -56,7 +56,9 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `test/vault-capture-e2e.test.ts` | Task 6 (6A/6B) format/behavior qualification (F01-F20), real-CLI first-capture bootstrapping (C01-C04), process-boundary exit codes (X03), and subprocess/vault-access measurements (M01-M02), all against the built executable and a real `obsidian-cli` |
 | `test/fixtures/vault-capture/` | Deterministic fixtures for the F-rows: `local-notes.md` + `pixel.png` (Markdown + local image), `table.pdf` (+ `generate-table-pdf.mjs` generator), `mixed-dir/` (three-file directory capture), `plain.txt`, `source-code.py` |
 | `docs/migration-qualification.md` | The Task 6 row-by-row qualification report this suite backs |
-| `scripts/live-check-vault.mjs` | Runs the live (network-dependent) rows against an explicitly designated throwaway vault and prints a JSON summary; used by Task 7 |
+| `scripts/live-check-vault.mjs` | Runs the live (network-dependent) rows against an explicitly designated throwaway vault, through the same publication-contract check `test/vault-capture-e2e.test.ts` uses (facts, one MOC link, `search` identity, full `read`), and prints a JSON summary; used by Task 7 |
+| `scripts/lib/vault-guard.mjs` | `assertNotLiveVault`/`isInsideLiveVault` — canonicalizes both the live-vault path and the caller's destination (resolving the nearest existing ancestor for not-yet-created paths) so a symlink alias into the live vault cannot bypass the guard; handles an absent live vault explicitly instead of throwing |
+| `scripts/lib/vault-guard.test.ts` | Unit contract for the guard: symlink-alias bypass, not-yet-created destination, absent live vault |
 | `docs/fork-boundary.md` | This file |
 
 Upstream files changed, and nothing else:
@@ -68,6 +70,8 @@ Upstream files changed, and nothing else:
 - `src/scraper/strategies/GitHubScraperStrategy.ts` (and its test) — Task 6 qualification fix (row F03): a single GitHub blob URL given directly as the capture root is now fetched and processed in place at depth 0 instead of re-announcing itself as a "discovered" link, which `BaseScraperStrategy`'s pre-seeded `visited` set permanently deduped, silently producing zero outcomes at any `--max-depth`/`--max-pages`.
 - `src/scraper/fetcher/BrowserFetcher.ts` (and its test) — Task 6 qualification fix (row X03): `chromium.launch()` now passes `handleSIGINT: false`, `handleSIGTERM: false`, `handleSIGHUP: false` so Playwright's own signal handlers no longer race and win against `sb-docs capture`'s own SIGINT handler, which previously left a real Ctrl-C during a browser-rendered capture exiting 130 with no JSON envelope ever printed.
 - `src/vault-cli/commands/capture.ts` / `capture.test.ts` and `src/vault-cli/commands/search.ts` / `search.test.ts` — Task 6 qualification fix: each subcommand now calls `.version(false)` so yargs' reserved top-level `--version` flag no longer silently swallows the subcommand's own `--version <label>` string option.
+- `src/vault/ObsidianCli.ts` (and its test) — Task 6 qualification instrumentation (MINOR 7): `createObsidianCliRunner` now accepts an optional `logger` and emits one `vault.cli_invoked` JSONL event (gated by `SB_DOCS_LOG`, same as every other vault event) per spawned `obsidian-cli` subprocess, classified `list`/`read`/`write`/`other` via the new exported `classifyObsidianCliSubcommand`.
+- `vite.config.ts` — test `include` now also covers `scripts/**/*.test.ts`, so `scripts/lib/vault-guard.test.ts` runs in the default `npm test`.
 
 ## Rules this fork keeps
 
