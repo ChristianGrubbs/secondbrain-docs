@@ -645,6 +645,250 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     await retrievable("toolbox", "toolboxical");
   }, 300_000);
 
+  describe(
+    // R10: process-level representatives for four of the nine damaged-state
+    // shapes `src/vault/VaultIndex.test.ts` already proves at the unit
+    // level (malformed pointer, deleted pointer, malformed manifest row,
+    // deleted database) — each exercised through both `sb-docs search` and
+    // a `sb-docs capture` that triggers `upsert`, at the real process
+    // boundary. Placed here (not in test/vault-capture-e2e.test.ts) because
+    // this file already owns the on-disk index-state helpers
+    // (`collectionRoot`, `readIndexState`) these rows need.
+    "R10: process-level damaged-index representatives (search and upsert)",
+    () => {
+      const CASES: Array<{
+        name: string;
+        damage: (root: string, generation: string) => void;
+      }> = [
+        {
+          name: "a malformed (non-JSON) pointer",
+          damage: (root) => {
+            fs.writeFileSync(path.join(root, "current.json"), "{ not json", "utf8");
+          },
+        },
+        {
+          name: "a deleted pointer",
+          damage: (root) => {
+            fs.rmSync(path.join(root, "current.json"));
+          },
+        },
+        {
+          name: "a malformed manifest row",
+          damage: (root, generation) => {
+            const file = path.join(root, "generations", generation, "manifest.json");
+            const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+            manifest.entries = [null, ...manifest.entries.slice(1)];
+            fs.writeFileSync(file, JSON.stringify(manifest), "utf8");
+          },
+        },
+        {
+          name: "a deleted database",
+          damage: (root, generation) => {
+            fs.rmSync(path.join(root, "generations", generation, "documents.db"));
+          },
+        },
+      ];
+
+      it.each(CASES)("$name: search recovers full membership, not top-N", async ({ damage }) => {
+        const root = collectionRoot("inbox");
+        const generation = activeGeneration("inbox");
+        const before = readIndexState("inbox");
+        damage(root, generation);
+
+        const run = await runVaultCli(["search", PHRASE, "--state-dir", stateDir, "--json"]);
+        expect(run.code).toBe(0);
+        expect((envelopeOf(run).results as unknown[]).length).toBeGreaterThan(0);
+
+        // Full membership after repair, inspected directly — not inferred
+        // from a top-N search hit.
+        const after = readIndexState("inbox");
+        expect(after.vaultPaths).toEqual(before.vaultPaths);
+      }, 120_000);
+
+      it.each(CASES)(
+        "$name: a capture that triggers upsert recovers full membership, not just the new note",
+        async ({ damage }) => {
+          const root = collectionRoot("inbox");
+          const generation = activeGeneration("inbox");
+          const before = readIndexState("inbox");
+          damage(root, generation);
+
+          const source = path.join(
+            path.dirname(sourceFile),
+            `r10-upsert-${Math.random().toString(36).slice(2)}.md`,
+          );
+          const marker = `r10upsertmarker${Math.random().toString(36).slice(2)}`;
+          fs.writeFileSync(
+            source,
+            SOURCE_MARKDOWN.replace(new RegExp(PHRASE, "g"), marker),
+            "utf8",
+          );
+          const run = await runVaultCli(["capture", source, "--state-dir", stateDir, "--json"]);
+          expect(run.code).toBe(0);
+          const outcomes = envelopeOf(run).outcomes as Array<{ index: string }>;
+          expect(outcomes[0].index).toBe("indexed");
+
+          const after = readIndexState("inbox");
+          // Every prior member plus exactly one new one — not the new note
+          // alone.
+          expect(after.vaultPaths).toHaveLength(before.vaultPaths.length + 1);
+          for (const priorPath of before.vaultPaths) {
+            expect(after.vaultPaths).toContain(priorPath);
+          }
+
+          const found = await runVaultCli([
+            "search",
+            marker,
+            "--state-dir",
+            stateDir,
+            "--json",
+          ]);
+          expect(found.code).toBe(0);
+          expect((envelopeOf(found).results as unknown[]).length).toBe(1);
+        },
+        120_000,
+      );
+    },
+  );
+
+  describe(
+    // R16: a note edited, renamed, or deleted while its indexing waits
+    // under a held lock. Each sub-case captures one note (exits 0,
+    // `index: pending`), mutates the *published vault note itself* — not the
+    // original source — while the lock is still held, then releases the
+    // lock and reindexes. The unit-level equivalents ("indexes a manually
+    // edited note as it now stands", "follows a manually renamed note to its
+    // new path", "reconciles a vault note that has gone out of the index,
+    // never out of the vault" in src/vault/VaultIndex.test.ts) already prove
+    // the underlying reconciliation logic; this only proves the process
+    // boundary carries the *actual* outcome through `index: pending` →
+    // reindex, rather than reporting a vanished/changed note as still
+    // cleanly `indexed`.
+    "R16: a note edited/renamed/deleted while its update waits under a held index lock",
+    () => {
+      async function capturePending(
+        phrase: string,
+        filename: string,
+      ): Promise<string> {
+        const source = path.join(path.dirname(sourceFile), filename);
+        fs.writeFileSync(
+          source,
+          SOURCE_MARKDOWN.replace(new RegExp(PHRASE, "g"), phrase),
+          "utf8",
+        );
+        const run = await runVaultCli(["capture", source, "--state-dir", stateDir, "--json"]);
+        expect(run.code).toBe(0);
+        const outcomes = envelopeOf(run).outcomes as Array<{
+          index: string;
+          publication?: { path: string };
+        }>;
+        expect(outcomes[0].index).toBe("pending");
+        return outcomes[0].publication?.path ?? "";
+      }
+
+      it("reflects an edit made to the published note while indexing was pending", async () => {
+        const release = await holdIndexLock();
+        try {
+          const notePath = await capturePending("r16editphrase", "r16-edit-source.md");
+          // A human edits the *saved vault note* directly, before it was ever
+          // indexed.
+          const before = fs.readFileSync(path.join(sandbox, notePath), "utf8");
+          fs.writeFileSync(
+            path.join(sandbox, notePath),
+            before.replace(/r16editphrase/g, "r16editedwhilepending"),
+          );
+        } finally {
+          await release();
+        }
+
+        const rebuilt = await runVaultCli(["reindex", "--state-dir", stateDir, "--json"]);
+        expect(rebuilt.code).toBe(0);
+
+        const edited = await runVaultCli([
+          "search",
+          "r16editedwhilepending",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ]);
+        expect(edited.code).toBe(0);
+        expect((envelopeOf(edited).results as unknown[]).length).toBe(1);
+
+        // The original (pre-edit) text is gone — indexing reflects what the
+        // note actually says now, not what capture originally offered.
+        const stale = await runVaultCli([
+          "search",
+          "r16editphrase",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ]);
+        expect(edited.code).toBe(0);
+        expect((envelopeOf(stale).results as unknown[]).length).toBe(0);
+      }, 180_000);
+
+      it("follows the published note to its new path when it was renamed while indexing was pending", async () => {
+        const release = await holdIndexLock();
+        let notePath = "";
+        try {
+          notePath = await capturePending("r16renamephrase", "r16-rename-source.md");
+          const renamed = path.join(
+            path.dirname(notePath),
+            "R16 Renamed While Pending.md",
+          );
+          fs.renameSync(path.join(sandbox, notePath), path.join(sandbox, renamed));
+        } finally {
+          await release();
+        }
+
+        const rebuilt = await runVaultCli(["reindex", "--state-dir", stateDir, "--json"]);
+        expect(rebuilt.code).toBe(0);
+
+        const found = await runVaultCli([
+          "search",
+          "r16renamephrase",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ]);
+        expect(found.code).toBe(0);
+        const results = envelopeOf(found).results as Array<{ vault_path: string }>;
+        expect(results).toHaveLength(1);
+        expect(results[0].vault_path).not.toBe(notePath);
+        expect(results[0].vault_path.endsWith("R16 Renamed While Pending.md")).toBe(true);
+      }, 180_000);
+
+      it("does not report a note deleted while indexing was pending as indexed", async () => {
+        const release = await holdIndexLock();
+        try {
+          const notePath = await capturePending("r16deletephrase", "r16-delete-source.md");
+          fs.rmSync(path.join(sandbox, notePath));
+        } finally {
+          await release();
+        }
+
+        const rebuilt = await runVaultCli(["reindex", "--state-dir", stateDir, "--json"]);
+        expect(rebuilt.code).toBe(0);
+
+        const gone = await runVaultCli([
+          "search",
+          "r16deletephrase",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ]);
+        expect(gone.code).toBe(0);
+        expect((envelopeOf(gone).results as unknown[]).length).toBe(0);
+        // The deleted note never comes back as a manifest entry either — a
+        // vanished note during the pending window must never be silently
+        // promoted to "indexed".
+        const status = await runVaultCli(["reindex", "--state-dir", stateDir, "--json"]);
+        expect(status.code).toBe(0);
+        expect(envelopeOf(status).status).toBe("rebuilt");
+      }, 180_000);
+    },
+  );
+
   it("never touched the operator's live vault", () => {
     if (!fs.existsSync(LIVE_VAULT)) return;
     const captures = path.join(LIVE_VAULT, "00 Inbox", "Source Captures");
@@ -654,5 +898,8 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     expect(names.some((name) => name.toLowerCase().includes("pendingphrase"))).toBe(
       false,
     );
+    for (const marker of ["r16editphrase", "r16renamephrase", "r16deletephrase"]) {
+      expect(names.some((name) => name.toLowerCase().includes(marker))).toBe(false);
+    }
   });
 });
