@@ -294,6 +294,26 @@ describe("sb-docs capture: configuration", () => {
   });
 });
 
+/** A note with enough body to split, plus the publication that reports it. */
+function seededPublication(vault: FakeVault): Publication {
+  const path = "00 Inbox/Source Captures/note abc123456789.md";
+  const markdown = [
+    "---",
+    "type: source",
+    "title: note",
+    "source_url: https://example.com/",
+    "publisher: secondbrain-docs",
+    "---",
+    "# note",
+    "",
+    "The indexable body of this note, with enough ordinary prose for the",
+    "splitter to produce at least one chunk from it.",
+    "",
+  ].join("\n");
+  vault.notes.set(path, markdown);
+  return { status: "published", path, markdown, digest: sha256(markdown), moc: "linked" };
+}
+
 function published(overrides: Partial<Publication> = {}): Publication {
   return {
     status: "published",
@@ -366,7 +386,10 @@ describe("sb-docs capture: exit codes", () => {
     const scraperService = fakeScraperService([
       { currentUrl: "https://example.com/", depth: 0 },
     ]);
-    const publisher: Publisher = { publish: async () => published() };
+    // The note is really in the vault, so "indexed" below is a fact about what
+    // was indexed rather than about what nothing objected to.
+    const publication = seededPublication(vault);
+    const publisher: Publisher = { publish: async () => publication };
 
     await runCapture(["https://example.com/", "--json"], { scraperService, publisher });
 
@@ -376,6 +399,48 @@ describe("sb-docs capture: exit codes", () => {
     expect(report.outcomes).toHaveLength(1);
     expect(report.outcomes[0].publication?.status).toBe("published");
     expect(report.outcomes[0].index).toBe("indexed");
+    process.exitCode = 0;
+  });
+
+  it("reports indexing pending when the saved note is renamed before it is indexed", async () => {
+    const scraperService = fakeScraperService([
+      { currentUrl: "https://example.com/", depth: 0 },
+    ]);
+    const publication = seededPublication(vault);
+    const publisher: Publisher = { publish: async () => publication };
+
+    // A capture queues its index update behind the index lock. This vault
+    // renames the published note during exactly that window: the index's own
+    // read — the first plain `read --all` of the note after publication — finds
+    // it gone.
+    const renamed = "00 Inbox/Source Captures/note renamed by a human.md";
+    const cli = new ObsidianCli(async (args, stdin) => {
+      if (
+        args[0] === "read" &&
+        args[1] === publication.path &&
+        !args.includes("--with-anchor") &&
+        vault.notes.has(publication.path)
+      ) {
+        vault.notes.set(renamed, publication.markdown);
+        vault.notes.delete(publication.path);
+      }
+      return vault.run(args, stdin);
+    });
+
+    await runCapture(["https://example.com/", "--json"], {
+      scraperService,
+      publisher,
+      cli,
+    });
+
+    const report = envelope();
+    // Publication stands and still decides the exit code; only the indexing of
+    // it is outstanding, and the next reindex resolves it from the new path.
+    expect(process.exitCode).toBe(0);
+    expect(report.exitCode).toBe(0);
+    expect(report.outcomes[0].publication?.status).toBe("published");
+    expect(report.outcomes[0].index).toBe("pending");
+    expect(vault.notes.has(renamed)).toBe(true);
     process.exitCode = 0;
   });
 

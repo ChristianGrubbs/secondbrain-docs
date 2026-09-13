@@ -31,7 +31,7 @@ import {
   type CaptureResult,
   capture,
 } from "../../vault/VaultCaptureService";
-import { VaultIndex } from "../../vault/VaultIndex";
+import { IndexNoteMissingError, VaultIndex } from "../../vault/VaultIndex";
 import { VaultPublisher } from "../../vault/VaultPublisher";
 
 /** Everything the command needs from the outside world. */
@@ -180,7 +180,21 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
         deps.indexer === undefined
           ? ownedIndex === null
             ? null
-            : { index: async (entry) => void (await ownedIndex.upsert(entry)) }
+            : {
+                index: async (entry) => {
+                  const outcome = await ownedIndex.upsert(entry);
+                  if (outcome.status === "missing") {
+                    // Publication succeeded and then the note moved or went
+                    // away while this page queued for the index lock. Nothing
+                    // was indexed, so reporting `indexed` would be a lie the
+                    // next search would have to discover on its own.
+                    throw new IndexNoteMissingError(
+                      `saved note is no longer at ${outcome.path}`,
+                      outcome.path,
+                    );
+                  }
+                },
+              }
           : deps.indexer;
 
       const options: ScraperOptions = {

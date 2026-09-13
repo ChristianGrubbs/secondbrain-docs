@@ -137,10 +137,16 @@ function envelope(): ReindexEnvelope {
   return JSON.parse(out[0]) as ReindexEnvelope;
 }
 
-/** Reads the generation the pointer currently names. */
-function activeGeneration(): string {
-  return JSON.parse(fs.readFileSync(path.join(stateDir, "index", "current.json"), "utf8"))
-    .generation as string;
+/**
+ * Reads the generation one collection's pointer currently names.
+ *
+ * Each collection owns its own pointer, so this needs an index instance to
+ * resolve the collection's directory rather than a fixed path.
+ */
+function activeGeneration(index: VaultIndex, collection = "inbox"): string {
+  return JSON.parse(
+    fs.readFileSync(path.join(index.collectionRoot(collection), "current.json"), "utf8"),
+  ).generation as string;
 }
 
 describe("sb-docs reindex", () => {
@@ -176,7 +182,7 @@ describe("sb-docs reindex", () => {
     vault.notes.set(rendered.path, rendered.markdown);
     const holder = makeIndex();
     await holder.rebuild({ collection: "inbox" });
-    const generation = activeGeneration();
+    const generation = activeGeneration(holder);
 
     let release = (): void => undefined;
     const held = new Promise<void>((resolve) => {
@@ -194,14 +200,15 @@ describe("sb-docs reindex", () => {
     expect(envelope()).toMatchObject({ status: "unavailable" });
     expect(process.exitCode).toBe(1);
     expect(err.join("\n")).toContain("❌ reindex unavailable");
-    expect(activeGeneration()).toBe(generation);
+    expect(activeGeneration(holder)).toBe(generation);
   });
 
   it("keeps the previous generation when the rebuild itself fails", async () => {
     vault.notes.set(rendered.path, rendered.markdown);
     await runReindex(["--json"]);
     const generation = envelope().report?.generation;
-    expect(generation).toBe(activeGeneration());
+    const reader = makeIndex();
+    expect(generation).toBe(activeGeneration(reader));
 
     // The vault backend goes away mid-flight: every read now fails hard.
     vault.notes.clear();
@@ -229,7 +236,7 @@ describe("sb-docs reindex", () => {
 
     expect(envelope().status).toBe("failed");
     expect(process.exitCode).toBe(1);
-    expect(activeGeneration()).toBe(generation);
+    expect(activeGeneration(reader)).toBe(generation);
   });
 
   it("imports an explicitly listed unmanaged note read-only", async () => {

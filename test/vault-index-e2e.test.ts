@@ -165,10 +165,24 @@ function envelopeOf(run: VaultCliRun): Record<string, unknown> {
   return JSON.parse(line ?? "{}") as Record<string, unknown>;
 }
 
-/** Reads the generation the index pointer currently names. */
-function activeGeneration(): string {
+/**
+ * Reads the generation one collection's pointer currently names.
+ *
+ * Each collection owns its own index, so the pointer lives under that
+ * collection's directory. The directory name is derived exactly as
+ * {@link VaultIndex} derives it, from the normalized collection identifier.
+ */
+function activeGeneration(collection = "inbox"): string {
+  const key = `${collection
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)}-${sha256(collection.toLowerCase()).slice(0, 12)}`;
   return JSON.parse(
-    fs.readFileSync(path.join(stateDir, "index", "current.json"), "utf8"),
+    fs.readFileSync(
+      path.join(stateDir, "index", "collections", key, "current.json"),
+      "utf8",
+    ),
   ).generation as string;
 }
 
@@ -436,6 +450,92 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     expect((envelopeOf(found).results as unknown[]).length).toBe(1);
     expect(found.listenCalls).toEqual([]);
   }, 120_000);
+
+  it("rebuilds every collection after the whole index is deleted", async () => {
+    // A second collection, so the acceptance is exercised on a vault holding
+    // more than one — rebuilding one collection must not cost the other its
+    // index, and restoring a deleted index is a rebuild per collection.
+    const otherSource = path.join(path.dirname(sourceFile), "toolboxical.md");
+    fs.writeFileSync(
+      otherSource,
+      SOURCE_MARKDOWN.replace(new RegExp(PHRASE, "g"), "toolboxical"),
+      "utf8",
+    );
+
+    const captured = await runVaultCli([
+      "capture",
+      otherSource,
+      "--collection",
+      "toolbox",
+      "--state-dir",
+      stateDir,
+      "--json",
+    ]);
+    expect(captured.code).toBe(0);
+
+    /**
+     * Asserts one collection holds a retrievable note carrying `phrase`.
+     *
+     * Not an exact result count: earlier tests in this file deliberately leave
+     * more than one note in the inbox, and a count would then be asserting how
+     * many fixtures ran rather than whether retrieval works.
+     */
+    const retrievable = async (collection: string, phrase: string): Promise<void> => {
+      const found = await runVaultCli([
+        "search",
+        phrase,
+        "--collection",
+        collection,
+        "--state-dir",
+        stateDir,
+        "--json",
+      ]);
+      expect(found.code).toBe(0);
+      const results = envelopeOf(found).results as { vault_path: string }[];
+      expect(results.length).toBeGreaterThanOrEqual(1);
+      const bodies = results.map((result) =>
+        fs.readFileSync(path.join(sandbox, result.vault_path), "utf8"),
+      );
+      expect(bodies.some((body) => body.toLowerCase().includes(phrase))).toBe(true);
+      expect(found.listenCalls).toEqual([]);
+    };
+
+    // Both collections retrievable before anything is deleted.
+    await retrievable("inbox", PHRASE);
+    await retrievable("toolbox", "toolboxical");
+
+    // Rebuilding one collection leaves the other's index in place.
+    const rebuiltInbox = await runVaultCli([
+      "reindex",
+      "--collection",
+      "inbox",
+      "--state-dir",
+      stateDir,
+      "--json",
+    ]);
+    expect(rebuiltInbox.code).toBe(0);
+    const toolboxGeneration = activeGeneration("toolbox");
+    expect(toolboxGeneration).toBeTruthy();
+
+    // Now delete the whole index and rebuild it, collection by collection.
+    fs.rmSync(path.join(stateDir, "index"), { recursive: true, force: true });
+
+    for (const collection of ["inbox", "toolbox"]) {
+      const rebuilt = await runVaultCli([
+        "reindex",
+        "--collection",
+        collection,
+        "--state-dir",
+        stateDir,
+        "--json",
+      ]);
+      expect(rebuilt.code).toBe(0);
+      expect(envelopeOf(rebuilt).status).toBe("rebuilt");
+    }
+
+    await retrievable("inbox", PHRASE);
+    await retrievable("toolbox", "toolboxical");
+  }, 300_000);
 
   it("never touched the operator's live vault", () => {
     if (!fs.existsSync(LIVE_VAULT)) return;

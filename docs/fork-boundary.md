@@ -30,7 +30,7 @@ This repository is a user-owned fork of [`arabold/docs-mcp-server`](https://gith
 | `src/vault/PublicationJournal.test.ts` | Unit contract for that durable state |
 | `src/vault/discovery.ts` | `scanNotes` / `discoverSources` — the one recursive scan, and the `source_id` map that freezes note paths |
 | `src/vault/discovery.test.ts` | Unit contract for discovery |
-| `src/vault/ObsidianCli.ts` | Argument-array subprocess wrapper over `obsidian-cli`, note bytes on stdin |
+| `src/vault/ObsidianCli.ts` | Argument-array subprocess wrapper over `obsidian-cli`, note bytes on stdin; both missing-note and both missing-directory diagnostics read as absent |
 | `src/vault/ObsidianCli.test.ts` | Unit contract for the process wrapper |
 | `src/vault/lock.ts` | `withExclusiveLock` / `readLockHolder` — the one interprocess lock primitive, shared by the per-source publication lock and the state-level index lock |
 | `src/vault/VaultIndex.ts` | `VaultIndex` — `upsert` / `rebuild` / `search` over the saved notes; generations, atomic pointer, derived manifest |
@@ -69,6 +69,8 @@ Upstream files changed, and nothing else:
 - **One lock primitive.** `src/vault/lock.ts` owns the SQLite `BEGIN EXCLUSIVE` mechanics; `PublicationJournal.withLock` and `VaultIndex.withIndexLock` both delegate to it and neither reimplements it. It is not reentrant, so helpers that run inside a critical section take it as given.
 - **One frontmatter parser.** `parseNoteFrontmatter` in `src/vault/render.ts` is the only one. The migration plan suggested `gray-matter` for indexing; using the existing parser instead keeps the body bytes an index chunk is built from identical to the body bytes publication compares, and adds no dependency.
 - **The index is derived, the vault is not.** Everything under `<stateDir>/index` can be deleted and rebuilt from the notes themselves. Reconciliation removes a vanished note from the index only — never from the vault — and no index path ever writes a note.
+- **One index per collection.** Each collection owns its generations and its pointer under `<stateDir>/index/collections/<key>`, so rebuilding one collection cannot discard another and restoring a deleted index is one `reindex` per collection.
+- **Store identity is injective.** Upstream lowercases every version it is given, while source identity is case sensitive, so the index keys its store by a lowercase token carrying a digest of the exact label. `Release` and `release` are two documents, and neither can ever be answered with the other's text.
 - **Upstream semantics stay untouched.** Existing upstream commands, their meanings, the web UI and the MCP source all remain as shipped, so rebases stay cheap.
 - **Both build defines are preserved.** `__APP_VERSION__` and `__POSTHOG_API_KEY__` are still injected, and the native externals list is unchanged.
 
@@ -153,6 +155,13 @@ rm -rf "$HOME/Library/Application Support/SecondBrainDocs/index"
 
 ```bash
 ./dist/vault-cli.js reindex --collection inbox
+```
+
+Run that once per collection: the index is per collection, so rebuilding one
+leaves every other collection's index exactly as it was.
+
+```bash
+./dist/vault-cli.js reindex --collection <other-collection>
 ```
 
 ## Host requirements
