@@ -375,7 +375,7 @@ describe("sb-docs capture: exit codes", () => {
     expect(report.exitCode).toBe(0);
     expect(report.outcomes).toHaveLength(1);
     expect(report.outcomes[0].publication?.status).toBe("published");
-    expect(report.outcomes[0].index).toBe("not-attempted");
+    expect(report.outcomes[0].index).toBe("indexed");
     process.exitCode = 0;
   });
 
@@ -471,7 +471,7 @@ describe("sb-docs capture: local Markdown and document fixtures", () => {
     expect(report.outcomes).toHaveLength(1);
     const outcome = report.outcomes[0];
     expect(outcome.publication?.status).toBe("published");
-    expect(outcome.index).toBe("not-attempted");
+    expect(outcome.index).toBe("indexed");
     expect(outcome.publication?.markdown).toContain("Local Notes");
     expect(outcome.publication?.markdown).toContain("bold");
     process.exitCode = 0;
@@ -489,7 +489,7 @@ describe("sb-docs capture: local Markdown and document fixtures", () => {
     expect(report.outcomes).toHaveLength(1);
     const outcome = report.outcomes[0];
     expect(outcome.publication?.status).toBe("published");
-    expect(outcome.index).toBe("not-attempted");
+    expect(outcome.index).toBe("indexed");
     // sample.pdf is RFC 2549, "IP over Avian Carriers with Quality of
     // Service" — a stable, known string proving real text was extracted
     // rather than an empty/placeholder conversion.
@@ -520,7 +520,7 @@ describe("sb-docs capture: bounded multi-page HTTP crawl", () => {
     expect(report.outcomes).toHaveLength(2);
     for (const outcome of report.outcomes) {
       expect(outcome.publication?.status).toBe("published");
-      expect(outcome.index).toBe("not-attempted");
+      expect(outcome.index).toBe("indexed");
     }
     process.exitCode = 0;
   });

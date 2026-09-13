@@ -45,16 +45,18 @@ async function mapWithLimit<T, R>(
 /**
  * Collects every Markdown note under a collection folder, recursively.
  *
- * @returns Vault-relative note paths, sorted.
+ * @returns Vault-relative note paths (sorted) and how many `list` invocations
+ *   it took to find them.
  */
 async function collectNotePaths(
   cli: ObsidianCli,
   root: string,
   logger: VaultLogger,
-): Promise<string[]> {
+): Promise<{ paths: string[]; directoryScans: number }> {
   const notes: string[] = [];
   const seen = new Set<string>();
   let level = [root];
+  let directoryScans = 0;
 
   for (let depth = 0; depth < MAX_DEPTH && level.length > 0; depth += 1) {
     const nextLevel: string[] = [];
@@ -62,6 +64,7 @@ async function collectNotePaths(
       if (seen.has(directory)) continue;
       seen.add(directory);
 
+      directoryScans += 1;
       const entries = await cli.listDirectory(directory);
       if (entries === null) continue;
 
@@ -77,9 +80,76 @@ async function collectNotePaths(
     level: "debug",
     event: "discovery.scanned",
     loc: "discovery.collectNotePaths",
-    ctx: { root, noteCount: notes.length },
+    ctx: { root, noteCount: notes.length, directoryScans },
   });
-  return notes.sort();
+  return { paths: notes.sort(), directoryScans };
+}
+
+/** One note as the scan read it, with its frontmatter already decoded. */
+export interface ScannedNote {
+  /** Vault-relative note path. */
+  path: string;
+  /** The note's exact whole-note bytes. */
+  markdown: string;
+  /** Decoded frontmatter, or null when the note carries none that parses. */
+  data: Record<string, unknown> | null;
+  /** The body with frontmatter removed, or the whole note when it has none. */
+  body: string;
+}
+
+/** One collection scan, with the cost it incurred. */
+export interface NoteScan {
+  notes: ScannedNote[];
+  /** `obsidian-cli list` invocations this scan made. */
+  directoryScans: number;
+  /** `obsidian-cli read --all` invocations this scan made. */
+  noteReads: number;
+}
+
+/**
+ * Reads every Markdown note under a collection folder, recursively.
+ *
+ * This is the one scan primitive: {@link scanSources} derives identities from
+ * it, and the index derives chunks from it, so both see exactly the same bytes
+ * and the same single read per note.
+ *
+ * @param options.cli Vault CLI wrapper to read through.
+ * @param options.collectionPath Vault-relative folder to scan.
+ * @param options.concurrency Notes read at once; defaults to 4.
+ * @returns Every note the folder holds, plus the scan's list and read counts.
+ */
+export async function scanNotes(options: {
+  cli: ObsidianCli;
+  collectionPath: string;
+  concurrency?: number;
+  logger?: VaultLogger;
+}): Promise<NoteScan> {
+  const logger = options.logger ?? nullLogger;
+  const listed = await collectNotePaths(options.cli, options.collectionPath, logger);
+
+  const notes = await mapWithLimit(
+    listed.paths,
+    options.concurrency ?? DEFAULT_CONCURRENCY,
+    async (notePath): Promise<ScannedNote | null> => {
+      const markdown = await options.cli.readNote(notePath);
+      if (markdown === null) return null;
+      const parsed = parseNoteFrontmatter(markdown);
+      return {
+        path: notePath,
+        markdown,
+        data: parsed?.data ?? null,
+        body: parsed?.body ?? markdown,
+      };
+    },
+  );
+
+  return {
+    notes: notes.filter((note): note is ScannedNote => note !== null),
+    directoryScans: listed.directoryScans,
+    // One read per listed note, every time. `list` reports names and nothing
+    // else, so there is no cheaper evidence to cache against.
+    noteReads: listed.paths.length,
+  };
 }
 
 /** One scan of a collection folder. */
@@ -111,24 +181,17 @@ export async function scanSources(options: {
   logger?: VaultLogger;
 }): Promise<SourceScan> {
   const logger = options.logger ?? nullLogger;
-  const notePaths = await collectNotePaths(options.cli, options.collectionPath, logger);
+  const scan = await scanNotes(options);
 
-  const found = await mapWithLimit(
-    notePaths,
-    options.concurrency ?? DEFAULT_CONCURRENCY,
-    async (notePath) => {
-      const markdown = await options.cli.readNote(notePath);
-      if (markdown === null) return { path: notePath, sourceId: null };
-
-      const raw = parseNoteFrontmatter(markdown)?.data.source_id;
-      // A hand-edited id can decode as a number rather than a string, so the
-      // value is coerced instead of required to be one.
-      return {
-        path: notePath,
-        sourceId: raw === undefined || raw === null ? null : String(raw),
-      };
-    },
-  );
+  const found = scan.notes.map((note) => {
+    const raw = note.data?.source_id;
+    // A hand-edited id can decode as a number rather than a string, so the
+    // value is coerced instead of required to be one.
+    return {
+      path: note.path,
+      sourceId: raw === undefined || raw === null ? null : String(raw),
+    };
+  });
 
   // Only paths that still exist count; a note that was moved away stops
   // claiming its old identity.

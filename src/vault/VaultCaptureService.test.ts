@@ -8,13 +8,16 @@ import { BaseScraperStrategy } from "../scraper/strategies/BaseScraperStrategy";
 import type { QueueItem, ScraperOptions, ScraperProgressEvent } from "../scraper/types";
 import type { ProgressCallback } from "../types";
 import { loadConfig } from "../utils/config";
+import { LockTimeoutError } from "./lock";
 import type { Publication, Publisher, SourceDocument } from "./types";
 import {
   type CaptureDependencies,
+  type CaptureIndexer,
   type CapturePageOutcome,
   capture,
   deriveExitCode,
 } from "./VaultCaptureService";
+import { IndexContentError } from "./VaultIndex";
 
 /** Minimal fake `ScraperService` that emits caller-supplied progress events. */
 class FakeScraperService {
@@ -911,5 +914,241 @@ describe("deriveExitCode", () => {
   it("returns exit 2 when a run error accompanies an otherwise fully clean outcome", () => {
     const outcome = outcomeWith(publicationOf("published", "linked"));
     expect(deriveExitCode([outcome], false, "unexpected failure")).toBe(2);
+  });
+});
+
+describe("capture indexing", () => {
+  /** The fake scraper, as the dependency type this module actually takes. */
+  const asService = (fake: FakeScraperService): CaptureDependencies["scraperService"] =>
+    fake as unknown as CaptureDependencies["scraperService"];
+
+  /** Records the order publication and indexing happened in. */
+  class OrderRecorder {
+    readonly events: string[] = [];
+  }
+
+  function indexedPublication(url: string): Publication {
+    return {
+      status: "published",
+      path: `00 Inbox/Source Captures/${url.replace(/\W+/g, "-")}.md`,
+      markdown: `---\ntitle: x\n---\nbody for ${url}`,
+      digest: `digest-${url}`,
+      moc: "linked",
+    };
+  }
+
+  it("publishes before it makes any index call", async () => {
+    const recorder = new OrderRecorder();
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/" }));
+    });
+    const publisher = new ScriptedPublisher(async (input) => {
+      recorder.events.push(`publish:${input.sourceUrl}`);
+      return indexedPublication(input.sourceUrl);
+    });
+    const indexer: CaptureIndexer = {
+      index: async (entry) => {
+        recorder.events.push(`index:${entry.sourceUrl}`);
+      },
+    };
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      { scraperService: asService(scraperService), publisher, indexer },
+    );
+
+    expect(recorder.events).toEqual([
+      "publish:https://example.com/",
+      "index:https://example.com/",
+    ]);
+    expect(result.outcomes[0].index).toBe("indexed");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("passes the saved note's own bytes, path and digest to the indexer", async () => {
+    const seen: Parameters<CaptureIndexer["index"]>[0][] = [];
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/doc" }));
+    });
+    const publication = indexedPublication("https://example.com/doc");
+    const publisher = new ScriptedPublisher(async () => publication);
+
+    await capture(
+      {
+        options: baseOptions({ library: "Doc Set", version: "2.1" }),
+        requestedUrl: "https://example.com/doc",
+      },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async (entry) => {
+            seen.push(entry);
+          },
+        },
+      },
+    );
+
+    expect(seen).toEqual([
+      {
+        path: publication.path,
+        markdown: publication.markdown,
+        digest: publication.digest,
+        sourceUrl: "https://example.com/doc",
+        collection: "Doc Set",
+        version: "2.1",
+      },
+    ]);
+  });
+
+  it("leaves the publication intact and reports pending when indexing fails", async () => {
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/" }));
+    });
+    const publication = indexedPublication("https://example.com/");
+    const publisher = new ScriptedPublisher(async () => publication);
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async () => {
+            throw new Error("index store unavailable");
+          },
+        },
+      },
+    );
+
+    expect(result.outcomes[0].index).toBe("pending");
+    expect(result.outcomes[0].publication).toEqual(publication);
+    expect(result.outcomes[0].error).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("reports pending when the index lock is held by another process", async () => {
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/" }));
+    });
+    const publisher = new ScriptedPublisher(async () =>
+      indexedPublication("https://example.com/"),
+    );
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async () => {
+            throw new LockTimeoutError("another process holds the index lock");
+          },
+        },
+      },
+    );
+
+    expect(result.outcomes[0].index).toBe("pending");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("reports failed when the saved note produces no chunks", async () => {
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/" }));
+    });
+    const publisher = new ScriptedPublisher(async () =>
+      indexedPublication("https://example.com/"),
+    );
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async () => {
+            throw new IndexContentError("no chunks", "note.md");
+          },
+        },
+      },
+    );
+
+    expect(result.outcomes[0].index).toBe("failed");
+    // Indexing status never moves the exit code.
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("indexes one URL once however often the crawl reports it", async () => {
+    const calls: string[] = [];
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/", depth: 0 }),
+      );
+      await progressCallback(
+        contentEvent({ currentUrl: "https://example.com/", depth: 2 }),
+      );
+    });
+    const publisher = new ScriptedPublisher(async () =>
+      indexedPublication("https://example.com/"),
+    );
+
+    await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async (entry) => {
+            calls.push(entry.sourceUrl);
+          },
+        },
+      },
+    );
+
+    expect(calls).toEqual(["https://example.com/"]);
+  });
+
+  it("leaves every outcome not-attempted when no indexer is supplied", async () => {
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(contentEvent({ currentUrl: "https://example.com/" }));
+    });
+    const publisher = new ScriptedPublisher(async () =>
+      indexedPublication("https://example.com/"),
+    );
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/" },
+      { scraperService: asService(scraperService), publisher },
+    );
+
+    expect(result.outcomes[0].index).toBe("not-attempted");
+  });
+
+  it("never indexes a page that was skipped rather than published", async () => {
+    const calls: string[] = [];
+    const scraperService = new FakeScraperService(async (progressCallback) => {
+      await progressCallback(
+        skipEvent({ currentUrl: "https://example.com/missing", outcome: "not-found" }),
+      );
+    });
+    const publisher = new ScriptedPublisher(async () =>
+      indexedPublication("https://example.com/missing"),
+    );
+
+    const result = await capture(
+      { options: baseOptions(), requestedUrl: "https://example.com/missing" },
+      {
+        scraperService: asService(scraperService),
+        publisher,
+        indexer: {
+          index: async (entry) => {
+            calls.push(entry.sourceUrl);
+          },
+        },
+      },
+    );
+
+    expect(calls).toEqual([]);
+    expect(result.outcomes[0].index).toBe("not-attempted");
   });
 });

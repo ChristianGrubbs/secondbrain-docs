@@ -7,18 +7,42 @@
  * `Publisher.publish` for every page that carries content, and turns the
  * scraper's per-page outcomes into a truthful, partial-success-aware report.
  *
- * Indexing is not this task's job — every outcome carries
- * `index: "not-attempted"`, and Task 5 adds indexing without changing these
- * exit semantics.
+ * Indexing is derived from what was published, never from what was crawled:
+ * the indexer is handed the note's saved path, bytes and digest *after* the
+ * publisher returns, and it re-reads the vault itself. Its outcome is recorded
+ * per page and never moves the exit code — a note that is safely in the vault
+ * but not yet retrievable is a diagnostic, not a failed capture.
  */
 
 import { CancellationError } from "../pipeline/errors";
 import type { ScraperService } from "../scraper/ScraperService";
 import type { ScraperOptions, ScraperProgressEvent } from "../scraper/types";
 import type { Publication, Publisher, SourceDocument } from "./types";
+import { IndexContentError, type IndexEntry } from "./VaultIndex";
 
 /** Tag distinguishing which terminal event produced one page outcome. */
 type TerminalCategory = "not-modified" | "not-found" | "fetch-failed" | "result";
+
+/**
+ * How far one published page got into the derived index.
+ *
+ * `pending` is the recoverable state: the note and its MOC link are intact and
+ * the next `reindex` picks it up. `failed` is reserved for a note the index
+ * refused on its own content — retrying it unchanged cannot help.
+ */
+export type CaptureIndexStatus = "not-attempted" | "indexed" | "pending" | "failed";
+
+/** The index, as a capture is allowed to see it. */
+export interface CaptureIndexer {
+  /**
+   * Indexes one saved note.
+   *
+   * @param entry The note as publication left it; the implementation re-reads
+   *   the canonical bytes from the vault before it indexes anything.
+   * @throws IndexContentError when the saved note yields nothing retrievable.
+   */
+  index(entry: IndexEntry): Promise<void>;
+}
 
 /** One page's outcome, keyed by final URL, crawl depth, and terminal status. */
 export type CapturePageOutcome = {
@@ -26,8 +50,8 @@ export type CapturePageOutcome = {
   sourceUrl: string;
   /** Crawl depth the page was discovered at. */
   depth: number;
-  /** Always `"not-attempted"` in this task; Task 5 adds real indexing. */
-  index: "not-attempted";
+  /** How far this page got into the derived index. */
+  index: CaptureIndexStatus;
   /** Present when the page was published, unchanged, replaced, or conflicted. */
   publication?: Publication;
   /**
@@ -102,6 +126,36 @@ export interface CaptureInput {
 export interface CaptureDependencies {
   scraperService: ScraperService;
   publisher: Publisher;
+  /** Omitted when indexing is not wanted; every outcome stays `not-attempted`. */
+  indexer?: CaptureIndexer;
+}
+
+/** One published page and what the index then made of it. */
+interface PublishedPage {
+  publication: Publication;
+  index: CaptureIndexStatus;
+}
+
+/**
+ * Indexes one published note, converting every failure into a recorded status.
+ *
+ * Indexing runs after publication and can never undo it, so nothing here is
+ * allowed to propagate: the note is already in the vault and the exit code is
+ * already decided by what happened to it there.
+ *
+ * @returns `indexed`, `failed` for content the index refused, `pending` for
+ *   everything else — a busy index lock, an unavailable store, an I/O error.
+ */
+async function indexPublication(
+  indexer: CaptureIndexer,
+  entry: IndexEntry,
+): Promise<CaptureIndexStatus> {
+  try {
+    await indexer.index(entry);
+    return "indexed";
+  } catch (error) {
+    return error instanceof IndexContentError ? "failed" : "pending";
+  }
 }
 
 /** A page outcome carries useful vault output when it holds a publication. */
@@ -235,15 +289,17 @@ export async function capture(
   deps: CaptureDependencies,
 ): Promise<CaptureResult> {
   const { options, requestedUrl, signal } = input;
-  const { scraperService, publisher } = deps;
+  const { scraperService, publisher, indexer } = deps;
 
   const pages = new Map<string, CapturePageOutcome>();
 
   // Run-scoped publication cache, keyed by final URL only (not depth), and
   // never evicted: the same canonical URL discovered concurrently,
   // sequentially, or at a different depth later in the same crawl shares one
-  // publish call and its settled result, rather than publishing again.
-  const publicationsByUrl = new Map<string, Promise<Publication>>();
+  // publish call and its settled result, rather than publishing again. The
+  // index call is inside that same cached promise, so one URL is indexed once
+  // however often the crawl reports it.
+  const publicationsByUrl = new Map<string, Promise<PublishedPage>>();
 
   const recordSkip = (
     progress: ScraperProgressEvent,
@@ -300,7 +356,7 @@ export async function capture(
         // assignment into the cache below always happens, even for a
         // synchronous throw, so a later occurrence of the same URL reuses
         // the settled (rejected) result rather than retrying.
-        publishPromise = (async () => {
+        publishPromise = (async (): Promise<PublishedPage> => {
           const document: SourceDocument = {
             sourceUrl: url,
             requestedUrl,
@@ -311,17 +367,33 @@ export async function capture(
             sourceContentType: result.sourceContentType,
             capturedAt: new Date().toISOString(),
           };
-          return publisher.publish(document);
+          const publication = await publisher.publish(document);
+
+          // Publication first, always. The index is derived from the note that
+          // now exists, and is handed its path, its saved bytes and the digest
+          // those bytes hash to — never the crawler's own output.
+          if (indexer === undefined) {
+            return { publication, index: "not-attempted" };
+          }
+          const index = await indexPublication(indexer, {
+            path: publication.path,
+            markdown: publication.markdown,
+            digest: publication.digest,
+            sourceUrl: url,
+            collection: options.library,
+            version: options.version ?? "",
+          });
+          return { publication, index };
         })();
         publicationsByUrl.set(url, publishPromise);
       }
 
-      const publication = await publishPromise;
+      const page = await publishPromise;
       pages.set(key, {
         sourceUrl: url,
         depth: progress.depth,
-        index: "not-attempted",
-        publication,
+        index: page.index,
+        publication: page.publication,
       });
     } catch (error) {
       if (signal?.aborted) {
