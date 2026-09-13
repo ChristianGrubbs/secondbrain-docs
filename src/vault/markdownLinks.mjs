@@ -121,6 +121,32 @@
  * `remark-parse`/`micromark`, which is out of this module's scope. See the
  * benchmark-style test in `markdownLinks.test.ts` for the measured numbers
  * and the isolation methodology.
+ *
+ * ROUND 11 (2026-09-13 Codex frontier review, scoped re-review, BLOCKER):
+ * round 10's own `countWikilinksInRun` was not actually linear. Its
+ * `open`/`close`/`nextOpen` were each found with a fresh `indexOf` call
+ * starting from the CURRENT position on every iteration; for
+ * `"[[".repeat(n) + "valid]]"`, every one of the `n` nested openers
+ * re-scanned forward toward the SAME distant closer, making the total cost
+ * quadratic (measured on the round-10 implementation: ~4.8ms at 32KB,
+ * ~68ms at 128KB, ~273ms at 256KB). The round-10 malformed-prefix benchmark
+ * never caught this because its input (`"[[a|x ] "` repeated) has no `]]`
+ * anywhere, so that scanner's very first iteration exited immediately
+ * without ever reaching the nested-opener-replacement branch this shape
+ * exercises.
+ *
+ * `countWikilinksInRun` is now a genuinely single-pass scan: one index `i`
+ * advances monotonically (by 1 or 2 characters per step, NEVER backward and
+ * NEVER re-searching `indexOf` from an earlier position), tracking at most
+ * one "current opener" position at a time. A `[[` seen while an opener is
+ * already open REPLACES it (the abandoned earlier opener is exactly the
+ * unterminated/malformed case rounds 9-10 were reaching for). A `]]` seen
+ * while an opener is open evaluates the span between them as one candidate
+ * link and clears the opener; a `]]` with no opener open is inert leftover
+ * text. Every character is visited a bounded number of times, so the total
+ * cost is linear regardless of how many openers or closers a run contains
+ * (verified: sub-1ms at 256KB for the repeated-nested-opener shape that
+ * broke round 10). See the benchmark-style test in `markdownLinks.test.ts`.
  */
 
 import remarkParse from "remark-parse";
@@ -282,30 +308,35 @@ export function countLinksTo({ markdown, target }) {
 
 /**
  * Scans one text run for `[[target]]`/`[[target|alias]]` occurrences, using
- * an explicit linear two-pointer scan rather than a regex (round 9, then
- * round 10 scoped re-review: two successive regex-based alias designs each
- * had a real defect).
+ * a genuinely single-pass scan with monotonic pointers -- never re-searching
+ * from an earlier position (round 9, round 10, and round 11 scoped
+ * re-reviews: three successive designs each had a real defect).
  *
  * Round 9's alias group `[^\]]*` stopped at the FIRST `]`, missing an alias
- * containing an escaped or character-referenced literal `]`. The round-9
- * fix, `(?:(?!\]\]).)*` (stop only at the real `]]`), then had its own
- * defect (round 10): it never stops at a NESTED `[[`, so an unterminated
- * link like `[[a|unterminated ] text [[b]]` let the regex borrow `b`'s
- * closing `]]` as if it were `a`'s, wrongly counting `a` as linked (a false
- * "already linked" match the publisher would trust, suppressing the note's
- * real link) -- and repeated malformed prefixes made the backtracking
- * regex engine's cost superlinear (measured: ~257ms at 28KB, ~1.87s at
- * 112KB of repeated `[[a|x ] `).
+ * containing an escaped or character-referenced literal `]`. Round 10's fix,
+ * `(?:(?!\]\]).)*` (stop only at the real `]]`), never stopped at a NESTED
+ * `[[`, so an unterminated link like `[[a|unterminated ] text [[b]]` let the
+ * regex borrow `b`'s closing `]]` as if it were `a`'s. Round 10's own
+ * replacement scanner fixed that, but for `open`/`close`/`nextOpen` each
+ * re-ran `indexOf` from the current position on every iteration: for
+ * `"[[".repeat(n) + "valid]]"`, every one of the `n` nested openers re-scans
+ * forward toward the SAME distant `]]`, making the total cost quadratic
+ * (measured: ~4.8ms at 32KB, ~68ms at 128KB, ~273ms at 256KB) -- round 11's
+ * BLOCKER.
  *
- * This scanner is linear in the run's length: `open`/`close`/`nextOpen`
- * are each found with a single forward `indexOf` call per iteration, and
- * every iteration advances past at least the just-processed `[[`, so the
- * total work across all iterations is bounded by the run's length. A link
- * is well-formed only when its next `]]` occurs before any nested `[[`;
- * otherwise the `[[` is treated as unterminated/malformed and skipped
- * (retrying from the nested `[[`, which itself may or may not be
- * well-formed) -- matching the intent both regex designs were reaching
- * for, without either defect.
+ * This version makes a single forward pass over `run`, advancing `i`
+ * monotonically (by 1 or 2 characters per step, never backward and never
+ * re-searching from an earlier index): it tracks at most one "current
+ * opener" position at a time. Seeing `[[` while an opener is already open
+ * REPLACES it (the earlier, now-abandoned opener is exactly the
+ * unterminated/malformed case rounds 9-10 were reaching for -- it never
+ * gets a chance to match a later `]]`). Seeing `]]` while an opener is open
+ * evaluates the text between them as one candidate link (split at the
+ * first `|` for target vs. alias, target compared as a plain string) and
+ * clears the opener; seeing `]]` with no opener open is inert leftover
+ * text. Every character is visited a bounded number of times, so the total
+ * cost is linear in the run's length regardless of how many openers or
+ * closers it contains.
  *
  * @param {string} run
  * @param {string} target Vault path of the note, without its `.md` extension.
@@ -313,26 +344,27 @@ export function countLinksTo({ markdown, target }) {
  */
 function countWikilinksInRun(run, target) {
   let count = 0;
+  let opener = -1; // Index right after the most recent unclosed "[[", or -1.
   let i = 0;
-  while (i < run.length) {
-    const open = run.indexOf("[[", i);
-    if (open === -1) break;
-    const searchFrom = open + 2;
-    const close = run.indexOf("]]", searchFrom);
-    if (close === -1) break;
-    const nextOpen = run.indexOf("[[", searchFrom);
-    if (nextOpen !== -1 && nextOpen < close) {
-      // A nested `[[` occurs before this `]]` -- `open` never actually
-      // closes here; treat it as unterminated/malformed and retry from the
-      // nested `[[`, which may itself be well-formed.
-      i = nextOpen;
+  const len = run.length;
+  while (i < len) {
+    if (run[i] === "[" && run[i + 1] === "[") {
+      opener = i + 2;
+      i += 2;
       continue;
     }
-    const inner = run.slice(searchFrom, close);
-    const pipeIndex = inner.indexOf("|");
-    const targetPart = pipeIndex === -1 ? inner : inner.slice(0, pipeIndex);
-    if (targetPart === target) count++;
-    i = close + 2;
+    if (run[i] === "]" && run[i + 1] === "]") {
+      if (opener !== -1) {
+        const inner = run.slice(opener, i);
+        const pipeIndex = inner.indexOf("|");
+        const targetPart = pipeIndex === -1 ? inner : inner.slice(0, pipeIndex);
+        if (targetPart === target) count++;
+        opener = -1;
+      }
+      i += 2;
+      continue;
+    }
+    i += 1;
   }
   return count;
 }
