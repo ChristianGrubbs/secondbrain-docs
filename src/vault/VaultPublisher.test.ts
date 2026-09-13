@@ -1189,6 +1189,61 @@ describe("VaultPublisher review regressions", () => {
       expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
     });
 
+    it(// MAJOR 1 (2026-09-13 Codex frontier review round 6, second scoped
+    // re-review): `collectVisibleText` used to return "" for a skipped
+    // node and simply concatenate its neighbours, so a wikilink
+    // fragmented by an inline code span was reassembled into a false
+    // "already linked" match, and the publisher never added the real
+    // link.
+    "does not count a pseudo-link fragmented by an inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}\`x\`${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// A hard line break inside what looks like a wikilink must not be
+    // reassembled into a false "already linked" match either.
+    "does not count a pseudo-link fragmented by a hard line break as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}  \n${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// An image inside what looks like a wikilink must not be reassembled
+    // into a false "already linked" match either.
+    "does not count a pseudo-link fragmented by an image as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}![alt](url)${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
     it("cannot be made to inject a second link through a hostile title", async () => {
       const publication = await publisher.publish(
         makeDocument({ title: "Innocent]]\n- [[Evil Injected Note|pwned" }),

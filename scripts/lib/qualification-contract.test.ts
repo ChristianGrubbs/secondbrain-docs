@@ -670,6 +670,114 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR 1 (2026-09-13 Codex frontier review round 6, second scoped
+    // re-review): a wikilink fragmented by an inline code span must not be
+    // reassembled into a false match.
+    "rejects a MOC whose only mention of the target is a pseudo-link fragmented by an inline code span",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-GAMMA2-1027");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `[[${target.slice(0, 5)}\`x\`${target.slice(5)}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-GAMMA2-1027"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // A hard line break fragmenting a pseudo-link must not be reassembled
+    // into a false match.
+    "rejects a MOC whose only mention of the target is a pseudo-link fragmented by a hard line break",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-DELTA2-1028");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `[[${target.slice(0, 5)}  \n${target.slice(5)}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-DELTA2-1028"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // An image fragmenting a pseudo-link must not be reassembled into a
+    // false match.
+    "rejects a MOC whose only mention of the target is a pseudo-link fragmented by an image",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-EPSILON2-1029");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `[[${target.slice(0, 5)}![alt](url)${target.slice(5)}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-EPSILON2-1029"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // MINOR (2026-09-13 Codex frontier review round 6, second scoped
+    // re-review): renderCollectionIndex never emits block HTML, so a link
+    // mentioned only inside a raw HTML block is deliberately not counted,
+    // exactly like a link inside a code fence is not -- a documented scope
+    // decision, not an oversight.
+    "rejects a MOC whose only mention of the target is inside a raw HTML block",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-ZETA2-1030");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `<div>\n[[${target}]]\n</div>\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-ZETA2-1030"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

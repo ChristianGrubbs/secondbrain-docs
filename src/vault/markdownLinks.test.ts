@@ -115,4 +115,135 @@ describe("markdownLinks", () => {
     const markdown = `- [[${TARGET}]]\n- [[${TARGET}]]\n`;
     expect(countLinksTo({ markdown, target: TARGET })).toBe(2);
   });
+
+  describe("boundary sentinel (round 6 scoped re-review MAJOR 1)", () => {
+    it(// `collectVisibleText` used to return "" for a skipped node and
+    // simply concatenate its neighbours, so `[[collection/` + (skipped
+    // inline code) + `Fixture]]` reassembled into a false match. A
+    // boundary sentinel between the two halves prevents that, and the
+    // real link placed separately must still count exactly once.
+    "does not reassemble a pseudo-link fragmented by an inline code span", () => {
+      const markdown = `[[collection/\`x\`Fixture]]\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("does not reassemble a pseudo-link fragmented by a hard line break", () => {
+      const markdown = `[[collection/  \nFixture]]\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("does not reassemble a pseudo-link fragmented by an image", () => {
+      const markdown = `[[collection/![alt](url)Fixture]]\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("does not reassemble a pseudo-link fragmented by inline HTML", () => {
+      const markdown = `[[collection/<br>Fixture]]\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+  });
+
+  describe("raw HTML scope decision (round 6 scoped re-review MINOR)", () => {
+    it(// `renderCollectionIndex` in src/vault/render.ts never emits block
+    // HTML -- the publisher's own MOCs are always a heading plus a flat
+    // Markdown bullet list -- so a link mentioned only inside a raw HTML
+    // block a human hand-edited in is deliberately NOT counted, exactly
+    // like a link mentioned only inside a code fence is not. This is a
+    // documented scope decision, not an oversight.
+    "does not count a link that appears only inside a raw HTML block", () => {
+      const markdown = `<div>\n[[${TARGET}]]\n</div>\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(0);
+    });
+  });
+
+  describe("structural coverage (round 6 scoped re-review MINOR: committed fixtures for previously-probed-only cases)", () => {
+    it("counts a link inside a heading", () => {
+      const markdown = `## See [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("counts a link inside a list item", () => {
+      const markdown = `- [[${TARGET}]]\n- some other item\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("counts a link inside a blockquote", () => {
+      const markdown = `> See [[${TARGET}]] for details.\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("counts a link inside a GFM-less table cell (pipe table via remark-parse core)", () => {
+      // remark-parse's core (no remark-gfm) does not parse pipe tables at
+      // all -- a `| ... |` line becomes ordinary paragraph text, still
+      // scanned as a `paragraph`, so the link is still found.
+      const markdown = `| [[${TARGET}]] | other |\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("reassembles a wikilink split across text nodes by strong emphasis", () => {
+      const markdown = `- [[collection/**Fixture**]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it(// A real Markdown link is transparent for reassembly purposes: its
+    // clickable label text (here "Fixture", the entire remaining part of
+    // the target) is genuinely visible content, so it is kept -- only
+    // the `(url)`/`[...]` delimiter syntax around it vanishes on parse.
+    "reassembles a wikilink split across text nodes by a real Markdown link", () => {
+      const markdown = `- [[collection/[Fixture](https://example.com)]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it(// Two adjacent paragraphs, the first ending with the opening half of
+    // a wikilink and the second starting with the closing half, must
+    // NEVER be concatenated into a false match -- matching is scoped per
+    // block (TEXT_CONTAINER_TYPES), not globally.
+    "does not merge a pseudo-link split across two separate paragraphs", () => {
+      const markdown = `[[collection/\n\nFixture]]\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+  });
+
+  describe("performance (round 6 scoped re-review MAJOR 2)", () => {
+    function buildFlatListMoc(entries: number): string {
+      const lines: string[] = [];
+      for (let i = 0; i < entries; i++) {
+        lines.push(`- [[collection/Fixture ${i}|Fixture ${i}]]`);
+      }
+      return `${lines.join("\n")}\n`;
+    }
+
+    it(// Measured on this machine before the fast path: ~508ms at 10k
+    // entries, ~1.4s at 20k, ~13.8s at 50k (roughly quadratic in total
+    // MOC size, since VaultPublisher calls this once per publication).
+    // The substring fast path makes the target-absent case parse-free
+    // regardless of MOC size (measured well under 1ms at 20k); the
+    // target-present case still requires a real parse (measured ~1.4s at
+    // 20k, unaffected by the fast path since the substring genuinely is
+    // present), but a repeat call against the exact same MOC string
+    // reuses the single-entry parse cache (measured ~4ms). Ceilings here
+    // are deliberately generous for CI stability -- this documents an
+    // accepted, bounded per-call link-check cost, not the plan's
+    // protected full-collection scan.
+    "stays fast on a large flat-list MOC when the target is absent, and bounded when present", () => {
+      const entries = 20000;
+      const moc = buildFlatListMoc(entries);
+      const absentTarget = "collection/absent-target-not-in-moc";
+      const presentTarget = `collection/Fixture ${entries - 1}`;
+
+      const absentStart = performance.now();
+      expect(countLinksTo({ markdown: moc, target: absentTarget })).toBe(0);
+      expect(performance.now() - absentStart).toBeLessThan(50);
+
+      const presentStart = performance.now();
+      expect(countLinksTo({ markdown: moc, target: presentTarget })).toBe(1);
+      expect(performance.now() - presentStart).toBeLessThan(3000);
+
+      // Same exact markdown string again -- the single-entry cache must
+      // make this dramatically cheaper than the cold parse above.
+      const cachedStart = performance.now();
+      expect(countLinksTo({ markdown: moc, target: presentTarget })).toBe(1);
+      expect(performance.now() - cachedStart).toBeLessThan(500);
+    });
+  });
 });
