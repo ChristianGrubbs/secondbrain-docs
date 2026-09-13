@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-two further reviewer-driven correction rounds (packets 3 and 4 — see those
-sections near the end). Task 6 as a whole is **not accepted**: F06 fails on an
-unresolved operator decision, F07 fails on a confirmed external converter
-limit, and D01/D03 are confirmed limits/defects deliberately left unfixed per
-this packet's scope. See `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md`
-for the full task definition and acceptance criteria. Final full-suite result
-on this branch's head, run twice: **150 files / 2364 tests passed**, exit 0
-both times.
+three further reviewer-driven correction rounds (packets 3, 4 and 5 — see
+those sections near the end). Task 6 as a whole is **not accepted**: F06 fails
+on an unresolved operator decision, F07 fails on a confirmed external
+converter limit, and D01/D03 are confirmed limits/defects deliberately left
+unfixed per this packet's scope. See
+`docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
+definition and acceptance criteria. Final full-suite result on this branch's
+head, run twice: **150 files / 2368 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -117,7 +117,7 @@ The unit-level missing-directory diagnostics required by 6B (`not a directory` v
 | X01 | Partial/useful-but-incomplete capture — exit 2 | pass (reused) | F11's process-level test IS this row: a manual edit conflict on recapture asserts `run.code === 2`, `publication.status === "conflict"`, and the human edit plus the original sentinel both survive in the saved note |
 | X02 | All-failed/no-useful-publication — exit 1 | pass (reused) | F12's process-level test IS this row: a 404 root asserts `run.code === 1` and `envelope.run_error` is set |
 | X03 | Cancelled via SIGINT — exit 130 | pass, after a genuine defect fix (Defect 3 below) | Test "X03: SIGINT cancellation exits 130 and preserves outcomes published before the abort"; root page publishes, then a real OS-level `SIGINT` is sent mid-fetch of a deliberately slow child page; `run.code === 130`, `envelope.cancelled === true`, ≥1 published outcome, and the root's saved note remains independently searchable after cancellation |
-| X03b | SIGINT/SIGTERM/SIGHUP browser-cleanup (MAJOR 1 addition, packet 3; rewritten packet 4, MAJOR B) | pass (unverified before this packet's rewrite -- the packet-3 version used a machine-wide `pgrep` snapshot that the coordinator's independent run demonstrated flaking under vitest parallelism, and let the fixture page complete naturally) | `it.each` "SIGINT/SIGTERM/SIGHUP during a browser-rendered capture leaves no Chromium descendants or a leaked temp profile dir": the fixture page never responds (cannot complete naturally); Chromium descendants are found by walking real `ps` ancestry from the child's own pid; the actual `--user-data-dir` is checked for leaks; SIGINT's exit code (130) and SIGTERM/SIGHUP's host-survives-while-browser-is-reaped outcome are asserted. Plus a negative control ("a genuinely leaked descendant is detected as still alive by the same check") proving the detection logic itself would catch a real leak. |
+| X03b | SIGINT/SIGTERM/SIGHUP browser-cleanup (MAJOR 1 addition, packet 3; rewritten packet 4, MAJOR B; negative control corrected packet 5, MAJOR 3) | pass (unverified before packet 4's rewrite -- the packet-3 version used a machine-wide `pgrep` snapshot that flaked under vitest parallelism and let the fixture page complete naturally; packet 4's negative control was itself vacuous -- see below) | `it.each` "SIGINT/SIGTERM/SIGHUP during a browser-rendered capture leaves no Chromium descendants or a leaked temp profile dir": the fixture page never responds; Chromium descendants are found by walking real `ps` ancestry from the child's own pid; the actual `--user-data-dir` is checked for leaks; SIGINT's exit code (130) and SIGTERM/SIGHUP's host-survives-while-browser-is-reaped outcome are asserted. **Real negative control** (packet 5): `it.each` "negative control: with cleanup disabled, %s leaves a real Chromium descendant and its profile dir alive (proves the assertions can fail)" runs the ACTUAL cleanup case with `SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1` plus a new test-only keep-alive hook (`SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL=1` in `capture.ts`) so the host survives the signal in isolation from Playwright's own cleanup, and proves the SAME assertions the healthy case uses (chromium-still-alive, profile-dir-leaked) correctly FAIL to hold. The packet-4 "negative control" (a bare `sleep` pid checked with `kill(pid,0)`) has been removed -- it never exercised browser discovery, signal delivery, or the cleanup case at all. |
 
 Publication exceptions not incrementing the upstream acquisition-failure counter
 is covered by existing `VaultCaptureService.test.ts` unit evidence (not
@@ -287,6 +287,17 @@ Packet 4 (Codex frontier review round 2 fixes):
 - **Full `npm test` run TWICE** on the exact final commit, per the coordinator's addendum (their independent run had found the packet-3 SIGTERM test flaking under parallelism): run 1 — **150 files / 2364 tests passed**, exit 0; run 2 — **150 files / 2364 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 4's edits.
 
+Packet 5 (Codex frontier review round 3 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **11 passed / 11** (2 new missing/empty-digest rejection cases).
+- `npx vitest run src/vault-cli/commands/capture.test.ts` — **22 passed / 22** (unaffected by the new keep-alive hook).
+- `npx vitest run src/vault/VaultIndex.test.ts` — **97 passed / 97** (R12/R13 exact-identity rewrite plus a new wrong-membership regression fixture).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (real negative control replacing the vacuous sleep-pid check).
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **150 files / 2368 tests passed**, exit 0; run 2 — **150 files / 2368 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 5's edits (a stray NUL byte introduced by a tool-encoding artifact mid-edit was caught and removed before committing).
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -332,8 +343,8 @@ manifest vault-path membership.
 | R09 | Unreadable database (search + upsert) | pass | `damages[8]` |
 | R10 | Process-level representatives: malformed pointer, deleted pointer, malformed manifest row, deleted database, through `search` and a `capture` that triggers `upsert` | pass | `test/vault-index-e2e.test.ts` describe "R10: process-level damaged-index representatives (search and upsert)", 8 test cases (4 shapes × search/upsert); membership inspected via `readIndexState` directly (manifest + `documents` row count), not top-N search |
 | R11 | Never-built vs. honest miss vs. damaged-with-notes, distinguished | pass | `VaultIndex.test.ts` "distinguishes never-built, honest miss and damaged-with-notes (R11)": all three envelopes checked side by side; never-built and honest-miss both legitimately `status: ok` + empty; damaged-with-notes recovers real results and is asserted `not.toEqual([])` |
-| R12 | Two collections (A, B) each with multiple notes: rebuild A, then B, delete only derived index data, reconstruct both; manifest AND database (identities/chunks) AND saved-byte digests inspected before any search; extended to a deleted-database ordering case | pass (round-2 corrected; previously manifest-only, single-note-per-collection — see Packet 4, MAJOR D) | `VaultIndex.test.ts` "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)" plus the new "a deleted database after a two-collection reconstruction is caught by direct inspection, not masked by search (R12/R13)" |
-| R13 | Full index loss with saved notes present, vs. a never-built control; manual edits preserved; conflict candidates excluded; case- AND whitespace-distinct (`"Release"`/`"release"`/`" Release"`) version identities stay distinct | pass (round-2 corrected: whitespace-distinct version added — see Packet 4, MAJOR D) | Same tests as R12. This index never fetches an original external source — only saved vault bytes — so "deny the original fetch" is satisfied by construction (`vault.writes` stays empty throughout) |
+| R12 | Two collections (A, B) each with multiple notes: rebuild A, then B, delete only derived index data, reconstruct both; the EXACT SET of distinct database note identities (via the same `(page.url, version)` join `searchStore` itself resolves hits through — not manifest, not text parsed from `content`) equals the expected set for BOTH collections, per-note database CONTENT carries the right body, and manifest digests are checked alongside (not instead of) the database check — all before any search runs; extended to a deleted-database ordering case and a wrong-membership-at-equal-row-count regression fixture | pass (round-3 corrected; round 2's version only asserted a `>=` total row count and checked digests against the manifest, not the database — see Packet 5, MAJOR 1) | `VaultIndex.test.ts` "preserves manual edits, excludes conflicts, and keeps version identities distinct across a two-collection full reconstruction (R12/R13)"; "a deleted database after a two-collection reconstruction is caught by direct inspection, not masked by search (R12/R13)"; "rejects a database with wrong note membership at the same total row count as a healthy generation (R12/R13)" |
+| R13 | Full index loss with saved notes present, vs. a never-built control; manual edits preserved; conflict candidates excluded; case- AND whitespace-distinct (`"Release"`/`"release"`/`" Release"`) version identities stay distinct, verified at the database identity level (`storeVersion`-keyed) | pass (round-2 corrected: whitespace-distinct version added; round-3 corrected: database-level identity, not manifest — see Packet 4 MAJOR D, Packet 5 MAJOR 1) | Same tests as R12. This index never fetches an original external source — only saved vault bytes — so "deny the original fetch" is satisfied by construction (`vault.writes` stays empty throughout) |
 | R14 | Generation-construction failure mid-build: no bad promotion, prior generation unchanged | pass (pre-existing coverage, cited) | `VaultIndex.test.ts` `describe("failures after a generation has begun")`: "keeps the prior generation when indexing fails part way through", "keeps the prior generation when verification rejects what was persisted" |
 | R15 | Held index lock: capture exits 0 with `index: pending`; search/reindex fail visibly; release + rebuild recovers | pass (pre-existing coverage, cited) | `test/vault-index-e2e.test.ts` `describe("with the index lock held by another process")` plus "picks up the pending note on the next reindex" |
 | R16 | A note edited, renamed, or deleted while its update waits under a held lock; the reindex/search outcome describes the actual state | pass | `test/vault-index-e2e.test.ts` new describe "R16: a note edited/renamed/deleted while its update waits under a held index lock", 3 test cases: edit → new content searchable, old content gone; rename → found at new path via source-identity discovery, not the pending path; delete → search returns zero results and reindex still reports `status: "rebuilt"` (never a stale "indexed" claim for a vanished note) |
@@ -407,6 +418,25 @@ SIGINT/SIGTERM/SIGHUP process rows (X03/X03b) were unverified prior to this
 packet's fixes**; they are recorded as pass above and in the R-row/X-row
 tables only because the rewritten assertions in this packet now pass. See
 "Verification run log" for the exact commands and the two full-suite runs.
+
+## Packet 5: Codex frontier review round 3 fixes (2026-09-13)
+
+Codex round 3 (label `task6-qualification-r3`) on `8a6b85f...951ecb1` returned
+issues-found with 3 major findings. Round-2 findings A and E were confirmed
+closed, the `BrowserFetcher` test hook confirmed inert in production, and the
+F06/F07/D01/D03 honesty framing confirmed. All three new findings are
+addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1 | R12/R13's database check asserted only a `>=` total row count and validated digests against the manifest, not the database -- a database missing one sibling while another supplied enough padding chunks would have passed, and a later search would silently repair it. Now asserts the EXACT SET of distinct `(page.url, version)` database identities for both collections (the same join `searchStore` itself resolves hits through, not manifest text or `content`-parsed text), checks per-note database content for the right phrase, and rejects cross-contamination. A new regression fixture repoints one sibling's database rows onto another's page at the identical total row count and proves the exact-set check rejects it while a count-only check would not. | `src/vault/VaultIndex.ts` (`storeVersion` exported for test use), `src/vault/VaultIndex.test.ts` |
+| MAJOR 2 | `qualifyNote` skipped digest validation entirely when `expectedDigest` was `undefined`, so a capture regression that omitted the digest from its own envelope still qualified. The digest is now REQUIRED (non-empty string) and compared unconditionally; a missing/empty digest is itself a contract failure with an explicit reason. | `scripts/lib/qualification-contract.mjs`, `.test.ts` (two new rejection cases: `undefined` and `""`) |
+| MAJOR 3 | The packet-4 "negative control" only proved `kill(pid, 0)` recognizes a supplied `sleep` pid -- it bypassed browser discovery, signal delivery, profile tracking, and the cleanup case entirely, so it proved nothing about whether the real assertions would catch a genuine regression. Replaced with a real end-to-end negative control: the ACTUAL cleanup case runs with `SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1`, plus a new test-only no-op signal listener (`SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL=1`, registered in `src/vault-cli/commands/capture.ts`, inert unless explicitly set) that keeps the host process alive on SIGTERM/SIGHUP so "Playwright's cleanup is disabled" can be observed in isolation from "the host process died" (Chromium's own CDP pipe transport otherwise treats the parent dying as its own shutdown signal, regardless of `handleSIGTERM`/`handleSIGHUP`). The exact same browser-descendant and profile-dir assertions the healthy case uses now correctly FAIL to hold when cleanup is genuinely disabled. | `src/vault-cli/commands/capture.ts`, `test/vault-capture-e2e.test.ts` (X-rows) |
+
+Row-status honesty: **R12/R13's database-identity claim and X03b's negative
+control were both weaker than represented prior to this packet** (see the
+row entries above for what actually changed). See "Verification run log" for
+the exact commands and the two full-suite runs required for this packet.
 
 ## What this packet does not claim
 
