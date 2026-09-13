@@ -13,6 +13,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   CasConflictError,
+  classifyObsidianCliSubcommand,
   createObsidianCliRunner,
   HeadingFormatError,
   ObsidianCli,
@@ -188,4 +189,48 @@ describe("obsidian-cli process boundary", () => {
       fs.rmSync(vault, { recursive: true, force: true });
     },
   );
+});
+
+describe("classifyObsidianCliSubcommand", () => {
+  it("buckets list and read as their own categories, mutating verbs as write, and store-key as other", () => {
+    expect(classifyObsidianCliSubcommand("list")).toBe("list");
+    expect(classifyObsidianCliSubcommand("read")).toBe("read");
+    for (const write of [
+      "create",
+      "write",
+      "append",
+      "section-insert",
+      "move",
+      "redirect-sweep",
+    ]) {
+      expect(classifyObsidianCliSubcommand(write)).toBe("write");
+    }
+    expect(classifyObsidianCliSubcommand("store-key")).toBe("other");
+    expect(classifyObsidianCliSubcommand("status")).toBe("other");
+  });
+});
+
+describe(// MINOR 7 (2026-09-13 Codex frontier review): one JSONL
+// `vault.cli_invoked` event per spawned obsidian-cli subprocess, so M-row
+// measurements can report actual subprocess/list/read/write counts
+// instead of only lock/upsert counts.
+"createObsidianCliRunner logging", () => {
+  it("emits a vault.cli_invoked event with the subcommand and its category for every spawn", async () => {
+    const stub = writeStubCli("logging-stub.mjs", `process.stdout.write("ok");`);
+    const events: Array<{ event: string; ctx?: Record<string, unknown> }> = [];
+    const run = createObsidianCliRunner({
+      cliPath: stub,
+      logger: (event) => {
+        events.push({ event: event.event, ctx: event.ctx });
+      },
+    });
+
+    await run(["read", "note.md", "--all"], null);
+    await run(["list", "some/folder"], null);
+
+    expect(events).toEqual([
+      { event: "vault.cli_invoked", ctx: { subcommand: "read", category: "read" } },
+      { event: "vault.cli_invoked", ctx: { subcommand: "list", category: "list" } },
+    ]);
+  });
 });

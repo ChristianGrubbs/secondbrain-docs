@@ -91,6 +91,7 @@ export default defineConfig({
       "src/**/*.test.ts",
       "src/**/*.test.tsx",
       "test/**/*.test.ts",
+      "scripts/**/*.test.ts",
     ],
     // Exclude live e2e tests by default (they can be run manually)
     exclude: ["test/**/*-live-e2e.test.ts"],

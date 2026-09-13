@@ -50,6 +50,57 @@ describe("BrowserFetcher", () => {
     vi.clearAllMocks();
   });
 
+  it(// Regression for a 2026-09-13 qualification finding (Task 6, row X03),
+  // corrected 2026-09-13 after frontier review: Playwright's default
+  // SIGINT handler force-exits the process on its own, racing and winning
+  // against `sb-docs capture`'s own graceful-cancellation handler — the
+  // JSON exit-130 envelope never printed on a real Ctrl-C during a
+  // browser-rendered capture. Disabling only Playwright's SIGINT handling
+  // hands that one signal's cleanup to the CLI. SIGTERM and SIGHUP stay
+  // enabled (Playwright's default): this launcher is shared with the
+  // upstream HTML middleware, which bridges neither signal, and
+  // Playwright's own handlers are what reliably reap the detached browser
+  // process tree and temp profile dir on those signals — see the process
+  // tests in test/vault-capture-e2e.test.ts (X03 SIGINT/SIGTERM/SIGHUP).
+  "disables only Playwright's own SIGINT handling, leaving SIGTERM/SIGHUP to Playwright's own cleanup", async () => {
+    mockBrowser();
+    await BrowserFetcher.launchBrowser();
+
+    expect(chromium.launch).toHaveBeenCalledWith(
+      expect.objectContaining({ handleSIGINT: false }),
+    );
+    const options = vi.mocked(chromium.launch).mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(options).not.toHaveProperty("handleSIGTERM");
+    expect(options).not.toHaveProperty("handleSIGHUP");
+  });
+
+  it(// MAJOR B negative-control support (2026-09-13 Codex frontier review,
+  // round 2): the test-only escape hatch reproduces the round-1 bug on
+  // demand, so the process-level cleanup assertions in
+  // test/vault-capture-e2e.test.ts can prove they actually fail against
+  // broken cleanup.
+  "SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1 disables Playwright's own SIGTERM/SIGHUP handling too", async () => {
+    const previous = process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP;
+    process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP = "1";
+    try {
+      mockBrowser();
+      await BrowserFetcher.launchBrowser();
+
+      expect(chromium.launch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          handleSIGINT: false,
+          handleSIGTERM: false,
+          handleSIGHUP: false,
+        }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP;
+      else process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP = previous;
+    }
+  });
+
   it("uses broad invalid TLS override for the browser context", async () => {
     const { browser } = mockBrowser();
     const config = loadConfig().scraper;

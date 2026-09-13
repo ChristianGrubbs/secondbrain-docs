@@ -1,0 +1,5 @@
+Zorbtronic plaintext fixture
+
+This plain-text fixture exists to prove that a `.txt` source captures its
+exact factual body through sb-docs capture, including the sentinel phrase
+FLUMPADOODLE-9182 used only in this file.

@@ -1,0 +1,1 @@
+Beta mixed-directory fixture. Sentinel: BETA-SENTINEL-7702.

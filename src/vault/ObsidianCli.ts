@@ -11,10 +11,32 @@
  */
 
 import { spawn } from "node:child_process";
+import { createJsonlLogger, type VaultLogger } from "./PublicationJournal";
 import type { CliResult, CliRunner } from "./types";
 
 /** Default location of the vault CLI. */
 export const OBSIDIAN_CLI_PATH = `${process.env.HOME ?? ""}/ai-stack/bin/obsidian-cli`;
+
+/**
+ * Buckets an `obsidian-cli` subcommand into the coarse category
+ * MINOR 7 (2026-09-13 Codex frontier review) measurements report on:
+ * `list`/`read` are non-mutating vault-access, everything else that reaches
+ * the vault is `write`, and `store-key` is neither (`other`).
+ */
+export function classifyObsidianCliSubcommand(
+  subcommand: string,
+): "list" | "read" | "write" | "other" {
+  if (subcommand === "list") return "list";
+  if (subcommand === "read") return "read";
+  if (
+    ["create", "write", "append", "section-insert", "move", "redirect-sweep"].includes(
+      subcommand,
+    )
+  ) {
+    return "write";
+  }
+  return "other";
+}
 
 /** Any nonzero exit from `obsidian-cli`. */
 export class ObsidianCliError extends Error {
@@ -103,15 +125,28 @@ const isSetextRefusal = (stderr: string): boolean => /setext heading/.test(stder
  * @returns A runner suitable for {@link ObsidianCli}.
  */
 export function createObsidianCliRunner(
-  options: { vaultPath?: string; cliPath?: string } = {},
+  options: { vaultPath?: string; cliPath?: string; logger?: VaultLogger } = {},
 ): CliRunner {
   const cliPath = options.cliPath ?? OBSIDIAN_CLI_PATH;
   const env = options.vaultPath
     ? { ...process.env, OBSIDIAN_VAULT: options.vaultPath }
     : process.env;
+  // MINOR 7 (2026-09-13 Codex frontier review): one JSONL event per
+  // spawned obsidian-cli invocation, gated by the same SB_DOCS_LOG env var
+  // every other vault event uses, so M-row measurements can report actual
+  // subprocess/list/read/write counts instead of only lock/upsert counts.
+  const logger: VaultLogger = options.logger ?? createJsonlLogger();
 
   return (args, stdin) =>
     new Promise<CliResult>((resolve, reject) => {
+      const subcommand = args[0] ?? "";
+      logger({
+        level: "debug",
+        event: "vault.cli_invoked",
+        loc: "createObsidianCliRunner",
+        ctx: { subcommand, category: classifyObsidianCliSubcommand(subcommand) },
+      });
+
       const child = spawn(cliPath, args, {
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],

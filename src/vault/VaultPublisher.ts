@@ -26,6 +26,7 @@ import {
   sanitizeSegment,
   sha256,
 } from "./identity";
+import { hasLinkTo } from "./markdownLinks.mjs";
 import {
   CasConflictError,
   HeadingFormatError,
@@ -94,28 +95,6 @@ export function updateDecision(input: {
   if (input.currentDigest === null) return "create";
   if (input.currentDigest !== input.ownedDigest) return "conflict";
   return input.semanticChanged ? "replace" : "unchanged";
-}
-
-/**
- * Removes fenced code blocks so a link shown as an example is not mistaken for
- * a live link.
- */
-function stripCodeFences(markdown: string): string {
-  return markdown
-    .split(/^```.*$/m)
-    .filter((_, index) => index % 2 === 0)
-    .join("\n");
-}
-
-/**
- * Reports whether an index already links to a note, with or without an alias.
- *
- * @param index The index note's Markdown.
- * @param target Vault path of the note, without its `.md` extension.
- */
-function hasLinkTo(index: string, target: string): boolean {
-  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`).test(stripCodeFences(index));
 }
 
 /**
@@ -937,7 +916,7 @@ export class VaultPublisher implements Publisher {
 
     if (index !== null) {
       if (!index.split("\n").includes(SOURCES_HEADING)) return "pending";
-      if (hasLinkTo(index, target)) return "linked";
+      if (hasLinkTo({ markdown: index, target })) return "linked";
     }
 
     try {

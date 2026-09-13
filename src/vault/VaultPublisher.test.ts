@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
+import { countLinksTo } from "./markdownLinks.mjs";
 import { ObsidianCli } from "./ObsidianCli";
 import { PublicationJournal } from "./PublicationJournal";
 import { renderSourceNote } from "./render";
@@ -204,14 +205,19 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-/** Counts index lines that live-link a note path. */
-function linksTo(index: string, target: string): string[] {
-  return index
-    .split("```")
-    .filter((_, i) => i % 2 === 0)
-    .join("")
-    .split("\n")
-    .filter((line) => line.includes(`[[${target}`));
+/**
+ * Reports one placeholder entry per real link, using the exact same shared,
+ * CommonMark-correct implementation the publisher itself uses (MAJOR 2,
+ * 2026-09-13 Codex frontier review round 5; MAJOR 1+2, round 6 scoped
+ * re-review: the shared implementation itself is now a real `remark` parse,
+ * not a hand-rolled line-based stripper) -- not a test-local
+ * re-implementation that could itself drift from what the publisher
+ * actually does. Kept as an array-returning helper (rather than switching
+ * every call site to `expect(countLinksTo(...)).toBe(n)`) so every existing
+ * `.toHaveLength(n)` assertion keeps working unchanged.
+ */
+function linksTo(index: string, target: string): unknown[] {
+  return Array.from({ length: countLinksTo({ markdown: index, target }) });
 }
 
 beforeEach(() => {
@@ -999,6 +1005,407 @@ describe("VaultPublisher review regressions", () => {
 
       expect(republished.moc).toBe("linked");
       expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 2 (2026-09-13 Codex frontier review, round 5): the fence
+    // stripper round 4 added only recognized backtick fences. A target
+    // mentioned only inside a tilde-fenced code block was still counted
+    // as a live link, so `linkFromIndex` believed the note was already
+    // linked and never added the real one.
+    "does not count a link inside a tilde-fenced code block as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n~~~\n- [[${target}]]\n~~~\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug, inline-code-span shape: a target mentioned only inside
+    // `` `[[...]]` `` inline code (not a fenced block) must not be
+    // treated as a live link either.
+    "does not count a link inside an inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee the example \`[[${target}]]\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 1+2 (2026-09-13 Codex frontier review round 6, scoped): a
+    // fence indented 1-3 spaces was invisible to the round-5 hand-rolled
+    // stripper, so a mention inside one was wrongly counted as a live
+    // link. The publisher must still add the real one.
+    "does not count a link inside a fence indented 1-3 spaces as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n  \`\`\`\n  - [[${target}]]\n  \`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    // A 4+-space-indented block is CommonMark's *indented* code block, a
+    // different construct from a fence entirely -- checked at the module
+    // level (`markdownLinks.test.ts`) and the contract level
+    // (`scripts/lib/qualification-contract.test.ts`). Deliberately not
+    // repeated as a full publish/insert round-trip here:
+    // `insertUnderHeading` inserts the new real link as a flat list item
+    // immediately under the heading, and CommonMark then reparses the
+    // *pre-existing* 4-space-indented line as a nested list item
+    // continuing that same list (not an indented code block) once it
+    // directly follows a list item -- a genuine, correct reparse of the
+    // resulting document, not a defect in link counting, so it would not
+    // be a meaningful end-to-end fixture for "was this mention hidden".
+
+    it(// CommonMark requires a closing fence line to contain nothing but the
+    // fence characters (optionally trailing whitespace); a bogus closer
+    // with trailing text does not close the fence, so the already-real
+    // link placed after the true close is recognized as already linked
+    // and must not be duplicated.
+    "recognizes a real link after a fence whose bogus closing line (with trailing text) did not actually close it", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n\`\`\`\n- [[${target}]]\n\`\`\` trailing\n\`\`\`\n- [[${target}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// CommonMark: a backtick-fenced code block's info string must not
+    // itself contain a backtick -- such a line is not a valid fence
+    // opener, so the real link right after it is ordinary prose and is
+    // already linked; the publisher must not duplicate it.
+    "recognizes a real link after a backtick opener whose info string itself contains backticks (not a valid fence)", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n\`\`\` \`info\` \n- [[${target}]]\n\`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// The round-5 hand-rolled stripper's inline-span regex only matched a
+    // single-backtick pair on one line; a multi-backtick-delimited span
+    // was not recognized as one unit.
+    "does not count a link inside a multi-backtick inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\` [[${target}]] \`\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// The round-5 hand-rolled stripper operated one line at a time, so an
+    // inline code span spanning a line break was invisible to it.
+    "does not count a link inside a multiline inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\n[[${target}]]\n\` above.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// A double-backtick-delimited span containing a literal single
+    // backtick inside it -- a "mismatched delimiter run" the hand-rolled
+    // single-backtick-pair regex could misjudge the boundary of.
+    "does not count a link inside a mismatched-delimiter-run inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee \`\` code \` still code, [[${target}]] \`\` here.\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Text that looks like a fence marker, but appears inline with no
+    // matching closing backtick run anywhere in the same paragraph, is an
+    // unmatched backtick run -- CommonMark treats it as literal text, so
+    // the real link on the same line is already linked and must not be
+    // duplicated.
+    "recognizes a real link on the same line as fence-looking text with no matching close", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nNote: \`\`\`\`\` marks a fence, e.g. [[${target}]].\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 1 (2026-09-13 Codex frontier review round 6, second scoped
+    // re-review): `collectVisibleText` used to return "" for a skipped
+    // node and simply concatenate its neighbours, so a wikilink
+    // fragmented by an inline code span was reassembled into a false
+    // "already linked" match, and the publisher never added the real
+    // link.
+    "does not count a pseudo-link fragmented by an inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}\`x\`${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// A hard line break inside what looks like a wikilink must not be
+    // reassembled into a false "already linked" match either.
+    "does not count a pseudo-link fragmented by a hard line break as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}  \n${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// An image inside what looks like a wikilink must not be reassembled
+    // into a false "already linked" match either.
+    "does not count a pseudo-link fragmented by an image as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}![alt](url)${target.slice(5)}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 1 (2026-09-13 Codex frontier review round 6, third pass): the
+    // raw-substring fast path this module briefly had ignored Markdown
+    // escapes -- `\-` is resolved by remark to a literal `-`, so a MOC
+    // link written with an escaped hyphen around a title containing one
+    // would have been fast-pathed to "not linked" and duplicated.
+    "recognizes an existing link written with a backslash-escaped hyphen as already linked", async () => {
+      const first = await publisher.publish(makeDocument({ title: "Foo-Bar" }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain("Foo-Bar");
+      const escapedTarget = target.replace(/-/g, "\\-");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${escapedTarget}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument({ title: "Foo-Bar" }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug shape, character references: `&amp;` is resolved by
+    // remark to a literal `&`.
+    "recognizes an existing link written with an HTML character reference as already linked", async () => {
+      const first = await publisher.publish(makeDocument({ title: "Foo&Bar" }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain("Foo&Bar");
+      const referencedTarget = target.replace(/&/g, "&amp;");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${referencedTarget}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument({ title: "Foo&Bar" }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 2 (2026-09-13 Codex frontier review round 6, third pass): the
+    // former sentinel character (U+E000) is ordinary text; nothing stops
+    // a real note title from containing it. A real, unfragmented link to
+    // such a target must still be recognized as already linked (no
+    // duplicate inserted).
+    "recognizes an existing link to a target containing the former sentinel character (U+E000) as already linked", async () => {
+      const puaTitle = "Foo\uE000Bar";
+      const first = await publisher.publish(makeDocument({ title: puaTitle }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain(puaTitle);
+      cli.notes.set(indexPath, `# Source Captures\n\n## Sources\n\n- [[${target}]]\n`);
+
+      const republished = await publisher.publish(makeDocument({ title: puaTitle }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR (2026-09-13 Codex frontier review round 9, scoped): the
+    // alias group used to stop at the FIRST `]`, so an alias containing
+    // a literal `]` (written as a backslash escape, which remark
+    // resolves to a literal `]`) made the whole `[[target|alias]]` match
+    // fail entirely, and the publisher would insert a duplicate note.
+    "recognizes an existing link whose alias contains a backslash-escaped closing bracket as already linked", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${target}|Foo\\]Bar]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug shape, character reference: `&#93;` is resolved by remark
+    // to a literal `]`.
+    "recognizes an existing link whose alias contains a numeric HTML character reference for ] as already linked", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${target}|Foo&#93;Bar]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MINOR 1 (2026-09-13 Codex frontier review round 9, scoped): an
+    // image REFERENCE (`![alt][ref]`) is a distinct mdast node type from
+    // a direct image, and lacked dedicated end-to-end coverage: a
+    // pseudo-link fragmented by one must not be recognized as a live
+    // link, and the publisher must still add the real one.
+    "does not count a pseudo-link fragmented by an image reference as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}![alt][ref]${target.slice(5)}]]\n\n[ref]: https://example.com\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR (2026-09-13 Codex frontier review round 10, scoped): an
+    // unterminated link's alias scan used to cross a NESTED `[[` and
+    // "borrow" a later link's closing `]]` -- a MOC with a malformed
+    // `[[a|unterminated ] text [[b]]` line wrongly counted `a` as
+    // already linked (suppressing the real link `a` still needs) while
+    // correctly counting `b` (which is a genuinely well-formed link, and
+    // must not be duplicated).
+    "adds the real link for a target preceded by a malformed unterminated link, without duplicating the genuinely well-formed link that follows it", async () => {
+      const first = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target A",
+          sourceUrl: "https://docs.astral.sh/uv/a/",
+        }),
+      );
+      const second = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target B",
+          sourceUrl: "https://docs.astral.sh/uv/b/",
+        }),
+      );
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const targetA = first.path.replace(/\.md$/, "");
+      const targetB = second.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${targetA}|unterminated ] text [[${targetB}]]\n`,
+      );
+
+      const republishedA = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target A",
+          sourceUrl: "https://docs.astral.sh/uv/a/",
+        }),
+      );
+      const republishedB = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target B",
+          sourceUrl: "https://docs.astral.sh/uv/b/",
+        }),
+      );
+
+      expect(republishedA.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", targetA)).toHaveLength(1);
+      expect(republishedB.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", targetB)).toHaveLength(1);
     });
 
     it("cannot be made to inject a second link through a hostile title", async () => {

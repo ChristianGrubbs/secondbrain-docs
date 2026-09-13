@@ -265,6 +265,27 @@ describe("sb-docs capture: configuration", () => {
     expect(appConfig.app.telemetryEnabled).toBe(false);
   });
 
+  it(// Regression for a 2026-09-13 qualification finding: yargs reserves the
+  // "version" key for its own top-level --version flag (registered in
+  // createVaultCli via `.version(__APP_VERSION__)`), so without disabling
+  // it per-command `capture --version <label>` silently dropped <label>
+  // and every capture published with an empty version, breaking
+  // version-scoped capture entirely through the real CLI.
+  "passes a --version value through as the source version label, not swallowed by yargs' reserved version flag", async () => {
+    let capturedVersion: string | undefined;
+    const scraperService = fakeScraperServiceCapturingOptions((options) => {
+      capturedVersion = options.version;
+    });
+    const publisher: Publisher = { publish: async () => published() };
+
+    await runCapture(["https://example.com/", "--version", "v1"], {
+      scraperService,
+      publisher,
+    });
+
+    expect(capturedVersion).toBe("v1");
+  });
+
   it("normalizes the default collection to inbox", async () => {
     let capturedLibrary: string | undefined;
     const scraperService = fakeScraperServiceCapturingOptions((options) => {

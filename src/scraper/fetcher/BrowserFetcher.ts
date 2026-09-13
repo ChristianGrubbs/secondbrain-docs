@@ -319,6 +319,37 @@ export class BrowserFetcher implements ContentFetcher {
       headless: true,
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
       args: ["--no-sandbox"],
+      // Regression for a 2026-09-13 qualification finding (Task 6, row X03):
+      // Playwright installs its own default SIGINT handler that force-closes
+      // the browser and exits the process directly. On a real Ctrl-C during
+      // a browser-rendered capture, that handler raced and won against
+      // `sb-docs capture`'s own SIGINT handler (which aborts gracefully and
+      // prints the exit-130 JSON envelope) — the process exited 130 with the
+      // browser torn down but the envelope never printed, silently breaking
+      // the "clients inspect the full JSON envelope" contract for real
+      // cancellation. Disabling only Playwright's SIGINT handling leaves
+      // that one signal's cleanup entirely to the CLI's own handler
+      // (`src/vault-cli/commands/capture.ts`), which already closes the
+      // browser via the scraper's normal abort/cleanup path.
+      //
+      // `handleSIGTERM` and `handleSIGHUP` are deliberately left enabled
+      // (Playwright's default `true`): this launcher is shared with the
+      // upstream HTML-scraping middleware, which bridges neither of those
+      // signals, and Playwright's own handlers are the only thing that
+      // reliably reaps the detached browser process tree and its temp
+      // profile directory on SIGTERM/SIGHUP. Disabling them would leak
+      // browser descendants and temp dirs on every non-SIGINT termination.
+      //
+      // TEST-ONLY escape hatch (dated 2026-09-13, MAJOR B negative control):
+      // `SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1` reproduces the round-1 bug
+      // (Playwright's own SIGTERM/SIGHUP cleanup disabled) so
+      // test/vault-capture-e2e.test.ts can prove its descendant/temp-dir
+      // assertions actually fail against broken cleanup, not just pass
+      // unconditionally. Never set outside that test.
+      handleSIGINT: false,
+      ...(process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP === "1"
+        ? { handleSIGTERM: false, handleSIGHUP: false }
+        : {}),
     });
   }
 
