@@ -24,6 +24,7 @@ import {
   type IndexManifestEntry,
   IndexVerificationError,
   STORE_ENCODING_ID,
+  storeVersion,
   VaultIndex,
   type VaultIndexOptions,
   VERIFY_PAGE_SIZE,
@@ -190,6 +191,51 @@ function storedChunks(
   } finally {
     db.close();
   }
+}
+
+/**
+ * Per-document database identity: each `documents` row joined to its
+ * `pages.url`, the same join `searchStore`'s own identity resolution uses
+ * (`hit.url`) -- not text parsed out of `content`, which stays literally
+ * embedded even if a row's `page_id` were repointed at a different page
+ * (MAJOR 1, 2026-09-13 Codex frontier review, round 3).
+ */
+function storedDocumentIdentities(
+  index: VaultIndex,
+  collection = COLLECTION,
+): {
+  docId: number;
+  pageId: number;
+  pageUrl: string;
+  storedVersion: string;
+  content: string;
+}[] {
+  const file = path.join(activeGenerationDir(index, collection), "documents.db");
+  const db = new Database(file, { readonly: true });
+  try {
+    return db
+      .prepare(
+        `SELECT d.id AS docId, d.page_id AS pageId, p.url AS pageUrl,
+                v.name AS storedVersion, d.content AS content
+         FROM documents d
+         JOIN pages p ON d.page_id = p.id
+         JOIN versions v ON p.version_id = v.id`,
+      )
+      .all() as {
+      docId: number;
+      pageId: number;
+      pageUrl: string;
+      storedVersion: string;
+      content: string;
+    }[];
+  } finally {
+    db.close();
+  }
+}
+
+/** One (url, exact version) identity, unique per distinct source document. */
+function documentIdentityKey(pageUrl: string, storedVersion: string): string {
+  return `${pageUrl} ${storedVersion}`;
 }
 
 describe("VaultIndex", () => {
@@ -974,12 +1020,90 @@ describe("VaultIndex", () => {
         [otherNote.path, otherSibling.path].sort(),
       );
 
-      // Database identities/chunks AND saved-byte digests for BOTH
-      // collections, inspected before any search.
-      const collectionDbRows = storedChunks(second, COLLECTION);
-      const otherDbRows = storedChunks(second, OTHER);
-      expect(collectionDbRows.length).toBeGreaterThanOrEqual(collectionEntries.length);
-      expect(otherDbRows.length).toBeGreaterThanOrEqual(otherEntries.length);
+      // MAJOR 1 (2026-09-13 Codex frontier review, round 3): the exact SET
+      // of distinct database note identities for BOTH collections,
+      // inspected before any search -- not merely a total row count, which
+      // a database missing one sibling while another supplies enough
+      // padding chunks could satisfy. Identity here is the same
+      // (page.url, version) join `searchStore` itself resolves hits
+      // through, not text parsed out of `content`.
+      const collectionDbIdentities = storedDocumentIdentities(second, COLLECTION);
+      const otherDbIdentities = storedDocumentIdentities(second, OTHER);
+
+      const expectedCollectionKeys = [
+        documentIdentityKey(inboxNote.document.sourceUrl, storeVersion("")),
+        documentIdentityKey(url, storeVersion("Release")),
+        documentIdentityKey(url, storeVersion("release")),
+        documentIdentityKey(url, storeVersion(" Release")),
+      ].sort();
+      const expectedOtherKeys = [
+        documentIdentityKey(otherNote.document.sourceUrl, storeVersion("")),
+        documentIdentityKey(otherSibling.document.sourceUrl, storeVersion("")),
+      ].sort();
+
+      const actualCollectionKeys = [
+        ...new Set(
+          collectionDbIdentities.map((d) =>
+            documentIdentityKey(d.pageUrl, d.storedVersion),
+          ),
+        ),
+      ].sort();
+      const actualOtherKeys = [
+        ...new Set(
+          otherDbIdentities.map((d) => documentIdentityKey(d.pageUrl, d.storedVersion)),
+        ),
+      ].sort();
+
+      expect(actualCollectionKeys).toEqual(expectedCollectionKeys);
+      expect(actualOtherKeys).toEqual(expectedOtherKeys);
+
+      // Per-note database CONTENT (not manifest) carries the right body --
+      // each note's own distinguishing phrase is present among the rows
+      // for its (url, version) key, and absent from every other note's
+      // rows (catching cross-contamination, not just presence).
+      const collectionExpectations: Array<{
+        url: string;
+        version: string;
+        phrase: string;
+      }> = [
+        { url: inboxNote.document.sourceUrl, version: "", phrase: "inboxical" },
+        { url, version: "Release", phrase: "uppercasereconium" },
+        { url, version: "release", phrase: "lowercasereconium" },
+        { url, version: " Release", phrase: "whitespacereconium" },
+      ];
+      for (const expectation of collectionExpectations) {
+        const owned = collectionDbIdentities.filter(
+          (d) =>
+            d.pageUrl === expectation.url &&
+            d.storedVersion === storeVersion(expectation.version),
+        );
+        expect(
+          owned.some((d) => d.content.includes(expectation.phrase)),
+          `(${expectation.url}, ${expectation.version}) database content should contain "${expectation.phrase}"`,
+        ).toBe(true);
+      }
+      const otherExpectations: Array<{ url: string; phrase: string }> = [
+        // Post-edit content, not the original "toolboxical" body.
+        { url: otherNote.document.sourceUrl, phrase: "handeditedtoolbox" },
+        { url: otherSibling.document.sourceUrl, phrase: "toolboxsibling" },
+      ];
+      for (const expectation of otherExpectations) {
+        const owned = otherDbIdentities.filter((d) => d.pageUrl === expectation.url);
+        expect(
+          owned.some((d) => d.content.includes(expectation.phrase)),
+          `${expectation.url} database content should contain "${expectation.phrase}"`,
+        ).toBe(true);
+      }
+      // The conflict candidate's rejected text and the pre-edit body never
+      // entered the database at all.
+      const allContent = [...collectionDbIdentities, ...otherDbIdentities]
+        .map((d) => d.content)
+        .join("\n");
+      expect(allContent).not.toContain("rejectedcandidate");
+      expect(allContent).not.toContain("toolboxical\n"); // pre-edit body, distinct from "handeditedtoolbox"
+
+      // Manifest digests, inspected the same way as before, alongside the
+      // database-level identity check above (not instead of it).
       for (const [note, entries] of [
         [inboxNote, collectionEntries],
         [upperVersion, collectionEntries],
@@ -1088,6 +1212,101 @@ describe("VaultIndex", () => {
       const repaired = await index.search({ query: "toolboxical", collection: OTHER });
       expect(repaired.results.map((r) => r.vault_path)).toEqual([otherNote.path]);
       expect(() => storedChunks(index, OTHER)).not.toThrow();
+    });
+
+    it(// MAJOR 1 regression fixture (2026-09-13 Codex frontier review, round
+    // 3): a database with a VALID manifest and the SAME total row count
+    // as a healthy generation, but WRONG membership -- one sibling's
+    // rows are gone, and another sibling's rows are duplicated to pad the
+    // count back up -- must be rejected by the exact-identity-set
+    // inspection this describe block's main test uses. A count-only
+    // check (`rows.length >= entries.length`) would have passed this
+    // exact fixture; the exact-identity-set check must not.
+    "rejects a database with wrong note membership at the same total row count as a healthy generation (R12/R13)", async () => {
+      const vault = new FakeVault();
+      const { otherNote } = twoCollections(vault);
+      const otherSibling = sourceNote({
+        url: "https://example.com/toolbox-sibling-mutate",
+        title: "Toolbox Sibling Mutate",
+        body: body("toolboxsiblingmutate"),
+        collection: OTHER,
+      });
+      vault.notes.set(otherSibling.path, otherSibling.markdown);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: OTHER });
+      await index.shutdown();
+
+      const healthyIdentities = storedDocumentIdentities(index, OTHER);
+      const healthyRowCount = healthyIdentities.length;
+      expect(healthyRowCount).toBeGreaterThan(0);
+
+      // Mutate the database directly: repoint every row belonging to
+      // `otherNote`'s page onto `otherSibling`'s page instead. Total row
+      // count in `documents` is unchanged; `otherNote`'s identity is
+      // gone from the database even though its manifest entry (never
+      // touched) still names it.
+      const dbFile = path.join(
+        path.join(
+          index.collectionRoot(OTHER),
+          "generations",
+          activeGeneration(index, OTHER),
+        ),
+        "documents.db",
+      );
+      // Mutated at the `pages` level, not `documents`: `documents` has an
+      // AFTER trigger that keeps the `vec0` virtual table in sync, which
+      // requires the sqlite-vec extension to be loaded (this raw
+      // `Database` handle deliberately does not load it, matching the
+      // existing pattern elsewhere in this file -- "`pages` carries no
+      // vector trigger, so this needs nothing the store itself would have
+      // to load"). Renaming otherNote's page url makes every one of its
+      // rows belong to a URL nothing expects, at the exact same total row
+      // count -- membership is wrong, count is unchanged.
+      const db = new Database(dbFile);
+      try {
+        const otherNotePage = db
+          .prepare("SELECT id FROM pages WHERE url = ?")
+          .get(otherNote.document.sourceUrl) as { id: number } | undefined;
+        expect(otherNotePage).toBeDefined();
+        db.prepare("UPDATE pages SET url = ? WHERE id = ?").run(
+          "https://example.com/mutated-away",
+          otherNotePage?.id,
+        );
+      } finally {
+        db.close();
+      }
+
+      // Manifest still (wrongly) claims otherNote is present -- this is
+      // exactly why a manifest-only or count-only check is insufficient.
+      expect(
+        index
+          .manifestEntries(OTHER)
+          .map((e) => e.vaultPath)
+          .sort(),
+      ).toEqual([otherNote.path, otherSibling.path].sort());
+
+      const mutatedIdentities = storedDocumentIdentities(index, OTHER);
+      expect(mutatedIdentities.length).toBe(healthyRowCount);
+
+      const expectedKeys = [otherNote.document.sourceUrl, otherSibling.document.sourceUrl]
+        .map((u) => documentIdentityKey(u, storeVersion("")))
+        .sort();
+      const actualKeys = [
+        ...new Set(
+          mutatedIdentities.map((d) => documentIdentityKey(d.pageUrl, d.storedVersion)),
+        ),
+      ].sort();
+
+      // The fixture: same row count, wrong membership. The exact-set
+      // check must reject it.
+      expect(actualKeys).not.toEqual(expectedKeys);
+      expect(actualKeys.sort()).toEqual(
+        [
+          documentIdentityKey(otherSibling.document.sourceUrl, storeVersion("")),
+          documentIdentityKey("https://example.com/mutated-away", storeVersion("")),
+        ].sort(),
+      );
     });
 
     it("keeps a capture into one collection out of the other's index", async () => {

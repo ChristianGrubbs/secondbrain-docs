@@ -415,7 +415,7 @@ function collectionKey(collection: string): string {
  * @returns A token no upstream normalization can alter, or `""` for the
  *   unversioned case, which upstream already treats as its own bucket.
  */
-function storeVersion(version: string): string {
+export function storeVersion(version: string): string {
   if (version === "") return "";
   return `sv${sha256(version).slice(0, 20)}`;
 }
