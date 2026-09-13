@@ -214,34 +214,12 @@ function writeConfig(configPath: string): void {
   );
 }
 
-/** Reads one collection's MOC (`index.md`) under the sandbox vault. */
-function readMoc(folder: string, vaultRoot: string = sandbox): string {
-  return fs.readFileSync(path.join(vaultRoot, folder, "index.md"), "utf8");
-}
-
-/** Counts occurrences of `needle` in `haystack`. */
-function countOccurrences(haystack: string, needle: string): number {
-  return haystack.split(needle).length - 1;
-}
-
-/** The MOC's wiki-link target for a saved note path (extensionless). */
-function mocLinkTarget(notePath: string): string {
-  return notePath.replace(/\.md$/, "");
-}
-
-/** One frontmatter field extracted from saved note bytes, by exact YAML key. */
-function frontmatterField(markdown: string, key: string): string | undefined {
-  const frontmatterBlock = markdown.match(/^---\n([\s\S]*?)\n---/);
-  if (!frontmatterBlock) return undefined;
-  const line = frontmatterBlock[1]
-    .split("\n")
-    .find((l) => l.startsWith(`${key}:`));
-  if (!line) return undefined;
-  return line
-    .slice(key.length + 1)
-    .trim()
-    .replace(/^"(.*)"$/, "$1");
-}
+// MAJOR 1 (2026-09-13 Codex frontier review, round 4): this suite's own
+// former local readMoc/countOccurrences/mocLinkTarget/frontmatterField
+// helpers were dead code once every row routed through `qualifyNote` (the
+// one shared contract, imported below) -- removed to eliminate a duplicate,
+// independently-driftable MOC/frontmatter matcher rather than leaving a
+// second copy that nothing calls but could silently rot.
 
 /**
  * MAJOR 3 (2026-09-13 Codex frontier review): the one shared end-to-end

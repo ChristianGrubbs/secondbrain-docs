@@ -229,6 +229,112 @@ describe("qualifyNote", () => {
     expect(result.reason).toMatch(/MOC link count/);
   });
 
+  it(
+    // MAJOR 1 (2026-09-13 Codex frontier review, round 4): a MOC containing
+    // only the note's path as plain text -- no `[[...]]` wikilink syntax at
+    // all -- must not qualify. A substring match against the extensionless
+    // path (the round-3 implementation) would have accepted this.
+    "rejects a MOC that only mentions the note's path as plain text, with no wikilink",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-LAMBDA-1011");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Plain text only: ${target}\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-LAMBDA-1011"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // A longer sibling target sharing the same prefix (e.g. the note's path
+    // plus " 2") must not be counted as a link to the shorter target -- the
+    // matcher requires the exact target immediately followed by `|` or `]]`.
+    "rejects a MOC whose only link targets a longer sibling path sharing the same prefix",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-MU-1012");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${target} 2|Fixture 2]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-MU-1012"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it("rejects malformed link syntax (missing closing brackets)", async () => {
+    const { notePath, savedBytes } = writeNoteAndMoc("FACT-NU-1013");
+    const target = notePath.replace(/\.md$/, "");
+    fs.writeFileSync(
+      path.join(vaultPath, "collection", "index.md"),
+      `- [[${target}\n`,
+      "utf8",
+    );
+
+    const result = await qualifyNote({
+      vaultPath,
+      notePath,
+      expectedDigest: sha256(savedBytes),
+      facts: ["FACT-NU-1013"],
+      runCli: fakeRunCli(),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/MOC link count 0/);
+  });
+
+  it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
+    const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
+    const target = notePath.replace(/\.md$/, "");
+    fs.writeFileSync(
+      path.join(vaultPath, "collection", "index.md"),
+      `- [[${target}|Fixture]]\n`,
+      "utf8",
+    );
+    const digest = sha256(savedBytes);
+
+    const result = await qualifyNote({
+      vaultPath,
+      notePath,
+      expectedDigest: digest,
+      facts: ["FACT-XI-1014"],
+      collection: "collection",
+      query: "FACT-XI-1014",
+      runCli: fakeRunCli({
+        search: {
+          code: 0,
+          stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+          stderr: "",
+        },
+        read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
   it("rejects when search does not resolve the note's identity", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-ETA-1007");
     const result = await qualifyNote({

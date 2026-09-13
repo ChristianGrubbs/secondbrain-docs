@@ -46,6 +46,38 @@ export function mocLinkTarget(notePath) {
 }
 
 /**
+ * Removes fenced code blocks so a link shown as an example is not mistaken
+ * for a live link. Mirrors `stripCodeFences` in `src/vault/VaultPublisher.ts`
+ * exactly (MAJOR 1, 2026-09-13 Codex frontier review, round 4).
+ */
+function stripCodeFences(markdown) {
+  return markdown
+    .split(/^```.*$/m)
+    .filter((_, index) => index % 2 === 0)
+    .join("\n");
+}
+
+/**
+ * Counts real wikilink references to `target` in a MOC, using the exact
+ * link syntax the fork's own publisher emits and detects
+ * (`- [[target|alias]]` or `[[target]]`, from `VaultPublisher.ts`'s
+ * `linkFromIndex`/`hasLinkTo`) -- not a substring match, which a MOC
+ * containing only plain text mentioning the note's path (or a longer
+ * sibling target sharing the same prefix, e.g. `collection/Fixture 2`)
+ * would satisfy without a single navigable link (MAJOR 1, 2026-09-13 Codex
+ * frontier review, round 4).
+ *
+ * @param moc The MOC note's Markdown.
+ * @param target Vault path of the note, without its `.md` extension.
+ * @returns The number of distinct `[[target]]`/`[[target|alias]]` matches.
+ */
+export function countMocLinksTo(moc, target) {
+  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`, "g");
+  return (stripCodeFences(moc).match(pattern) ?? []).length;
+}
+
+/**
  * Runs the full qualification contract for one published outcome.
  *
  * @param options.vaultPath Absolute path of the vault the note was saved into.
@@ -141,7 +173,7 @@ export async function qualifyNote(options) {
   let mocLinkCount = -1;
   try {
     const moc = fs.readFileSync(path.join(vaultPath, path.dirname(notePath), "index.md"), "utf8");
-    mocLinkCount = countOccurrences(moc, mocLinkTarget(notePath));
+    mocLinkCount = countMocLinksTo(moc, mocLinkTarget(notePath));
   } catch (err) {
     return { ok: false, reason: `could not read MOC: ${err}`, notePath };
   }
