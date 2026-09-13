@@ -6,12 +6,14 @@
  * throwaway state directory + `DOCS_MCP_CONFIG`. Prints one JSON summary
  * line to stdout so Task 7 can consume it as a scripted live-surface check.
  *
- * MAJOR 3 (2026-09-13 Codex frontier review): each row runs the same
- * end-to-end publication-contract check `test/vault-capture-e2e.test.ts`
- * uses (facts in saved bytes, exactly one MOC link, `search` resolves the
- * note's identity, `read` returns the complete saved bytes) — not just an
- * exit code plus one substring. A row whose network dependency is
- * unavailable is reported as `"blocked"`, never `"pass"`.
+ * MAJOR 3 / MAJOR C (2026-09-13 Codex frontier review, rounds 1 and 2): each
+ * row runs the exact same `qualifyNote` contract
+ * `test/vault-capture-e2e.test.ts` uses (facts in saved bytes, frontmatter
+ * identity, whole-note digest, exactly one MOC link, `search` resolving the
+ * note's identity, `read` returning the complete saved bytes) from the one
+ * shared module `scripts/lib/qualification-contract.mjs` — not a
+ * second, independently drifting, weaker copy. A row whose network
+ * dependency is unavailable is reported as `"blocked"`, never `"pass"`.
  *
  * No listener is started; nothing here reads or writes the operator's real
  * vault, state directory, or `DOCS_MCP_CONFIG`.
@@ -30,6 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertNotLiveVault } from "./lib/vault-guard.mjs";
+import { qualifyNote } from "./lib/qualification-contract.mjs";
 
 const LIVE_VAULT = "/Volumes/3M/Obsidian";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -109,7 +112,7 @@ if (!status.includes(`vault: ok (${vaultPath})`)) {
   fail(`obsidian-cli did not report the throwaway vault ${vaultPath}; refusing to capture`);
 }
 
-/** Runs the built CLI directly and returns its parsed JSON envelope (or null). */
+/** Runs the built CLI directly and returns `{code, stdout, stderr}` plus the parsed JSON envelope (or null). */
 function runCli(cliArgs) {
   const result = spawnSync(vaultCliEntry, cliArgs, {
     encoding: "utf8",
@@ -123,40 +126,23 @@ function runCli(cliArgs) {
   } catch {
     envelope = null;
   }
-  return { result, envelope };
-}
-
-/** One frontmatter field extracted from saved note bytes, by exact YAML key. */
-function frontmatterField(markdown, key) {
-  const frontmatterBlock = markdown.match(/^---\n([\s\S]*?)\n---/);
-  if (!frontmatterBlock) return undefined;
-  const line = frontmatterBlock[1].split("\n").find((l) => l.startsWith(`${key}:`));
-  if (!line) return undefined;
-  return line
-    .slice(key.length + 1)
-    .trim()
-    .replace(/^"(.*)"$/, "$1");
-}
-
-/** Counts occurrences of `needle` in `haystack`. */
-function countOccurrences(haystack, needle) {
-  return haystack.split(needle).length - 1;
+  return {
+    envelope,
+    asCliResult: { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" },
+  };
 }
 
 /**
- * Runs one live row through the full qualification contract used by
- * test/vault-capture-e2e.test.ts's `assertQualifiedNote`: facts in the
- * saved bytes, correct version scope, exactly one MOC link, `search`
- * resolving the note's identity (path + digest), and `read` returning the
- * complete saved bytes.
+ * Runs one live row through the full shared qualification contract.
  *
  * A network-dependent failure to reach the source at all (spawn error,
- * timeout, or a run that never produced any outcome) is reported as
- * `"blocked"`, never `"pass"` -- distinct from a genuine assertion failure
- * (`"fail"`), which means the endpoint answered but the contract broke.
+ * timeout, or a run that never produced any published outcome) is reported
+ * as `"blocked"`, never `"pass"` -- distinct from a genuine assertion
+ * failure (`"fail"`), which means the endpoint answered but the contract
+ * broke.
  */
-function runRow(id, { captureArgs, collection, facts, query, sourceUrlContains }) {
-  const { result: captureResult, envelope } = runCli([
+async function runRow(id, { captureArgs, collection, facts, query, sourceUrlContains }) {
+  const { envelope, asCliResult: captureResult } = runCli([
     "capture",
     ...captureArgs,
     "--collection",
@@ -167,80 +153,46 @@ function runRow(id, { captureArgs, collection, facts, query, sourceUrlContains }
   ]);
 
   const outcome = envelope?.outcomes?.[0];
-  const notePath = outcome?.publication?.path;
-  if (captureResult.status !== 0 || !outcome || outcome.publication?.status !== "published") {
+  if (captureResult.code !== 0 || !outcome || outcome.publication?.status !== "published") {
     return {
       id,
       status: "blocked",
-      reason: `capture did not publish (exit ${captureResult.status}, ${
+      reason: `capture did not publish (exit ${captureResult.code}, ${
         envelope?.run_error ?? captureResult.stderr?.slice(0, 300) ?? "no envelope"
       })`,
     };
   }
 
-  const savedBytes = fs.readFileSync(path.join(vaultPath, notePath), "utf8");
-  const missingFacts = facts.filter((fact) => !savedBytes.includes(fact));
-  if (missingFacts.length > 0) {
-    return { id, status: "fail", reason: `missing facts: ${missingFacts.join(", ")}`, notePath };
-  }
-
-  if (sourceUrlContains !== undefined) {
-    const sourceUrl =
-      frontmatterField(savedBytes, "source_url") ??
-      frontmatterField(savedBytes, "requested_url");
-    if (!sourceUrl?.includes(sourceUrlContains)) {
-      return { id, status: "fail", reason: `source_url missing ${sourceUrlContains}`, notePath };
-    }
-  }
-
-  const mocPath = path.join(vaultPath, path.dirname(notePath), "index.md");
-  let mocLinkCount = -1;
-  try {
-    const moc = fs.readFileSync(mocPath, "utf8");
-    mocLinkCount = countOccurrences(moc, notePath.replace(/\.md$/, ""));
-  } catch {
-    mocLinkCount = -1;
-  }
-  if (mocLinkCount !== 1) {
-    return { id, status: "fail", reason: `MOC link count ${mocLinkCount}, expected 1`, notePath };
-  }
-
-  const { result: searchResult, envelope: searchEnvelope } = runCli([
-    "search",
-    query,
-    "--collection",
+  const result = await qualifyNote({
+    vaultPath,
+    notePath: outcome.publication.path,
+    expectedDigest: outcome.publication.digest,
+    facts,
     collection,
-    "--state-dir",
-    stateDir,
-    "--json",
-  ]);
-  const match = (searchEnvelope?.results ?? []).find((r) => r.vault_path === notePath);
-  if (searchResult.status !== 0 || !match || match.digest !== outcome.publication.digest) {
-    return {
-      id,
-      status: "fail",
-      reason: `search "${query}" did not resolve ${notePath} by identity`,
-      notePath,
-    };
-  }
+    query,
+    version: "",
+    sourceUrlContains,
+    runCli: async (cliArgs) => {
+      const withStateDir =
+        cliArgs[0] === "read" ? cliArgs : [...cliArgs, "--state-dir", stateDir];
+      return runCli(withStateDir).asCliResult;
+    },
+  });
 
-  const { result: readResult } = runCli(["read", notePath]);
-  if (readResult.status !== 0 || readResult.stdout !== `${savedBytes}\n`) {
-    return { id, status: "fail", reason: "read did not return complete saved bytes", notePath };
-  }
-
-  return { id, status: "pass", notePath, digest: outcome.publication.digest };
+  return result.ok
+    ? { id, status: "pass", notePath: result.notePath, digest: result.digest }
+    : { id, status: "fail", reason: result.reason, notePath: result.notePath };
 }
 
 const rows = [
-  runRow("F01", {
+  await runRow("F01", {
     captureArgs: ["https://www.rfc-editor.org/rfc/rfc2549.txt"],
     collection: "livecheck-f01-single-page",
     facts: ["Avian Carriers"],
     query: "Avian Carriers",
     sourceUrlContains: "rfc2549.txt",
   }),
-  runRow("F02", {
+  await runRow("F02", {
     // See the matching comment in test/vault-capture-e2e.test.ts: a base
     // repo URL crawl with a small --max-pages does not reliably include
     // README.md (GitHub's tree listing is not alphabetical); capturing the
@@ -257,7 +209,7 @@ const rows = [
     query: "Grounded Docs",
     sourceUrlContains: "README.md",
   }),
-  runRow("F03", {
+  await runRow("F03", {
     captureArgs: [
       "https://github.com/arabold/docs-mcp-server/blob/main/package.json",
       "--max-depth",
@@ -270,7 +222,7 @@ const rows = [
     query: "docs-mcp-server",
     sourceUrlContains: "package.json",
   }),
-  runRow("F05", {
+  await runRow("F05", {
     captureArgs: ["https://quotes.toscrape.com/js/"],
     collection: "livecheck-f05-js-rendered",
     facts: ["Albert Einstein"],
