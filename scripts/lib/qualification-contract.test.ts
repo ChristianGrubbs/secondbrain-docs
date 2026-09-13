@@ -115,6 +115,41 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR 2 (2026-09-13 Codex frontier review, round 3): a capture
+    // regression that omits the digest from its own envelope must NOT
+    // silently qualify -- the contract previously skipped digest
+    // validation entirely when `expectedDigest` was `undefined`.
+    "rejects a missing publication digest (undefined) even though the saved note itself is well-formed",
+    async () => {
+      const { notePath } = writeNoteAndMoc("FACT-IOTA-1009");
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: undefined,
+        facts: ["FACT-IOTA-1009"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/missing publication digest/);
+    },
+  );
+
+  it("rejects an empty-string publication digest the same way as a missing one", async () => {
+    const { notePath } = writeNoteAndMoc("FACT-KAPPA-1010");
+    const result = await qualifyNote({
+      vaultPath,
+      notePath,
+      expectedDigest: "",
+      facts: ["FACT-KAPPA-1010"],
+      runCli: fakeRunCli(),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/missing publication digest/);
+  });
+
   it("rejects malformed metadata: missing source_id", async () => {
     const notePath = "collection/no-source-id.md";
     const savedBytes = [

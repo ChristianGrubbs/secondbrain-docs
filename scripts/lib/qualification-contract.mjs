@@ -50,7 +50,10 @@ export function mocLinkTarget(notePath) {
  *
  * @param options.vaultPath Absolute path of the vault the note was saved into.
  * @param options.notePath Vault-relative path of the saved note.
- * @param options.expectedDigest The outcome's own reported digest.
+ * @param options.expectedDigest REQUIRED: the outcome's own reported
+ *   publication digest. A missing or empty digest fails the contract --
+ *   callers must read it from the capture envelope
+ *   (`outcome.publication.digest`) and must not omit it.
  * @param options.facts Substrings that must appear in the saved bytes.
  * @param options.collection Collection the note was captured into.
  * @param options.query Search query expected to resolve this note's identity.
@@ -86,8 +89,19 @@ export async function qualifyNote(options) {
     return { ok: false, reason: `could not read saved note: ${err}`, notePath };
   }
 
+  // MAJOR 2 (2026-09-13 Codex frontier review, round 3): the publication
+  // digest is REQUIRED, not optional -- skipping validation when it is
+  // absent let a capture regression that omits the digest from its own
+  // envelope still qualify. A missing digest is itself a contract failure.
+  if (typeof expectedDigest !== "string" || expectedDigest.length === 0) {
+    return {
+      ok: false,
+      reason: `missing publication digest (outcome.publication.digest was ${JSON.stringify(expectedDigest)}); the envelope must carry a non-empty digest for this note to qualify`,
+      notePath,
+    };
+  }
   const actualDigest = sha256(savedBytes);
-  if (expectedDigest !== undefined && actualDigest !== expectedDigest) {
+  if (actualDigest !== expectedDigest) {
     return {
       ok: false,
       reason: `digest mismatch: outcome said ${expectedDigest}, saved bytes hash to ${actualDigest}`,
