@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-four further reviewer-driven correction rounds (packets 3, 4, 5 and 6 — see
-those sections near the end). Task 6 as a whole is **not accepted**: F06 fails
-on an unresolved operator decision, F07 fails on a confirmed external
+five further reviewer-driven correction rounds (packets 3, 4, 5, 6 and 7 —
+see those sections near the end). Task 6 as a whole is **not accepted**: F06
+fails on an unresolved operator decision, F07 fails on a confirmed external
 converter limit, and D01/D03 are confirmed limits/defects deliberately left
 unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **151 files / 2380 tests passed**, exit 0 both times.
+head, run twice: **151 files / 2393 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -311,6 +311,20 @@ Packet 6 (Codex frontier review round 4 fixes):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **151 files / 2380 tests passed**, exit 0; run 2 — **151 files / 2380 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 6's edits.
 
+Packet 7 (Codex frontier review round 5 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (2 import-order fixes on `VaultPublisher.ts`/`live-check-vault.mjs`; no logic changes).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **19 passed / 19** (4 new cases: backtick-fence-only, tilde-fence-only, inline-code-only rejections, plus a real-link-alongside-code-example acceptance).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (5 new `isSymlinkPath`/`assertNotSymlink` unit cases).
+- `npx vitest run scripts/live-check-vault.test.ts` — **10 passed / 10** (2 new cases: external `config.yaml` symlinked to an existing/nonexistent live-vault file).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **77 passed / 77** (2 new regressions: tilde-fence and inline-code-span mentions do not suppress the real link).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected; confirms the shared-module refactor didn't change publisher behavior end-to-end).
+- Standalone script confirmed the pre-fix (backtick-only) `stripCodeFences` would return a false-positive link count of 1 for both the tilde-fence and inline-code fixtures, and the new "config.yaml symlinked to a NONEXISTENT live-vault file" case in `scripts/live-check-vault.test.ts` failed (`toThrow` received `undefined`) against the pre-fix `resolveGuardedState` — both findings reproduced test-first before their fixes landed.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault after the guard/matcher changes — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **151 files / 2393 tests passed**, exit 0; run 2 — **151 files / 2393 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 7's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -466,6 +480,26 @@ branch:
 
 See "Verification run log" for the exact commands and the two full-suite runs
 required for this packet.
+
+## Packet 7: Codex frontier review round 5 fixes (2026-09-13)
+
+Codex round 5 (label `task6-qualification-r5`) on `8a6b85f...89908ce` returned
+issues-found with 2 major findings, both adjudicated valid and narrow ("last
+fix round before a scoped routine-tier re-review"). Both are addressed on
+this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1 | `live-check-vault.mjs`'s guard resolved a not-yet-created path's *nearest existing ancestor* to check containment, but a DANGLING `config.yaml` symlink (or a dangling symlinked state dir) whose target does not exist makes `realpathSync` throw for the symlink itself; the code fell back to treating the symlink's own external parent as canonical, so containment silently passed while `writeFileSync`/`mkdirSync` would still follow the symlink into the live vault. Rather than attempt to resolve a target that may not exist, `scripts/lib/vault-guard.mjs` gained `isSymlinkPath`/`assertNotSymlink`, which `lstat`s the path itself (never following it) and rejects any symlinked state dir or `config.yaml` outright, before the containment check runs. | `scripts/lib/vault-guard.mjs` (new `isSymlinkPath`/`assertNotSymlink`, 5 new unit tests), `scripts/live-check-vault.mjs` (`resolveGuardedState` calls both before `assertNotLiveVault`), `scripts/live-check-vault.test.ts` (2 new cases: external `config.yaml` symlinked to an EXISTING live-vault file, and to a NONEXISTENT one — both rejected before any write, live-vault bytes/state untouched) |
+| MAJOR 2 | The round-4 `stripCodeFences` (in both `scripts/lib/qualification-contract.mjs` and its copy `hasLinkTo`/`stripCodeFences` in `src/vault/VaultPublisher.ts`) only recognized backtick fences: a target mentioned only inside a `~~~`-fenced block or an inline code span (`` `[[target]]` ``) still counted as a real link. In the publisher this was a genuine product bug, not just a tooling gap — `hasLinkTo` returning true for a code-example mention made `linkFromIndex` believe the note was already linked and skip adding the real link, leaving a published note with zero navigable MOC links. Extracted the ONE shared implementation `src/vault/markdownLinks.mjs` (`stripCodeAndInlineSpans`/`countLinksTo`/`hasLinkTo`), which strips both fence styles (respecting CommonMark's fence-closing rule: the same character, repeated at least as many times as the opener) and inline code spans, before counting/detecting links. Both `VaultPublisher.ts` and `qualification-contract.mjs` now import this one module instead of each carrying its own copy. | `src/vault/markdownLinks.mjs` (new shared module), `src/vault/VaultPublisher.ts` (`hasLinkTo`/`stripCodeFences` removed, imports the shared module), `src/vault/VaultPublisher.test.ts` (2 new regressions: tilde-fenced and inline-code-span mentions do not suppress the real link; `linksTo` test helper switched to the shared stripper so it doesn't itself misclassify a tilde/inline mention), `scripts/lib/qualification-contract.mjs` (`countMocLinksTo` now delegates to the shared module), `scripts/lib/qualification-contract.test.ts` (4 new cases: backtick-fence-only, tilde-fence-only, inline-code-only rejections, plus a real-link-alongside-a-code-example acceptance proving exactly one match) |
+
+Both fixes were verified test-first: a standalone script reproduced the old
+backtick-only `stripCodeFences` returning a false-positive link count of 1
+for both the tilde-fence and inline-code fixtures before the shared module
+existed, and the new "NONEXISTENT symlink target" `live-check-vault.test.ts`
+case failed against the pre-fix `resolveGuardedState` (`toThrow` received
+`undefined`) before `assertNotSymlink` was added. See "Verification run log"
+for the exact commands and the two full-suite runs required for this packet.
 
 ## What this packet does not claim
 
