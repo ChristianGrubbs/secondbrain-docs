@@ -30,7 +30,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { assertNotLiveVault } from "./lib/vault-guard.mjs";
 import { qualifyNote } from "./lib/qualification-contract.mjs";
 
@@ -38,12 +38,54 @@ const LIVE_VAULT = "/Volumes/3M/Obsidian";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const vaultCliEntry = path.join(projectRoot, "dist", "vault-cli.js");
 
+/**
+ * Resolves and guard-checks the state directory and config path for one
+ * run, WITHOUT performing any filesystem write -- this is what lets
+ * `scripts/live-check-vault.test.ts` prove rejection happens before any
+ * write, using a fake `liveVaultPath` rather than the real live vault
+ * (MAJOR 2, 2026-09-13 Codex frontier review, round 4).
+ *
+ * @param options.stateDirArg The raw `--state-dir` argument, or undefined
+ *   to use a fresh `mkdtemp` directory.
+ * @param options.liveVaultPath The live vault path to guard against.
+ * @param options.overwriteConfig Whether an existing config.yaml may be
+ *   replaced.
+ * @returns `{ stateDir, configFile, configPreexisted }` on success.
+ * @throws If the resolved state directory or config path is the live vault
+ *   or a symlink alias into it, or if config.yaml already exists and
+ *   `overwriteConfig` is not set.
+ */
+export function resolveGuardedState({ stateDirArg, liveVaultPath, overwriteConfig }) {
+  const stateDir = stateDirArg
+    ? path.resolve(stateDirArg)
+    : fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-livecheck-state-"));
+
+  assertNotLiveVault(stateDir, liveVaultPath);
+
+  const configFile = path.join(stateDir, "config.yaml");
+  // Checked separately from `stateDir`: a caller could in principle pass a
+  // `configFile`-shaped symlink alias distinct from `stateDir` itself in a
+  // future revision of this script, and this keeps the guard from
+  // depending on that never changing.
+  assertNotLiveVault(configFile, liveVaultPath);
+
+  const configPreexisted = fs.existsSync(configFile);
+  if (configPreexisted && !overwriteConfig) {
+    throw new Error(
+      `refusing to overwrite existing config at ${configFile} -- pass --overwrite-config to replace it explicitly, or use a different --state-dir`,
+    );
+  }
+
+  return { stateDir, configFile, configPreexisted };
+}
+
 /** Parses `--flag value` pairs from argv; unknown flags are ignored. */
 function parseArgs(argv) {
-  const args = {};
+  const args = { overwriteConfig: false };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--vault") args.vault = argv[++i];
     if (argv[i] === "--state-dir") args.stateDir = argv[++i];
+    if (argv[i] === "--overwrite-config") args.overwriteConfig = true;
   }
   return args;
 }
@@ -53,6 +95,19 @@ function fail(message) {
   process.exit(1);
 }
 
+// Runs the CLI body only when this file is the program's entry point --
+// `scripts/live-check-vault.test.ts` imports `resolveGuardedState` from
+// this same module, and top-level argv-parsing/exit-on-missing-`--vault`
+// code must not fire (and abort the whole test process) on import.
+const isMainModule =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMainModule) {
+  await main();
+}
+
+async function main() {
 const args = parseArgs(process.argv.slice(2));
 if (!args.vault) {
   fail("--vault <absolute-throwaway-vault-path> is required");
@@ -79,12 +134,26 @@ if (!fs.existsSync(cliPath)) {
 
 fs.mkdirSync(path.join(vaultPath, "00 Inbox"), { recursive: true });
 
-const stateDir = args.stateDir
-  ? path.resolve(args.stateDir)
-  : fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-livecheck-state-"));
+// MAJOR 2 (2026-09-13 Codex frontier review, round 4): only `--vault` was
+// guard-checked. A supplied `--state-dir` inside the live vault (or a
+// symlink alias into it) was created and its config.yaml overwritten
+// immediately, before any capture ran and before the vault guard ever saw
+// it. The state directory and config path now go through the exact same
+// containment check `--vault` uses, and an existing config.yaml is never
+// silently overwritten, all before any write.
+let stateDir;
+let configFile;
+try {
+  ({ stateDir, configFile } = resolveGuardedState({
+    stateDirArg: args.stateDir,
+    liveVaultPath: LIVE_VAULT,
+    overwriteConfig: args.overwriteConfig,
+  }));
+} catch (err) {
+  fail(err instanceof Error ? err.message : String(err));
+}
 fs.mkdirSync(stateDir, { recursive: true });
 
-const configFile = path.join(stateDir, "config.yaml");
 fs.writeFileSync(
   configFile,
   [
@@ -244,3 +313,4 @@ const summary = {
 
 console.log(JSON.stringify(summary, null, 2));
 process.exit(summary.allPassed ? 0 : 1);
+}
