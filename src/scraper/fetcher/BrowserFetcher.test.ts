@@ -76,6 +76,31 @@ describe("BrowserFetcher", () => {
     expect(options).not.toHaveProperty("handleSIGHUP");
   });
 
+  it(// MAJOR B negative-control support (2026-09-13 Codex frontier review,
+  // round 2): the test-only escape hatch reproduces the round-1 bug on
+  // demand, so the process-level cleanup assertions in
+  // test/vault-capture-e2e.test.ts can prove they actually fail against
+  // broken cleanup.
+  "SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1 disables Playwright's own SIGTERM/SIGHUP handling too", async () => {
+    const previous = process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP;
+    process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP = "1";
+    try {
+      mockBrowser();
+      await BrowserFetcher.launchBrowser();
+
+      expect(chromium.launch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          handleSIGINT: false,
+          handleSIGTERM: false,
+          handleSIGHUP: false,
+        }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP;
+      else process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP = previous;
+    }
+  });
+
   it("uses broad invalid TLS override for the browser context", async () => {
     const { browser } = mockBrowser();
     const config = loadConfig().scraper;

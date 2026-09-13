@@ -339,7 +339,17 @@ export class BrowserFetcher implements ContentFetcher {
       // reliably reaps the detached browser process tree and its temp
       // profile directory on SIGTERM/SIGHUP. Disabling them would leak
       // browser descendants and temp dirs on every non-SIGINT termination.
+      //
+      // TEST-ONLY escape hatch (dated 2026-09-13, MAJOR B negative control):
+      // `SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1` reproduces the round-1 bug
+      // (Playwright's own SIGTERM/SIGHUP cleanup disabled) so
+      // test/vault-capture-e2e.test.ts can prove its descendant/temp-dir
+      // assertions actually fail against broken cleanup, not just pass
+      // unconditionally. Never set outside that test.
       handleSIGINT: false,
+      ...(process.env.SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP === "1"
+        ? { handleSIGTERM: false, handleSIGHUP: false }
+        : {}),
     });
   }
 
