@@ -301,7 +301,11 @@ describe("markdownLinks", () => {
         let minMs = Number.POSITIVE_INFINITY;
         let aggregateMs = 0;
         let iterations = 0;
-        while (aggregateMs < 20 && iterations < 50) {
+        // Always take at least five samples so a slower (regressed) scan that
+        // clears the 20 ms aggregate on its first call still gets a minimum
+        // over several measurements rather than one possibly-descheduled one
+        // (Codex scoped review round 13, 2026-09-13).
+        while ((aggregateMs < 20 || iterations < 5) && iterations < 50) {
           const start = performance.now();
           result = countLinksTo({ markdown: chunk, target: "valid" });
           const elapsedMs = performance.now() - start;
