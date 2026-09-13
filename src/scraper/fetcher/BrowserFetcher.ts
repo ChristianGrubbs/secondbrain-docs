@@ -319,6 +319,21 @@ export class BrowserFetcher implements ContentFetcher {
       headless: true,
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
       args: ["--no-sandbox"],
+      // Regression for a 2026-09-13 qualification finding (Task 6, row X03):
+      // Playwright installs its own SIGINT/SIGTERM/SIGHUP handlers by default
+      // that force-close the browser and exit the process directly. On a
+      // real Ctrl-C during a browser-rendered capture, that handler raced
+      // and won against `sb-docs capture`'s own SIGINT handler (which aborts
+      // gracefully and prints the exit-130 JSON envelope) — the process
+      // exited 130 with the browser torn down but the envelope never
+      // printed, silently breaking the "clients inspect the full JSON
+      // envelope" contract for real cancellation. Disabling Playwright's own
+      // signal handling leaves cleanup entirely to the CLI's own handler
+      // (`src/vault-cli/commands/capture.ts`), which already closes the
+      // browser via the scraper's normal abort/cleanup path.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
     });
   }
 
