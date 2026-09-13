@@ -1031,6 +1031,43 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR (2026-09-13 Codex frontier review round 10, scoped): a
+    // malformed, unterminated link before the real one must not "borrow"
+    // the real link's closing `]]` -- the note being qualified must still
+    // be recognized as linked exactly once.
+    "counts exactly one real link when a malformed unterminated link precedes it",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-NU2-1037");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `[[collection/other-note|unterminated ] text [[${target}]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-NU2-1037"],
+        collection: "collection",
+        query: "FACT-NU2-1037",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

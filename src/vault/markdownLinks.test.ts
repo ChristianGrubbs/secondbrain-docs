@@ -247,6 +247,50 @@ describe("markdownLinks", () => {
     });
   });
 
+  describe(// MAJOR (2026-09-13 Codex frontier review round 10, scoped): the
+  // round-9 alias scan `(?:(?!\]\]).)*` stops only at `]]`, so an
+  // unterminated link's alias scan crosses a NESTED `[[` and "borrows" a
+  // later link's closing `]]` -- `[[a|unterminated ] text [[b]]` wrongly
+  // matched from `a`'s opener all the way to `b`'s closer, counting `a`
+  // as linked (a false "already linked" result the publisher would
+  // trust, suppressing the real link `a` still needs) while ALSO
+  // counting `b`. Fixed by replacing the regex with an explicit linear
+  // two-pointer scanner that treats an unterminated `[[` (one whose next
+  // `]]` is preceded by a nested `[[`) as malformed and never lets it
+  // borrow a later closer.
+  "malformed unterminated link before a valid link (round 10 scoped re-review)", () => {
+    it("counts 0 for the unterminated/malformed target and 1 for the real one that follows", () => {
+      const markdown = "[[a|unterminated ] text [[b]]\n";
+      expect(countLinksTo({ markdown, target: "a" })).toBe(0);
+      expect(countLinksTo({ markdown, target: "b" })).toBe(1);
+    });
+
+    it(// A performance regression proving the fix: our own scan step,
+    // isolated by pre-parsing outside the timed region, is linear even
+    // on a large repeated-malformed-prefix document. (End-to-end
+    // `countLinksTo` on this same input is dominated by
+    // `remark-parse`'s own CommonMark link/bracket-resolution cost for
+    // pathologically bracket-dense content -- see this module's top
+    // comment for the isolation methodology and measured numbers; that
+    // upstream cost is unrelated to, and unaffected by, this module's
+    // own counting algorithm.)
+    "scans a large repeated-malformed-prefix document in well under 200ms once parsed", () => {
+      const chunk = "[[a|x ] ".repeat(14000); // ~112KB
+      expect(chunk.length).toBeGreaterThan(100000);
+      // Two calls warm the single-entry parse cache with THIS exact
+      // string, so the second call's `countLinksTo` measures only this
+      // module's own per-run scanning cost, not `remark-parse`'s.
+      countLinksTo({ markdown: chunk, target: "nonexistent" });
+
+      const start = performance.now();
+      const result = countLinksTo({ markdown: chunk, target: "nonexistent" });
+      const elapsedMs = performance.now() - start;
+
+      expect(result).toBe(0);
+      expect(elapsedMs).toBeLessThan(200);
+    });
+  });
+
   describe("raw HTML scope decision (round 6 scoped re-review MINOR)", () => {
     it(// `renderCollectionIndex` in src/vault/render.ts never emits block
     // HTML -- the publisher's own MOCs are always a heading plus a flat

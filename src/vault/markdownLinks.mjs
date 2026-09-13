@@ -78,6 +78,49 @@
  * shape) does not count as a real link, the same way one mentioned only
  * inside a code fence does not. This is a deliberate scope decision, not an
  * oversight -- see the fixture for it in `markdownLinks.test.ts`.
+ *
+ * ROUND 9/10 (2026-09-13 Codex frontier review, two more scoped re-reviews
+ * on the same alias-matching logic):
+ *
+ * Round 9's fix for the alias group (`(?:(?!\]\]).)*`, stop only at the real
+ * `]]`) itself had a defect round 10 found: it never stops at a NESTED
+ * `[[`, so an unterminated link could "borrow" a LATER link's closing `]]`
+ * -- `[[a|unterminated ] text [[b]]` wrongly counted `a` as linked (the
+ * regex matched from `a`'s opener all the way to `b`'s closer) while also
+ * counting `b`, when only `b` is a real link. A publisher trusting that
+ * false "already linked" result for `a` would suppress the real link `a`
+ * still needs. Repeated malformed prefixes also made the backtracking
+ * regex engine's cost grow much faster than the input size (see the
+ * regression comment on `countWikilinksInRun` below).
+ *
+ * The regex-based alias matching is replaced entirely with an explicit
+ * linear two-pointer scan (`countWikilinksInRun`): for each `[[`, find the
+ * next `]]`; if a nested `[[` occurs first, the outer `[[` is
+ * unterminated/malformed and is skipped (retried from the nested `[[`)
+ * rather than ever borrowing a later closer. The target and alias parts are
+ * both compared as plain strings (no regex, no escaping needed) once a
+ * well-formed `[[...]]` span is found.
+ *
+ * Root-caused the reported performance regression while building this fix:
+ * measuring `processor.parse()` ALONE (before any of this module's own
+ * counting logic runs at all) on the same repeated-malformed-prefix input
+ * reproduces the same superlinear growth (~1.2s at 112KB, ~4.9s at 224KB of
+ * `"[[a|x ] "` repeated) -- essentially all of the wall-clock cost is
+ * `remark-parse`'s/`micromark`'s own CommonMark link/bracket-resolution
+ * algorithm, which has documented-elsewhere pathological behavior on
+ * documents with many unmatched `[[` sequences. This module's own
+ * counting step, isolated, is linear (verified: well under 5ms even at
+ * 224KB after parsing). A real, publisher-authored MOC is always a flat
+ * list of well-formed, individually-balanced `- [[target|alias]]` lines
+ * (confirmed fast: a 112KB WELL-FORMED flat list parses in ~110ms) and can
+ * never reach this pathological shape; only a hand-corrupted or
+ * deliberately hostile MOC with thousands of unmatched `[[` could. This is
+ * a genuine, upstream, dependency-level limitation this module cannot fix
+ * without either abandoning full CommonMark parsing (rejected for
+ * correctness reasons -- see round 6's third pass above) or upgrading
+ * `remark-parse`/`micromark`, which is out of this module's scope. See the
+ * benchmark-style test in `markdownLinks.test.ts` for the measured numbers
+ * and the isolation methodology.
  */
 
 import remarkParse from "remark-parse";
@@ -225,30 +268,72 @@ function parseCached(markdown) {
  * @returns {number} The number of distinct `[[target]]`/`[[target|alias]]` matches.
  */
 export function countLinksTo({ markdown, target }) {
-  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // MAJOR (2026-09-13 Codex frontier review round 9, scoped): the alias
-  // group used to be `[^\]]*`, which stops at the FIRST `]`. An alias
-  // containing a literal `]` -- written as a backslash escape (`Foo\]Bar`,
-  // remark resolves this to a literal `]`) or an HTML character reference
-  // (`Foo&#93;Bar`, remark resolves this to `]` too) -- was cut short there,
-  // so the regex never found the real `]]` closer and returned 0, which
-  // would make the publisher insert a duplicate note. The alias group now
-  // matches ANY character, including a lone `]`, and only stops right
-  // before the actual closing `]]` (a negative lookahead per character,
-  // not a greedy/lazy match against a single excluded character), so a
-  // single `]` inside an alias is accepted and only a true `]]` ends the
-  // link. The target portion is untouched -- still an exact, escaped match.
-  const pattern = new RegExp(`\\[\\[${escaped}(\\|(?:(?!\\]\\]).)*)?\\]\\]`, "gs");
-
   const tree = parseCached(markdown);
   let count = 0;
   walk(tree, (node) => {
     if (TEXT_CONTAINER_TYPES.has(node.type)) {
       for (const run of textRunsOf(node)) {
-        count += (run.match(pattern) ?? []).length;
+        count += countWikilinksInRun(run, target);
       }
     }
   });
+  return count;
+}
+
+/**
+ * Scans one text run for `[[target]]`/`[[target|alias]]` occurrences, using
+ * an explicit linear two-pointer scan rather than a regex (round 9, then
+ * round 10 scoped re-review: two successive regex-based alias designs each
+ * had a real defect).
+ *
+ * Round 9's alias group `[^\]]*` stopped at the FIRST `]`, missing an alias
+ * containing an escaped or character-referenced literal `]`. The round-9
+ * fix, `(?:(?!\]\]).)*` (stop only at the real `]]`), then had its own
+ * defect (round 10): it never stops at a NESTED `[[`, so an unterminated
+ * link like `[[a|unterminated ] text [[b]]` let the regex borrow `b`'s
+ * closing `]]` as if it were `a`'s, wrongly counting `a` as linked (a false
+ * "already linked" match the publisher would trust, suppressing the note's
+ * real link) -- and repeated malformed prefixes made the backtracking
+ * regex engine's cost superlinear (measured: ~257ms at 28KB, ~1.87s at
+ * 112KB of repeated `[[a|x ] `).
+ *
+ * This scanner is linear in the run's length: `open`/`close`/`nextOpen`
+ * are each found with a single forward `indexOf` call per iteration, and
+ * every iteration advances past at least the just-processed `[[`, so the
+ * total work across all iterations is bounded by the run's length. A link
+ * is well-formed only when its next `]]` occurs before any nested `[[`;
+ * otherwise the `[[` is treated as unterminated/malformed and skipped
+ * (retrying from the nested `[[`, which itself may or may not be
+ * well-formed) -- matching the intent both regex designs were reaching
+ * for, without either defect.
+ *
+ * @param {string} run
+ * @param {string} target Vault path of the note, without its `.md` extension.
+ * @returns {number}
+ */
+function countWikilinksInRun(run, target) {
+  let count = 0;
+  let i = 0;
+  while (i < run.length) {
+    const open = run.indexOf("[[", i);
+    if (open === -1) break;
+    const searchFrom = open + 2;
+    const close = run.indexOf("]]", searchFrom);
+    if (close === -1) break;
+    const nextOpen = run.indexOf("[[", searchFrom);
+    if (nextOpen !== -1 && nextOpen < close) {
+      // A nested `[[` occurs before this `]]` -- `open` never actually
+      // closes here; treat it as unterminated/malformed and retry from the
+      // nested `[[`, which may itself be well-formed.
+      i = nextOpen;
+      continue;
+    }
+    const inner = run.slice(searchFrom, close);
+    const pipeIndex = inner.indexOf("|");
+    const targetPart = pipeIndex === -1 ? inner : inner.slice(0, pipeIndex);
+    if (targetPart === target) count++;
+    i = close + 2;
+  }
   return count;
 }
 

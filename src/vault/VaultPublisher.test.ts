@@ -1361,6 +1361,53 @@ describe("VaultPublisher review regressions", () => {
       expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
     });
 
+    it(// MAJOR (2026-09-13 Codex frontier review round 10, scoped): an
+    // unterminated link's alias scan used to cross a NESTED `[[` and
+    // "borrow" a later link's closing `]]` -- a MOC with a malformed
+    // `[[a|unterminated ] text [[b]]` line wrongly counted `a` as
+    // already linked (suppressing the real link `a` still needs) while
+    // correctly counting `b` (which is a genuinely well-formed link, and
+    // must not be duplicated).
+    "adds the real link for a target preceded by a malformed unterminated link, without duplicating the genuinely well-formed link that follows it", async () => {
+      const first = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target A",
+          sourceUrl: "https://docs.astral.sh/uv/a/",
+        }),
+      );
+      const second = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target B",
+          sourceUrl: "https://docs.astral.sh/uv/b/",
+        }),
+      );
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const targetA = first.path.replace(/\.md$/, "");
+      const targetB = second.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${targetA}|unterminated ] text [[${targetB}]]\n`,
+      );
+
+      const republishedA = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target A",
+          sourceUrl: "https://docs.astral.sh/uv/a/",
+        }),
+      );
+      const republishedB = await publisher.publish(
+        makeDocument({
+          title: "Malformed Target B",
+          sourceUrl: "https://docs.astral.sh/uv/b/",
+        }),
+      );
+
+      expect(republishedA.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", targetA)).toHaveLength(1);
+      expect(republishedB.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", targetB)).toHaveLength(1);
+    });
+
     it("cannot be made to inject a second link through a hostile title", async () => {
       const publication = await publisher.publish(
         makeDocument({ title: "Innocent]]\n- [[Evil Injected Note|pwned" }),
