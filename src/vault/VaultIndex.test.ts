@@ -1979,6 +1979,186 @@ describe("VaultIndex", () => {
       expect(events.map((entry) => entry.event)).toContain("index.rebuilt");
     });
   });
+  describe("detectors given malformed input", () => {
+    it("promotes a note whose longest stored run is not an indexable term", async () => {
+      const vault = new FakeVault();
+      // The underscore run is the longest thing in the note by any regex
+      // measure, survives into the stored chunk because it is inside a fenced
+      // code block, and is not a term the tokenizer indexes at all. Searching
+      // for it correctly finds nothing; reading that as corruption would block
+      // a perfectly good rebuild.
+      const note = sourceNote({
+        url: "https://example.com/underscored",
+        title: "Underscored",
+        body: [
+          "# Divider Conventions",
+          "",
+          "The ordinary prose of this note mentions perspicacity twice, which is",
+          "what a reader would actually search for.",
+          "",
+          "```text",
+          "________________________________",
+          "--------------------------------",
+          "________________________________",
+          "```",
+          "",
+          "Closing prose, perspicacity again, so the splitter has real words.",
+        ].join("\n"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(1);
+
+      // The fixture only means something if that run really did survive into
+      // the stored chunks and really is unindexable.
+      const stored = storedChunks(index)
+        .map((chunk) => chunk.content)
+        .join("\n");
+      expect(stored).toContain("________________________________");
+
+      const response = await index.search({
+        query: "perspicacity",
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+    });
+
+    it("rebuilds from a manifest whose header reads but whose rows do not", async () => {
+      const vault = new FakeVault();
+      const notes = ["primafacie", "secundafacie", "tertiafacie"].map((phrase) => {
+        const note = sourceNote({
+          url: `https://example.com/${phrase}`,
+          title: phrase,
+          body: body(phrase),
+        });
+        vault.notes.set(note.path, note.markdown);
+        return note;
+      });
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      await index.shutdown();
+
+      // Current version, current collection, current encoding, `entries` an
+      // array — and one row that is not an object. Reducing `chunkCount` over
+      // it throws out of the classification that exists to recover from it.
+      const manifestFile = path.join(activeGenerationDir(index), "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      manifest.entries = [null, ...manifest.entries.slice(1)];
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+
+      const response = await index.search({
+        query: "primafacie",
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([notes[0].path]);
+
+      // Every sibling, not only the note that was asked for.
+      expect(
+        index
+          .manifestEntries(COLLECTION)
+          .map((e) => e.vaultPath)
+          .sort(),
+      ).toEqual(notes.map((note) => note.path).sort());
+    });
+
+    it("recovers a malformed manifest through an upsert too", async () => {
+      const vault = new FakeVault();
+      const notes = ["quartafacie", "quintafacie"].map((phrase) => {
+        const note = sourceNote({
+          url: `https://example.com/${phrase}`,
+          title: phrase,
+          body: body(phrase),
+        });
+        vault.notes.set(note.path, note.markdown);
+        return note;
+      });
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+
+      const manifestFile = path.join(activeGenerationDir(index), "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      manifest.entries = [null, ...manifest.entries.slice(1)];
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+
+      const result = await index.upsert(entryFor(notes[0]));
+      expect(result.status).toBe("indexed");
+
+      for (const note of notes) {
+        const response = await index.search({
+          query: note.document.title,
+          collection: COLLECTION,
+        });
+        expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      }
+    });
+
+    it.each([
+      ["a row missing its chunk count", { chunkCount: undefined }],
+      ["a fractional chunk count", { chunkCount: 1.5 }],
+      ["a negative chunk count", { chunkCount: -1 }],
+      ["a chunk count that is not a number", { chunkCount: "1" }],
+      ["a vault path that is not a string", { vaultPath: 7 }],
+      ["a legacy flag that is not a boolean", { legacy: "no" }],
+    ])("rebuilds rather than trusting %s", async (_name, damage) => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/damaged",
+        title: "Damaged",
+        body: body("damageable"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+
+      const manifestFile = path.join(activeGenerationDir(index), "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      manifest.entries[0] = { ...manifest.entries[0], ...damage };
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+
+      const response = await index.search({
+        query: "damageable",
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+    });
+
+    it("treats a pointer naming an impossible generation as missing state", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/pointed",
+        title: "Pointed",
+        body: body("pointable"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      await index.shutdown();
+
+      // A pointer is a file and a file can say anything. This one names a path
+      // that climbs out of the state directory; it must classify, not resolve.
+      const pointerFile = path.join(index.collectionRoot(COLLECTION), "current.json");
+      fs.writeFileSync(
+        pointerFile,
+        JSON.stringify({ generation: "../../../../escape", switchedAt: "2026-09-13" }),
+        "utf8",
+      );
+
+      const response = await index.search({ query: "pointable", collection: COLLECTION });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(index.manifestEntries(COLLECTION)).toHaveLength(1);
+
+      // The rebuild wrote a real generation name, and nothing was created
+      // outside the collection's own directory.
+      const pointer = JSON.parse(fs.readFileSync(pointerFile, "utf8"));
+      expect(pointer.generation).toMatch(/^gen-/);
+    });
+  });
 });
 
 /**

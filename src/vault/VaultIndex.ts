@@ -431,6 +431,12 @@ const ENCODING_PROBES = ["", "1.0", "Release", "release", " Release", "Release "
  * forgotten, because any change to the mapping changes it in the same commit.
  *
  * It is recorded in every manifest and checked before a generation is trusted.
+ *
+ * One limit, stated because it is easy to over-read: the fingerprint covers
+ * these labels and no others. It detects any change to how they map — which is
+ * every change the mapping has actually undergone — but a hypothetical revision
+ * that altered only labels outside this set would leave it unchanged. Widening
+ * the list costs nothing and is the right response to inventing such a case.
  */
 export const STORE_ENCODING_ID = sha256(
   ENCODING_PROBES.map((label) => `${label}=>${storeVersion(label)}`).join("\u0000"),
@@ -490,6 +496,55 @@ function readJson<T>(file: string): T | null {
   }
 }
 
+/**
+ * Reports whether a pointer's generation name is one this build wrote.
+ *
+ * The pointer is a file, and a file can say anything. Every path this module
+ * builds from a generation name is joined onto the state directory, and one
+ * carrying `..` would resolve outside it — so the name is checked against the
+ * shape {@link VaultIndex.nextGenerationName} produces before it is ever joined
+ * to anything, and anything else classifies as missing state rather than
+ * becoming a path.
+ */
+function isGenerationName(value: unknown): value is string {
+  return typeof value === "string" && /^gen-[A-Za-z0-9._-]{1,120}$/.test(value);
+}
+
+/**
+ * Reports whether one decoded manifest row is a row this build can use.
+ *
+ * Called on every entry of every manifest read from disk, because the
+ * alternative is a detector that trusts its own input: reducing `chunkCount`
+ * over a row that is `null` throws out of the classification that exists to
+ * turn damaged state into a rebuild, and the caller then fails every time
+ * instead of recovering once.
+ */
+function isManifestEntry(value: unknown): value is IndexManifestEntry {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+
+  for (const key of [
+    "sourceId",
+    "sourceUrl",
+    "vaultPath",
+    "collection",
+    "version",
+    "digest",
+    "indexedAt",
+  ]) {
+    if (typeof entry[key] !== "string") return false;
+  }
+
+  if (typeof entry.legacy !== "boolean") return false;
+  const chunkCount = entry.chunkCount;
+  return (
+    typeof chunkCount === "number" &&
+    Number.isInteger(chunkCount) &&
+    Number.isFinite(chunkCount) &&
+    chunkCount >= 0
+  );
+}
+
 /** Reads a string field out of decoded frontmatter. */
 function frontmatterText(
   data: Record<string, unknown> | null,
@@ -523,6 +578,25 @@ function deriveTitle(
 }
 
 /**
+ * Splits text into the runs a probe may be chosen from.
+ *
+ * Letters and digits only — no underscores, no hyphens. Those are word
+ * characters to a regular expression and separators to the full-text
+ * tokenizer (`porter unicode61`), and a candidate that straddles that
+ * disagreement is the problem: a long underscore run inside a fenced code block
+ * is the longest "token" in a note by any regex measure and is not an indexed
+ * term at all, so searching for it correctly returns nothing. A check that
+ * reads that correct answer as corruption blocks a healthy rebuild.
+ *
+ * Restricting candidates to alphanumeric runs keeps both uses honest: each is a
+ * literal substring of the stored chunk, so exhaustive matching finds it, and
+ * each is exactly one tokenizer term, so a search for it finds it too.
+ */
+function probeCandidates(text: string): string[] {
+  return text.split(/[^\p{L}\p{N}]+/u);
+}
+
+/**
  * Picks the substring a rebuild probes one note's stored chunks for.
  *
  * The token is taken from the **splitter's own output**, never from the raw
@@ -545,7 +619,7 @@ function deriveTitle(
 function probeToken(chunks: Chunk[]): string | null {
   let longest: string | null = null;
   for (const chunk of chunks) {
-    for (const token of chunk.content.split(/[^\p{L}\p{N}_-]+/u)) {
+    for (const token of probeCandidates(chunk.content)) {
       if (token.length < 5) continue;
       if (longest === null || token.length > longest.length) longest = token;
     }
@@ -1251,7 +1325,7 @@ export class VaultIndex {
   manifestEntries(collection: string): IndexManifestEntry[] {
     const normalized = normalizeCollection(collection);
     const pointer = readJson<IndexPointer>(this.pointerFile(normalized));
-    if (pointer === null) return [];
+    if (pointer === null || !isGenerationName(pointer.generation)) return [];
     return this.loadManifest(normalized, pointer.generation)?.entries ?? [];
   }
 
@@ -1472,21 +1546,28 @@ export class VaultIndex {
     // ranking question and no business of verification — that conflation is
     // what made an earlier probe reject sound rebuilds — but a token known to
     // be in the index returning nothing at all is not a ranking question.
+    let asked = 0;
     for (const [key, probe] of probes) {
       const entry = expected.get(key);
       if (entry === undefined) continue;
+      asked += 1;
       const hits = await service.searchStore(
         input.collection,
         storeVersion(entry.version),
         probe,
         1,
       );
-      if (hits.length === 0) {
-        throw new IndexVerificationError(
-          `rebuilt index answers no search at all: "${probe}" is stored and finds nothing`,
-        );
-      }
-      return;
+      if (hits.length > 0) return;
+    }
+
+    if (asked > 0) {
+      // Every sampled probe came back empty. One could be a quirk of the term
+      // it happened to choose; all of them cannot be, and this is the only
+      // conclusion the check is entitled to draw — that the index answers
+      // nothing at all, not that any particular note ranks anywhere.
+      throw new IndexVerificationError(
+        `rebuilt index answers no search at all: ${asked} stored term${asked === 1 ? " finds" : "s find"} nothing`,
+      );
     }
   }
 
@@ -1505,7 +1586,7 @@ export class VaultIndex {
     vaultPath: string;
   }): Promise<boolean> {
     const pointer = readJson<IndexPointer>(this.pointerFile(input.collection));
-    if (pointer === null) return false;
+    if (pointer === null || !isGenerationName(pointer.generation)) return false;
 
     const manifest = this.loadManifest(input.collection, pointer.generation);
     if (manifest === null) return false;
@@ -1551,7 +1632,7 @@ export class VaultIndex {
    */
   private inspectGeneration(collection: string): GenerationInspection {
     const pointer = readJson<IndexPointer>(this.pointerFile(collection));
-    if (pointer === null || typeof pointer.generation !== "string") {
+    if (pointer === null || !isGenerationName(pointer.generation)) {
       return { usable: false, generation: null, problem: "never-built" };
     }
 
@@ -1754,6 +1835,11 @@ export class VaultIndex {
     if (manifest === null || manifest.version !== INDEX_MANIFEST_VERSION) return null;
     if (manifest.collection !== collection) return null;
     if (!Array.isArray(manifest.entries)) return null;
+    // Every entry, not just the array around them. A file whose header reads
+    // correctly and whose rows do not is still derived state this build cannot
+    // use, and saying so here is what routes it to the rebuild rather than to a
+    // property access on a row that is not an object.
+    if (!manifest.entries.every(isManifestEntry)) return null;
     return manifest;
   }
 
@@ -1794,12 +1880,30 @@ export class VaultIndex {
 
     const ordered = names
       .filter((name) => name !== current)
-      .map((name) => ({ name, at: fs.statSync(path.join(root, name)).mtimeMs }))
+      .map((name) => {
+        try {
+          return { name, at: fs.statSync(path.join(root, name)).mtimeMs };
+        } catch {
+          // Listed a moment ago and not there now. Housekeeping is not the
+          // place to turn somebody else's tidy-up into a failed rebuild.
+          return null;
+        }
+      })
+      .filter((entry): entry is { name: string; at: number } => entry !== null)
       .sort((a, b) => b.at - a.at)
       .slice(GENERATIONS_KEPT - 1);
 
     for (const stale of ordered) {
-      fs.rmSync(path.join(root, stale.name), { recursive: true, force: true });
+      try {
+        fs.rmSync(path.join(root, stale.name), { recursive: true, force: true });
+      } catch {
+        this.logger({
+          level: "warn",
+          event: "index.prune_failed",
+          loc: "VaultIndex.pruneGenerations",
+          ctx: { collection, generation: stale.name },
+        });
+      }
     }
   }
 }
