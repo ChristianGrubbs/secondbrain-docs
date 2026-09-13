@@ -61,6 +61,29 @@ export function resolveNearestExistingAncestor(targetPath) {
  * @param {string} liveVaultPath The operator's real vault path.
  * @returns {boolean} True if `candidatePath` resolves inside `liveVaultPath`.
  */
+/**
+ * Reports whether `candidatePath` itself is a symlink (dangling or not),
+ * without following it.
+ *
+ * `lstatSync` (unlike `realpathSync`/`existsSync`) inspects the path entry
+ * itself rather than its resolved target, so this correctly reports `true`
+ * for a symlink whose target does not exist (a "dangling" symlink) — the
+ * exact shape `resolveNearestExistingAncestor` cannot see, because
+ * `realpathSync` throws on a dangling symlink and the caller falls back to
+ * treating the symlink's own (non-live-vault) parent directory as the
+ * canonical location (MAJOR 1, 2026-09-13 Codex frontier review, round 5).
+ *
+ * @param {string} candidatePath
+ * @returns {boolean}
+ */
+export function isSymlinkPath(candidatePath) {
+  try {
+    return fs.lstatSync(candidatePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export function isInsideLiveVault(candidatePath, liveVaultPath) {
   let liveVaultReal;
   try {
@@ -97,6 +120,29 @@ export function assertNotLiveVault(candidatePath, liveVaultPath) {
   if (isInsideLiveVault(candidatePath, liveVaultPath)) {
     throw new Error(
       `refusing to run against the operator's live vault (or a symlink alias into it): ${liveVaultPath}`,
+    );
+  }
+}
+
+/**
+ * Throws if `candidatePath` is itself a symlink, dangling or not.
+ *
+ * Chosen deliberately over "resolve the symlink's target and containment-
+ * check that instead": a dangling symlink's target cannot be
+ * `realpathSync`-resolved at all (nothing exists there yet to canonicalize
+ * through), so any resolution scheme for it is itself unverifiable. A flat
+ * "no symlinks here" rule for a live-write-sensitive path (a state
+ * directory or its config file) is simpler, is unconditionally safe against
+ * both an existing-target and a dangling-target alias into the live vault,
+ * and never allows a case this guard cannot fully verify.
+ *
+ * @param {string} candidatePath
+ * @param {string} label Human-readable description used in the error message.
+ */
+export function assertNotSymlink(candidatePath, label) {
+  if (isSymlinkPath(candidatePath)) {
+    throw new Error(
+      `refusing to use a symlinked ${label} -- symlinks are never permitted here because a dangling one can alias the live vault without being resolvable: ${candidatePath}`,
     );
   }
 }

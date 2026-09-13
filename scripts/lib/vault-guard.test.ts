@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { assertNotLiveVault, isInsideLiveVault } from "./vault-guard.mjs";
+import { assertNotLiveVault, assertNotSymlink, isInsideLiveVault, isSymlinkPath } from "./vault-guard.mjs";
 
 describe("vault-guard", () => {
   let scratch: string;
@@ -162,4 +162,48 @@ describe("vault-guard", () => {
 
     expect(isInsideLiveVault(outsideViaTraversal, liveVault)).toBe(false);
   });
+
+  describe(
+    // MAJOR 1 (2026-09-13 Codex frontier review, round 5): a DANGLING
+    // symlink's target cannot be `realpathSync`-resolved, so
+    // `isInsideLiveVault`/`resolveNearestExistingAncestor` cannot see
+    // through it at all. `isSymlinkPath`/`assertNotSymlink` catch the
+    // symlink itself, independent of whether its target exists.
+    "isSymlinkPath / assertNotSymlink",
+    () => {
+      it("reports false for a plain file", () => {
+        const plainFile = path.join(scratch, "plain-file.txt");
+        fs.writeFileSync(plainFile, "hello\n");
+        expect(isSymlinkPath(plainFile)).toBe(false);
+      });
+
+      it("reports false for a path that does not exist at all", () => {
+        expect(isSymlinkPath(path.join(scratch, "does-not-exist"))).toBe(false);
+      });
+
+      it("reports true for a symlink whose target exists", () => {
+        const target = path.join(scratch, "target-file.txt");
+        fs.writeFileSync(target, "hello\n");
+        const link = path.join(scratch, "link-to-target");
+        fs.symlinkSync(target, link);
+        expect(isSymlinkPath(link)).toBe(true);
+      });
+
+      it("reports true for a DANGLING symlink whose target does not exist", () => {
+        const link = path.join(scratch, "dangling-link");
+        fs.symlinkSync(path.join(scratch, "nonexistent-target"), link);
+        expect(isSymlinkPath(link)).toBe(true);
+      });
+
+      it("assertNotSymlink throws for a symlink and is silent for a plain path", () => {
+        const plainFile = path.join(scratch, "plain-file-2.txt");
+        fs.writeFileSync(plainFile, "hello\n");
+        const link = path.join(scratch, "another-dangling-link");
+        fs.symlinkSync(path.join(scratch, "nonexistent-target-2"), link);
+
+        expect(() => assertNotSymlink(link, "config.yaml")).toThrow(/symlinked config\.yaml/);
+        expect(() => assertNotSymlink(plainFile, "config.yaml")).not.toThrow();
+      });
+    },
+  );
 });

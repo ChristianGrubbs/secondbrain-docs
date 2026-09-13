@@ -133,6 +133,56 @@ describe(
       expect(fs.readFileSync(configFile, "utf8")).toBe(existingBytes);
     });
 
+    it(
+      // MAJOR 1 (2026-09-13 Codex frontier review, round 5): a dangling
+      // config.yaml symlink whose target does not yet exist made
+      // `realpathSync` fail, so `resolveNearestExistingAncestor` fell back
+      // to the external parent, `existsSync` reported false, validation
+      // passed without --overwrite-config, and `writeFileSync` followed the
+      // symlink and created the file inside the live vault. This proves an
+      // external config.yaml symlinked to an EXISTING live-vault file is
+      // rejected before any write, and the live-vault file is untouched.
+      "rejects an external config.yaml symlinked to an EXISTING file inside the live vault",
+      () => {
+        const stateDirArg = path.join(scratch, "external-state-symlink-existing");
+        fs.mkdirSync(stateDirArg, { recursive: true });
+        const liveVaultTarget = path.join(fakeLiveVault, "config.yaml");
+        const existingLiveVaultBytes = "# live vault config, never touch\n";
+        fs.writeFileSync(liveVaultTarget, existingLiveVaultBytes, "utf8");
+        fs.symlinkSync(liveVaultTarget, path.join(stateDirArg, "config.yaml"));
+
+        expect(() =>
+          resolveGuardedState({
+            stateDirArg,
+            liveVaultPath: fakeLiveVault,
+            overwriteConfig: false,
+          }),
+        ).toThrow(/live vault|symlink/);
+        expect(fs.readFileSync(liveVaultTarget, "utf8")).toBe(existingLiveVaultBytes);
+      },
+    );
+
+    it(
+      // Same bypass, but the symlink's target does not exist yet -- the
+      // exact dangling-symlink shape the finding describes.
+      "rejects an external config.yaml symlinked to a NONEXISTENT file inside the live vault",
+      () => {
+        const stateDirArg = path.join(scratch, "external-state-symlink-dangling");
+        fs.mkdirSync(stateDirArg, { recursive: true });
+        const liveVaultTarget = path.join(fakeLiveVault, "not-yet-created-config.yaml");
+        fs.symlinkSync(liveVaultTarget, path.join(stateDirArg, "config.yaml"));
+
+        expect(() =>
+          resolveGuardedState({
+            stateDirArg,
+            liveVaultPath: fakeLiveVault,
+            overwriteConfig: false,
+          }),
+        ).toThrow(/live vault|symlink/);
+        expect(fs.existsSync(liveVaultTarget)).toBe(false);
+      },
+    );
+
     it("still refuses an overwrite when --overwrite-config is set but the config path is inside the live vault", () => {
       const insideLiveVault = path.join(fakeLiveVault, "some-state-dir");
       fs.mkdirSync(insideLiveVault, { recursive: true });

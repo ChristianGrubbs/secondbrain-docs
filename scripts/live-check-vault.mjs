@@ -31,7 +31,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { assertNotLiveVault } from "./lib/vault-guard.mjs";
+import { assertNotLiveVault, assertNotSymlink } from "./lib/vault-guard.mjs";
 import { qualifyNote } from "./lib/qualification-contract.mjs";
 
 const LIVE_VAULT = "/Volumes/3M/Obsidian";
@@ -60,6 +60,16 @@ export function resolveGuardedState({ stateDirArg, liveVaultPath, overwriteConfi
     ? path.resolve(stateDirArg)
     : fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-livecheck-state-"));
 
+  // MAJOR 1 (2026-09-13 Codex frontier review, round 5): a DANGLING
+  // config.yaml symlink (or a dangling symlinked state dir) whose target
+  // does not yet exist made `realpathSync` throw inside
+  // `resolveNearestExistingAncestor`, which then fell back to the
+  // symlink's own external parent directory -- silently bypassing
+  // containment entirely, even though `writeFileSync`/`mkdirSync` would
+  // still follow the symlink into the live vault. Symlinks are rejected
+  // outright here, before the containment check ever runs, rather than
+  // attempting to resolve a target that may not exist.
+  assertNotSymlink(stateDir, "state directory");
   assertNotLiveVault(stateDir, liveVaultPath);
 
   const configFile = path.join(stateDir, "config.yaml");
@@ -67,6 +77,7 @@ export function resolveGuardedState({ stateDirArg, liveVaultPath, overwriteConfi
   // `configFile`-shaped symlink alias distinct from `stateDir` itself in a
   // future revision of this script, and this keeps the guard from
   // depending on that never changing.
+  assertNotSymlink(configFile, "config.yaml");
   assertNotLiveVault(configFile, liveVaultPath);
 
   const configPreexisted = fs.existsSync(configFile);
