@@ -50,23 +50,30 @@ describe("BrowserFetcher", () => {
     vi.clearAllMocks();
   });
 
-  it(// Regression for a 2026-09-13 qualification finding (Task 6, row X03):
-  // Playwright's default SIGINT/SIGTERM/SIGHUP handlers force-exit the
-  // process on their own, racing and winning against `sb-docs capture`'s
-  // own graceful-cancellation handler — the JSON exit-130 envelope never
-  // printed on a real Ctrl-C during a browser-rendered capture. Disabling
-  // Playwright's own signal handling hands cleanup entirely to the CLI.
-  "disables Playwright's own SIGINT/SIGTERM/SIGHUP handling so the CLI's own cancellation handler owns process exit", async () => {
+  it(// Regression for a 2026-09-13 qualification finding (Task 6, row X03),
+  // corrected 2026-09-13 after frontier review: Playwright's default
+  // SIGINT handler force-exits the process on its own, racing and winning
+  // against `sb-docs capture`'s own graceful-cancellation handler — the
+  // JSON exit-130 envelope never printed on a real Ctrl-C during a
+  // browser-rendered capture. Disabling only Playwright's SIGINT handling
+  // hands that one signal's cleanup to the CLI. SIGTERM and SIGHUP stay
+  // enabled (Playwright's default): this launcher is shared with the
+  // upstream HTML middleware, which bridges neither signal, and
+  // Playwright's own handlers are what reliably reap the detached browser
+  // process tree and temp profile dir on those signals — see the process
+  // tests in test/vault-capture-e2e.test.ts (X03 SIGINT/SIGTERM/SIGHUP).
+  "disables only Playwright's own SIGINT handling, leaving SIGTERM/SIGHUP to Playwright's own cleanup", async () => {
     mockBrowser();
     await BrowserFetcher.launchBrowser();
 
     expect(chromium.launch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        handleSIGINT: false,
-        handleSIGTERM: false,
-        handleSIGHUP: false,
-      }),
+      expect.objectContaining({ handleSIGINT: false }),
     );
+    const options = vi.mocked(chromium.launch).mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(options).not.toHaveProperty("handleSIGTERM");
+    expect(options).not.toHaveProperty("handleSIGHUP");
   });
 
   it("uses broad invalid TLS override for the browser context", async () => {
