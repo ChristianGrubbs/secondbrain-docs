@@ -1244,6 +1244,66 @@ describe("VaultPublisher review regressions", () => {
       expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
     });
 
+    it(// MAJOR 1 (2026-09-13 Codex frontier review round 6, third pass): the
+    // raw-substring fast path this module briefly had ignored Markdown
+    // escapes -- `\-` is resolved by remark to a literal `-`, so a MOC
+    // link written with an escaped hyphen around a title containing one
+    // would have been fast-pathed to "not linked" and duplicated.
+    "recognizes an existing link written with a backslash-escaped hyphen as already linked", async () => {
+      const first = await publisher.publish(makeDocument({ title: "Foo-Bar" }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain("Foo-Bar");
+      const escapedTarget = target.replace(/-/g, "\\-");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${escapedTarget}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument({ title: "Foo-Bar" }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug shape, character references: `&amp;` is resolved by
+    // remark to a literal `&`.
+    "recognizes an existing link written with an HTML character reference as already linked", async () => {
+      const first = await publisher.publish(makeDocument({ title: "Foo&Bar" }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain("Foo&Bar");
+      const referencedTarget = target.replace(/&/g, "&amp;");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${referencedTarget}]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument({ title: "Foo&Bar" }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 2 (2026-09-13 Codex frontier review round 6, third pass): the
+    // former sentinel character (U+E000) is ordinary text; nothing stops
+    // a real note title from containing it. A real, unfragmented link to
+    // such a target must still be recognized as already linked (no
+    // duplicate inserted).
+    "recognizes an existing link to a target containing the former sentinel character (U+E000) as already linked", async () => {
+      const puaTitle = "Foo\uE000Bar";
+      const first = await publisher.publish(makeDocument({ title: puaTitle }));
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      expect(target).toContain(puaTitle);
+      cli.notes.set(indexPath, `# Source Captures\n\n## Sources\n\n- [[${target}]]\n`);
+
+      const republished = await publisher.publish(makeDocument({ title: puaTitle }));
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
     it("cannot be made to inject a second link through a hostile title", async () => {
       const publication = await publisher.publish(
         makeDocument({ title: "Innocent]]\n- [[Evil Injected Note|pwned" }),

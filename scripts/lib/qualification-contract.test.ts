@@ -778,6 +778,159 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR 1 (2026-09-13 Codex frontier review round 6, third pass): the
+    // raw-substring fast path this module briefly had ignored Markdown
+    // escapes -- `\-` is resolved by remark to a literal `-` -- so a MOC
+    // link written this way around a target containing a hyphen would have
+    // been fast-pathed to "no link" (MOC link count 0), a false rejection
+    // of an actually-qualified note.
+    "accepts a MOC link to a target containing a hyphen, written with a backslash escape",
+    async () => {
+      const savedBytes = [
+        "---",
+        "type: source",
+        "title: Foo-Bar",
+        "source_url: https://example.com/foo-bar",
+        "requested_url: https://example.com/foo-bar",
+        "source_id: abc124",
+        "collection: collection",
+        'version: ""',
+        "---",
+        "FACT-ETA2-1031",
+      ].join("\n");
+      const notePath = "collection/Foo-Bar abc124.md";
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(path.join(vaultPath, notePath), savedBytes, "utf8");
+      const escapedTarget = target.replace(/-/g, "\\-");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${escapedTarget}]]\n`,
+        "utf8",
+      );
+
+      const digest = sha256(savedBytes);
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-ETA2-1031"],
+        collection: "collection",
+        query: "FACT-ETA2-1031",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // Same bug shape, character references: `&amp;` is resolved by remark
+    // to a literal `&`.
+    "accepts a MOC link to a target containing an ampersand, written with an HTML character reference",
+    async () => {
+      const savedBytes = [
+        "---",
+        "type: source",
+        "title: Foo&Bar",
+        "source_url: https://example.com/foo-and-bar",
+        "requested_url: https://example.com/foo-and-bar",
+        "source_id: abc125",
+        "collection: collection",
+        'version: ""',
+        "---",
+        "FACT-THETA2-1032",
+      ].join("\n");
+      const notePath = "collection/Foo&Bar abc125.md";
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(path.join(vaultPath, notePath), savedBytes, "utf8");
+      const referencedTarget = target.replace(/&/g, "&amp;");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${referencedTarget}]]\n`,
+        "utf8",
+      );
+
+      const digest = sha256(savedBytes);
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-THETA2-1032"],
+        collection: "collection",
+        query: "FACT-THETA2-1032",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // MAJOR 2 (2026-09-13 Codex frontier review round 6, third pass): the
+    // former sentinel character (U+E000) is ordinary text; nothing stops a
+    // real vault path from containing it. A real, unfragmented link must
+    // still qualify.
+    "accepts a MOC link to a target containing the former sentinel character (U+E000)",
+    async () => {
+      const puaTitle = "Foo\uE000Bar";
+      const savedBytes = [
+        "---",
+        "type: source",
+        `title: ${puaTitle}`,
+        "source_url: https://example.com/foo-pua-bar",
+        "requested_url: https://example.com/foo-pua-bar",
+        "source_id: abc126",
+        "collection: collection",
+        'version: ""',
+        "---",
+        "FACT-IOTA2-1033",
+      ].join("\n");
+      const notePath = `collection/${puaTitle} abc126.md`;
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(path.join(vaultPath, notePath), savedBytes, "utf8");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${target}]]\n`,
+        "utf8",
+      );
+
+      const digest = sha256(savedBytes);
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-IOTA2-1033"],
+        collection: "collection",
+        query: "FACT-IOTA2-1033",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

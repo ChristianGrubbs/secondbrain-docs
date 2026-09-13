@@ -27,36 +27,45 @@
  * to remark, so it always survives into a `text` node's `value` verbatim,
  * which is exactly what this module's regex matches against.
  *
- * Round 6 scoped re-review (2026-09-13) found two further defects in this
- * exact approach:
+ * Round 6 scoped re-review (2026-09-13) found two further defects, and a
+ * second scoped re-review the same day found two more in the first round's
+ * own fixes -- both since corrected here (see MAJOR 1 and MAJOR 2 below).
  *
- * MAJOR 1: `collectVisibleText` returned `""` for a skipped `inlineCode`
- * node and simply concatenated the surrounding siblings with nothing in
- * between, so a wikilink fragmented by an inline code span, a hard break, or
- * an image (e.g. `[[collection/` + `` `x` `` + `Fixture]]`) was silently
- * reassembled into a false match -- the exact bug this module exists to
- * prevent, just moved one level up. Every node whose own text must never be
- * concatenated with its neighbours now contributes a private-use-area
- * boundary character instead of an empty string, so a wikilink can never
- * span across one.
+ * MAJOR 1 (dropped after two revisions, 2026-09-13 Codex frontier review
+ * round 6, THIRD pass): the module briefly had a raw-substring fast path
+ * (`markdown.includes("[[" + target)`) to skip parsing when the target text
+ * was provably absent, gated by a regex meant to detect when that shortcut
+ * could be unsound. That gate still missed real cases: `\-`-style Markdown
+ * escapes and `&amp;`-style character references are both resolved by
+ * remark (an escaped `\-` becomes a literal `-`, `&amp;` becomes `&`)
+ * without matching the gate's trigger characters, so `[[collection/Foo\-Bar]]`
+ * for target `collection/Foo-Bar` raw-substring-missed and fast-pathed to 0
+ * even though a real parse finds the link -- exactly the kind of duplicate-
+ * insertion bug this module exists to prevent. There is no cheap,
+ * enumerable set of "safe" trigger characters here: any construct remark
+ * resolves differently from its raw bytes is a potential miss. The fast
+ * path and its gate are REMOVED entirely; `countLinksTo`/`hasLinkTo` always
+ * parse. The single-entry parse cache (below) is kept, since re-parsing the
+ * exact same markdown string is pure waste, not a correctness tradeoff.
+ * Measured full-parse cost (accepted, documented limit, not a fast-path
+ * substitute): ~508ms at 10k entries, ~1.4s at 20k, ~13.8s at 50k in a
+ * single flat-list MOC -- real collection MOCs are orders of magnitude
+ * smaller than this synthetic benchmark (see the benchmark-style test in
+ * `markdownLinks.test.ts`), and this is a per-call link-check cost, not the
+ * plan's protected full-collection scan.
  *
- * MAJOR 2: every `countLinksTo`/`hasLinkTo` call reparsed the whole MOC from
- * scratch, and `VaultPublisher` calls it once per publication -- on a large,
- * flat, ever-growing MOC this trends quadratic with the number of already
- * captured sources (measured: ~508ms at 10k entries, ~1.4s at 20k, ~13.8s at
- * 50k). Two correctness-preserving speedups: (1) a plain substring check
- * (`markdown.includes("[[" + target)`) short-circuits to 0 without parsing
- * at all when the literal target text does not appear anywhere in the raw
- * source -- a real link (aliased or not) always contains that exact
- * substring in the raw bytes, so its absence proves there is no link,
- * without needing to know whether the substring (if present) is inside code
- * or prose; (2) a single-entry cache keyed by exact markdown-string identity
- * avoids reparsing the same MOC string across repeated calls in one process
- * (e.g. the qualification contract's own re-checks). This is a per-call
- * link-check cost, not the plan's protected full-collection scan, so a
- * bounded parse cost for a large-but-finite MOC is an accepted, documented
- * tradeoff (see the benchmark-style test in `markdownLinks.test.ts`), not a
- * violation of that protection.
+ * MAJOR 2 (2026-09-13 Codex frontier review round 6, THIRD pass): the
+ * previous fix used a Unicode Private Use Area character (`U+E000`) as an
+ * in-band "boundary sentinel" to keep opaque-node content from
+ * concatenating with its neighbours. That character is still ordinary,
+ * matchable text -- nothing stops a real vault path (a note title, which is
+ * user-controlled free text) from containing it, which could either
+ * collide with the sentinel or be split by it. Boundaries are no longer
+ * serialized as a character at all: `collectVisibleTextRuns` returns an
+ * ARRAY of text runs, starting a new run at every opaque node and joining
+ * only transparent children into the current run. Wikilinks are counted
+ * per run, so no separator character of any kind is ever required or at
+ * risk of colliding with real content.
  *
  * MINOR: root-level (block) `html` nodes were never scanned at all (they are
  * not `paragraph`/`heading`/`tableCell`), so a hand-edited MOC using raw
@@ -107,26 +116,16 @@ function walk(node, visitor) {
 const TEXT_CONTAINER_TYPES = new Set(["paragraph", "heading", "tableCell"]);
 
 /**
- * A Unicode Private Use Area character, chosen as a boundary sentinel
- * because it can never appear in real Markdown source text (it has no
- * meaning to any Markdown or HTML author, and remark's parser never
- * produces it), so it can never itself become part of a false match, and it
- * always breaks apart the two sides of any node whose real content must
- * never be silently concatenated with its neighbours (MAJOR 1, 2026-09-13
- * Codex frontier review round 6, scoped re-review). NEVER a NUL byte
- * (`\x00`): several tools and hooks in this repo treat a literal NUL in a
- * source or test file as a corruption signal.
- */
-const LINK_BOUNDARY = "\uE000";
-
-/**
  * mdast node types whose own content must never be concatenated with their
  * neighbours: fenced/indented code, inline code, hard line breaks, images
  * (of either form), raw HTML (block or inline -- see the MINOR note in this
  * module's top comment), and footnote references (only reachable with a
  * plugin remark-parse alone never loads, kept for defense in depth). Each
- * contributes one `LINK_BOUNDARY` character instead of its own text, or of
- * an empty string.
+ * one starts a new, independent text run (see `collectVisibleTextRuns`)
+ * rather than contributing any character of its own -- not even a sentinel
+ * (MAJOR 2, 2026-09-13 Codex frontier review round 6, third pass: an
+ * earlier sentinel-character approach could collide with a real vault path
+ * containing that exact character).
  */
 const BOUNDARY_NODE_TYPES = new Set([
   "code",
@@ -140,25 +139,49 @@ const BOUNDARY_NODE_TYPES = new Set([
 ]);
 
 /**
- * Recursively collects the visible text of one phrasing-content node for
- * matching purposes. A `text` node contributes its literal value. A node in
- * `BOUNDARY_NODE_TYPES` contributes one `LINK_BOUNDARY` character -- never
- * its own text, and never an empty string that would let its neighbours
- * merge across it. Every other node with children (emphasis, strong, link,
- * paragraph, heading, tableCell, listItem, blockquote, ...) is transparent:
- * its children's collected text is concatenated directly, which is exactly
- * what lets a wikilink split by e.g. `*emphasis*` still reassemble.
+ * Appends the visible text of one phrasing-content node into `runs` (an
+ * array of strings, mutated in place). A `text` node appends its literal
+ * value onto the current (last) run. A node in `BOUNDARY_NODE_TYPES` starts
+ * a brand-new, empty run -- ending the current one -- so its neighbours can
+ * never be concatenated across it, without requiring any separator
+ * character. Every other node with children (emphasis, strong, delete,
+ * link, paragraph, heading, tableCell, listItem, blockquote, ...) is
+ * transparent: its children are visited in order into the same run(s),
+ * which is exactly what lets a wikilink split by e.g. `*emphasis*` still
+ * reassemble within one run.
  *
  * @param {import("mdast").Node} node
- * @returns {string}
+ * @param {string[]} runs Mutated in place; always has at least one element.
  */
-function collectVisibleText(node) {
-  if (node.type === "text") return node.value ?? "";
-  if (BOUNDARY_NODE_TYPES.has(node.type)) return LINK_BOUNDARY;
-  if (Array.isArray(node.children)) {
-    return node.children.map(collectVisibleText).join("");
+function collectVisibleTextRuns(node, runs) {
+  if (node.type === "text") {
+    runs[runs.length - 1] += node.value ?? "";
+    return;
   }
-  return LINK_BOUNDARY;
+  if (BOUNDARY_NODE_TYPES.has(node.type)) {
+    runs.push("");
+    return;
+  }
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) collectVisibleTextRuns(child, runs);
+    return;
+  }
+  // An unknown leaf node type (defensive): never silently disappear into
+  // the surrounding run.
+  runs.push("");
+}
+
+/**
+ * Returns the array of independent text runs for one text-container node
+ * (see `TEXT_CONTAINER_TYPES`), split at every opaque node it contains.
+ *
+ * @param {import("mdast").Node} node
+ * @returns {string[]}
+ */
+function textRunsOf(node) {
+  const runs = [""];
+  collectVisibleTextRuns(node, runs);
+  return runs;
 }
 
 /** Single-entry parse cache, keyed by exact markdown-string identity. */
@@ -167,10 +190,12 @@ let cachedTree;
 
 /**
  * Parses `markdown`, reusing the previous result when called again with the
- * literal same string (MAJOR 2, 2026-09-13 Codex frontier review round 6,
- * scoped re-review) -- a plain `===` string comparison is already the
+ * literal same string (MAJOR 1, 2026-09-13 Codex frontier review round 6,
+ * third pass) -- a plain `===` string comparison is already the
  * length-then-byte-compare a manual hash check would amount to, so no
- * separate hash is needed for a single-entry cache.
+ * separate hash is needed for a single-entry cache. This is a pure
+ * performance optimization: it never changes the result, unlike the
+ * removed substring fast path (see this module's top comment).
  *
  * @param {string} markdown
  * @returns {import("mdast").Node}
@@ -184,50 +209,22 @@ function parseCached(markdown) {
 }
 
 /**
- * Matches raw text that could make a wikilink's literal substring disappear
- * from the raw bytes while a real parse still finds it: emphasis/strong
- * delimiters (`*`/`_`) or the start of a real inline link/image destination
- * (`](`/`][`). Those are the only "transparent" constructs this module
- * reassembles (their own delimiter characters vanish from the collected
- * text, letting two raw-byte-separated runs become one contiguous match) --
- * see `TEXT_CONTAINER_TYPES`'s sibling logic in `collectVisibleText`.
- *
- * A hard break, inline code span, image, or raw HTML can also fragment a
- * wikilink's raw bytes, but those are all `BOUNDARY_NODE_TYPES` -- they can
- * only ever ADD an unmatchable character, never remove one, so they can
- * never turn a substring-absent raw text into a parse-present match; only a
- * transparent node whose own delimiters vanish on parse can do that, which
- * is exactly what this pattern catches (MAJOR 2, 2026-09-13 Codex frontier
- * review round 6, scoped re-review round 2: the initial fast path missed
- * this interaction with round 6's own emphasis/strong/link reassembly
- * requirement).
- */
-const POSSIBLE_FRAGMENTING_MARKUP = /[*_]|\]\(|\]\[/;
-
-/**
  * Counts real wikilink references to `target` in `markdown`
  * (`[[target]]`/`[[target|alias]]`), using a real CommonMark parse so
  * fenced code (any indentation, any fence character run length), indented
  * code blocks, inline code spans (any backtick run length, single- or
  * multi-line), hard breaks, images and raw HTML are never mistaken for
  * prose, however they are written, and can never be silently bridged into a
- * false match by concatenation.
+ * false match by concatenation. Always parses -- see this module's top
+ * comment for why a raw-substring fast path was tried and removed (Markdown
+ * escapes and character references make raw-byte presence/absence
+ * unreliable).
  *
  * @param options.markdown The Markdown to search.
  * @param options.target Vault path of the note, without its `.md` extension.
  * @returns {number} The number of distinct `[[target]]`/`[[target|alias]]` matches.
  */
 export function countLinksTo({ markdown, target }) {
-  // A real, unfragmented link (aliased or not) always contains this exact
-  // substring in the raw source, whether or not it is inside code -- so its
-  // absence proves there is no link at all, without parsing, UNLESS the
-  // document also contains markup that could fragment the raw bytes of an
-  // otherwise-matching link while a real parse still reassembles it (MAJOR
-  // 2). In that case we always fall through to a real parse.
-  if (!POSSIBLE_FRAGMENTING_MARKUP.test(markdown) && !markdown.includes(`[[${target}`)) {
-    return 0;
-  }
-
   const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`, "g");
 
@@ -235,7 +232,9 @@ export function countLinksTo({ markdown, target }) {
   let count = 0;
   walk(tree, (node) => {
     if (TEXT_CONTAINER_TYPES.has(node.type)) {
-      count += (collectVisibleText(node).match(pattern) ?? []).length;
+      for (const run of textRunsOf(node)) {
+        count += (run.match(pattern) ?? []).length;
+      }
     }
   });
   return count;

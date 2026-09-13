@@ -116,12 +116,13 @@ describe("markdownLinks", () => {
     expect(countLinksTo({ markdown, target: TARGET })).toBe(2);
   });
 
-  describe("boundary sentinel (round 6 scoped re-review MAJOR 1)", () => {
+  describe("text-run splitting at opaque nodes (round 6 scoped re-review MAJOR 1, third pass)", () => {
     it(// `collectVisibleText` used to return "" for a skipped node and
     // simply concatenate its neighbours, so `[[collection/` + (skipped
-    // inline code) + `Fixture]]` reassembled into a false match. A
-    // boundary sentinel between the two halves prevents that, and the
-    // real link placed separately must still count exactly once.
+    // inline code) + `Fixture]]` reassembled into a false match. Splitting
+    // into independent text runs at every opaque node (no separator
+    // character of any kind) prevents that, and the real link placed
+    // separately must still count exactly once.
     "does not reassemble a pseudo-link fragmented by an inline code span", () => {
       const markdown = `[[collection/\`x\`Fixture]]\nreal: [[${TARGET}]]\n`;
       expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
@@ -137,9 +138,84 @@ describe("markdownLinks", () => {
       expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
     });
 
+    it(// MINOR (2026-09-13 Codex frontier review round 6, third pass): an
+    // image REFERENCE (`![alt][ref]`, resolved against a `[ref]: url`
+    // definition elsewhere) is a distinct mdast node type from a direct
+    // image, and was missing dedicated committed coverage.
+    "does not reassemble a pseudo-link fragmented by an image reference", () => {
+      const markdown = `[[collection/![alt][ref]Fixture]]\n\n[ref]: https://example.com\nreal: [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
     it("does not reassemble a pseudo-link fragmented by inline HTML", () => {
       const markdown = `[[collection/<br>Fixture]]\nreal: [[${TARGET}]]\n`;
       expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+  });
+
+  describe(// MAJOR 2 (2026-09-13 Codex frontier review round 6, third pass): the
+  // previous fix used a Unicode Private Use Area character (U+E000) as an
+  // in-band boundary sentinel. That character is still ordinary text --
+  // nothing stops a real vault path (built from a user-controlled note
+  // title) from containing it, colliding with the sentinel. Boundaries
+  // are now structural (an array of independent text runs), never a
+  // character, so a target containing this exact code point cannot
+  // collide with anything.
+  "target containing the former sentinel character (U+E000)", () => {
+    const PUA = "";
+    const puaTarget = `collection/Foo${PUA}Bar`;
+
+    it("counts a real, unfragmented link to a target containing U+E000 exactly once", () => {
+      const markdown = `[[collection/Foo${PUA}Bar]]\n`;
+      expect(countLinksTo({ markdown, target: puaTarget })).toBe(1);
+    });
+
+    it(// The collision this construct used to trigger: a pseudo-link
+    // fragmented by an inline code span, checked against a target that
+    // happens to contain the exact character the old sentinel used.
+    // The old sentinel-character implementation returned 1 here
+    // (confirmed by a standalone reproduction before this fix); the
+    // array-of-runs implementation has no character to collide with.
+    "does not let a pseudo-link fragmented by an opaque node collide with a U+E000-containing target", () => {
+      const markdown = "[[collection/Foo`x`Bar]]\n";
+      expect(countLinksTo({ markdown, target: puaTarget })).toBe(0);
+    });
+  });
+
+  describe(// MAJOR 1 (2026-09-13 Codex frontier review round 6, third pass): the
+  // raw-substring fast path this module briefly had ignored Markdown
+  // escapes and character references, both of which remark resolves
+  // differently from the raw bytes -- `\-` becomes a literal `-`, `&amp;`
+  // becomes `&`. Neither contains the fast path's own trigger characters,
+  // so both were wrongly fast-pathed to 0 even though a real parse finds
+  // the link, which would have made the publisher insert a duplicate.
+  // The fast path is removed entirely (see this module's top comment);
+  // these fixtures now simply confirm a real parse always resolves them
+  // correctly.
+  "Markdown escapes and character references in targets (fast path removed, always parses)", () => {
+    it("counts a link whose target contains a backslash-escaped hyphen", () => {
+      const markdown = "[[collection/Foo\\-Bar]]\n";
+      expect(countLinksTo({ markdown, target: "collection/Foo-Bar" })).toBe(1);
+    });
+
+    it("counts a link whose target contains a backslash-escaped underscore", () => {
+      const markdown = "[[collection/Foo\\_Bar]]\n";
+      expect(countLinksTo({ markdown, target: "collection/Foo_Bar" })).toBe(1);
+    });
+
+    it("counts a link whose target contains a backslash-escaped asterisk", () => {
+      const markdown = "[[collection/Foo\\*Bar]]\n";
+      expect(countLinksTo({ markdown, target: "collection/Foo*Bar" })).toBe(1);
+    });
+
+    it("counts a link whose target contains a named HTML character reference (&amp;)", () => {
+      const markdown = "[[collection/Foo&amp;Bar]]\n";
+      expect(countLinksTo({ markdown, target: "collection/Foo&Bar" })).toBe(1);
+    });
+
+    it("counts a link whose target contains a numeric HTML character reference (&#x26;)", () => {
+      const markdown = "[[collection/Foo&#x26;Bar]]\n";
+      expect(countLinksTo({ markdown, target: "collection/Foo&Bar" })).toBe(1);
     });
   });
 
@@ -204,46 +280,79 @@ describe("markdownLinks", () => {
     });
   });
 
-  describe("performance (round 6 scoped re-review MAJOR 2)", () => {
-    function buildFlatListMoc(entries: number): string {
-      const lines: string[] = [];
+  describe(// MAJOR 1 (2026-09-13 Codex frontier review round 6, third pass): the
+  // raw-substring fast path this module briefly had was removed entirely
+  // (see this module's top comment) because it could return a false "no
+  // link" for a target reachable only through a Markdown escape or
+  // character reference, which would make the publisher insert a
+  // duplicate note -- a correctness bug worse than the performance cost
+  // it was trying to avoid. `countLinksTo`/`hasLinkTo` now always parse;
+  // the single-entry parse cache (kept, since it never changes the
+  // result) is the only optimization left.
+  "performance (round 6 scoped re-review MAJOR 2; fast path removed in round 6 third pass)", () => {
+    function buildFlatListMoc(entries: number, salt: string): string {
+      const lines: string[] = [`<!-- salt: ${salt} -->`];
       for (let i = 0; i < entries; i++) {
         lines.push(`- [[collection/Fixture ${i}|Fixture ${i}]]`);
       }
       return `${lines.join("\n")}\n`;
     }
 
-    it(// Measured on this machine before the fast path: ~508ms at 10k
-    // entries, ~1.4s at 20k, ~13.8s at 50k (roughly quadratic in total
-    // MOC size, since VaultPublisher calls this once per publication).
-    // The substring fast path makes the target-absent case parse-free
-    // regardless of MOC size (measured well under 1ms at 20k); the
-    // target-present case still requires a real parse (measured ~1.4s at
-    // 20k, unaffected by the fast path since the substring genuinely is
-    // present), but a repeat call against the exact same MOC string
-    // reuses the single-entry parse cache (measured ~4ms). Ceilings here
-    // are deliberately generous for CI stability -- this documents an
-    // accepted, bounded per-call link-check cost, not the plan's
-    // protected full-collection scan.
-    "stays fast on a large flat-list MOC when the target is absent, and bounded when present", () => {
+    it(// Measured on this machine (always-parse, no fast path): ~500ms at
+    // 10k entries, ~1.3-1.4s at 20k, ~7-15s at 50k, for BOTH the
+    // absent-target and present-target cases (there is no longer a
+    // parse-free path for either) -- roughly linear-to-quadratic in
+    // total MOC size, since `VaultPublisher` calls this once per
+    // publication. This is an accepted, measured, documented per-call
+    // link-check cost, not the plan's protected full-collection scan;
+    // real collection MOCs are orders of magnitude smaller than this
+    // 20k-entry synthetic benchmark. A repeat call against the exact
+    // same markdown string reuses the single-entry parse cache (measured
+    // ~2-7ms), which is the only remaining optimization.
+    "documents the measured full-parse cost on a large flat-list MOC, for both an absent and a present target", () => {
       const entries = 20000;
-      const moc = buildFlatListMoc(entries);
+      // Two distinct strings (different "salt" comments) so the cache
+      // cannot silently turn either "cold" measurement into a hit.
+      const mocForAbsent = buildFlatListMoc(entries, "absent");
+      const mocForPresent = buildFlatListMoc(entries, "present");
       const absentTarget = "collection/absent-target-not-in-moc";
       const presentTarget = `collection/Fixture ${entries - 1}`;
 
       const absentStart = performance.now();
-      expect(countLinksTo({ markdown: moc, target: absentTarget })).toBe(0);
-      expect(performance.now() - absentStart).toBeLessThan(50);
+      expect(countLinksTo({ markdown: mocForAbsent, target: absentTarget })).toBe(0);
+      expect(performance.now() - absentStart).toBeLessThan(3000);
 
       const presentStart = performance.now();
-      expect(countLinksTo({ markdown: moc, target: presentTarget })).toBe(1);
+      expect(countLinksTo({ markdown: mocForPresent, target: presentTarget })).toBe(1);
       expect(performance.now() - presentStart).toBeLessThan(3000);
 
       // Same exact markdown string again -- the single-entry cache must
       // make this dramatically cheaper than the cold parse above.
       const cachedStart = performance.now();
-      expect(countLinksTo({ markdown: moc, target: presentTarget })).toBe(1);
+      expect(countLinksTo({ markdown: mocForPresent, target: presentTarget })).toBe(1);
       expect(performance.now() - cachedStart).toBeLessThan(500);
+    });
+
+    it(// MINOR (2026-09-13 Codex frontier review round 6, third pass): a
+    // cache-sequence regression -- the single-entry cache must never
+    // serve a stale result for even a one-character-different string,
+    // and reverting to the original string must re-hit correctly too
+    // (proving the cache key really is the current string's exact
+    // value, not some weaker fingerprint that could collide).
+    "does not serve a stale cached result across a one-character-modified-then-reverted sequence", () => {
+      const original = `- [[${TARGET}]]\n`;
+      const modified = `- [[${TARGET}]] \n`; // one added trailing space
+      const target = TARGET;
+
+      expect(countLinksTo({ markdown: original, target })).toBe(1);
+      expect(countLinksTo({ markdown: modified, target })).toBe(1);
+      expect(countLinksTo({ markdown: original, target })).toBe(1);
+
+      // A modification that actually changes the count must be seen
+      // too, not masked by a stale cache entry.
+      const withDuplicate = `- [[${TARGET}]]\n- [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown: withDuplicate, target })).toBe(2);
+      expect(countLinksTo({ markdown: original, target })).toBe(1);
     });
   });
 });
