@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-five further reviewer-driven correction rounds (packets 3, 4, 5, 6 and 7 —
+six further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7 and 8 —
 see those sections near the end). Task 6 as a whole is **not accepted**: F06
 fails on an unresolved operator decision, F07 fails on a confirmed external
 converter limit, and D01/D03 are confirmed limits/defects deliberately left
 unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **151 files / 2393 tests passed**, exit 0 both times.
+head, run twice: **152 files / 2422 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -325,6 +325,22 @@ Packet 7 (Codex frontier review round 5 fixes):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **151 files / 2393 tests passed**, exit 0; run 2 — **151 files / 2393 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 7's edits.
 
+Packet 8 (Codex scoped re-review round 6 fixes):
+
+- `npm run typecheck` — clean (no errors); confirms `remark`/`remark-parse`/`unified`/`unist-util-visit` import cleanly from the `.mjs` module under `allowJs`.
+- `npm run lint` — clean after `npm run lint:fix` (1 template-literal style fix; no logic changes).
+- `npx vitest run src/vault/markdownLinks.test.ts` — **13 passed / 13** (new file: plain/aliased link, plain-text-syntax probe, emphasis-split reassembly, all 8 named CommonMark edge cases, duplicate rejection).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **84 passed / 84** (7 new end-to-end regressions for 7 of the 8 constructs).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **27 passed / 27** (8 new cases covering all 8 constructs).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected by the TSDoc/named-param changes; `assertNotSymlink` call sites updated).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (1 new case: dangling `stateDirArg` symlink into a nonexistent live-vault path).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected; every row still routes through the shared, now `remark`-based, contract).
+- Standalone script confirmed the pre-fix hand-rolled `stripCodeAndInlineSpans`/`countLinksTo` returned the wrong count (2 instead of 1, or 0 instead of 1) for 5 of the 8 named constructs; the same script against the new `remark`-based implementation returned exactly 1 for all 8.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault after the rewrite — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2422 tests passed**, exit 0; run 2 — **152 files / 2422 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 8's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -500,6 +516,29 @@ existed, and the new "NONEXISTENT symlink target" `live-check-vault.test.ts`
 case failed against the pre-fix `resolveGuardedState` (`toThrow` received
 `undefined`) before `assertNotSymlink` was added. See "Verification run log"
 for the exact commands and the two full-suite runs required for this packet.
+
+## Packet 8: Codex scoped re-review round 6 fixes (2026-09-13)
+
+A scoped Codex re-review (label `task6-qualification-r6-scoped`) of the
+packet-7 diff (`89908ce...2a57d39`) returned issues-found: the round-5
+symlink guard and the `.mjs` import shape were confirmed closed/fine, but 2
+major, 2 minor and 1 nit findings remained, all on the round-6/packet-7 diff
+itself. All five are addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1+2 | `src/vault/markdownLinks.mjs`'s hand-rolled line-based fence/inline-span stripper was not CommonMark-correct: it missed fences indented 1-3 spaces, accepted a closing fence line with trailing non-whitespace text as if it closed the fence, accepted a backtick opener whose info string itself contained backticks (not a valid fence per CommonMark), and its same-line single-backtick-pair inline-span regex mishandled multi-backtick spans, multiline spans, and mismatched delimiter runs. Rather than extend the hand-rolled parser further, it was replaced entirely with the `remark`/`remark-parse`/`unified` toolchain already in the dependency tree (also used by `src/splitter/SemanticMarkdownSplitter.ts`; no new dependency): parses to an mdast tree, walks it skipping `code`/`inlineCode` nodes, and counts wikilinks in the remaining text. Verified by probe that remark (no wikilink plugin) treats `[[target]]`/`[[target\|alias]]` as ordinary literal text, and that a wikilink split across text nodes by an emphasis node (e.g. `[[collection/*Fixture*]]`) needs its per-paragraph text reassembled before matching -- both documented in the module. | `src/vault/markdownLinks.mjs` (rewritten), new `src/vault/markdownLinks.test.ts` (13 tests: plain link, aliased link, the plain-text probe, emphasis-split reassembly, all 8 named CommonMark edge cases, duplicate rejection), `src/vault/VaultPublisher.test.ts` (7 new end-to-end regressions covering 7 of the 8 constructs; the 4+-space-indented-code-block construct is deliberately not repeated as a full publish/insert round-trip there -- see the comment explaining why that specific construct's indentation semantics change once a list item precedes it, a correct CommonMark reparse, not a counting defect), `scripts/lib/qualification-contract.test.ts` (8 new cases covering all 8 constructs) |
+| MINOR 1 | `scripts/live-check-vault.test.ts` only had `resolveGuardedState` call-site fixtures for a symlink *alias directory* (pointing at the live vault root) and an external *config.yaml* symlinked into the live vault; it lacked a case for `stateDirArg` itself being a dangling symlink into a nonexistent live-vault path. | `scripts/live-check-vault.test.ts` (new case: dangling `stateDirArg` symlink into a nonexistent live-vault target, asserting rejection and that nothing is created at the dangling target or inside the live vault) |
+| MINOR 2 | `scripts/lib/vault-guard.mjs`'s round-5 edit left `isInsideLiveVault`'s original TSDoc block orphaned directly above the newly-inserted `isSymlinkPath`, and `isSymlinkPath` had no docblock of its own. | `scripts/lib/vault-guard.mjs` (TSDoc restored immediately above `isInsideLiveVault`; `isSymlinkPath` given its own docblock) |
+| NIT | `countLinksTo(markdown, target)` and `assertNotSymlink(candidatePath, label)` used same-typed positional parameters, against the repo convention of a named options object for functions with more than one parameter of the same type. | `src/vault/markdownLinks.mjs` (`countLinksTo`/`hasLinkTo` now take `{ markdown, target }`), `scripts/lib/vault-guard.mjs` (`assertNotSymlink` now takes `{ candidatePath, label }`), all call sites updated: `src/vault/VaultPublisher.ts`, `scripts/lib/qualification-contract.mjs`, `scripts/live-check-vault.mjs`, `scripts/lib/vault-guard.test.ts` |
+
+Both majors were verified test-first: a standalone script running the
+pre-fix hand-rolled `stripCodeAndInlineSpans`/`countLinksTo` against 5 of the
+8 constructs showed it returning the wrong count (2 instead of 1, or 0
+instead of 1) for every one of them; the same script against the new
+`remark`-based implementation returned exactly 1 for all 8 constructs. See
+"Verification run log" for the exact commands and the two full-suite runs
+required for this packet.
 
 ## What this packet does not claim
 
