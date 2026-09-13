@@ -30,10 +30,28 @@
 
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import { visit } from "unist-util-visit";
 
 /** One parser instance, reused across calls (parsing is the expensive part). */
 const processor = unified().use(remarkParse);
+
+/**
+ * Calls `visitor` on every node in the tree, depth-first, including `tree`
+ * itself. A small local replacement for `unist-util-visit`: that package is
+ * only a transitive dependency of `remark-parse`, not declared directly in
+ * `package.json` (controller finding, 2026-09-13), so relying on it via
+ * hoisting is a dependency-hygiene defect -- a future lockfile change could
+ * remove it and break this module (and `VaultPublisher.ts`, which imports
+ * it) at runtime with no `package.json` diff to explain why.
+ *
+ * @param {import("mdast").Node} node
+ * @param {(node: import("mdast").Node) => void} visitor
+ */
+function walk(node, visitor) {
+  visitor(node);
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) walk(child, visitor);
+  }
+}
 
 /**
  * mdast node types whose direct (non-code) text content this module treats
@@ -80,7 +98,7 @@ export function countLinksTo({ markdown, target }) {
 
   const tree = processor.parse(markdown);
   let count = 0;
-  visit(tree, (node) => {
+  walk(tree, (node) => {
     if (TEXT_CONTAINER_TYPES.has(node.type)) {
       count += (collectVisibleText(node).match(pattern) ?? []).length;
     }
