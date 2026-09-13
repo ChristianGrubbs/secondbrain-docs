@@ -22,6 +22,7 @@ import {
   IndexContentError,
   type IndexEntry,
   IndexVerificationError,
+  STORE_ENCODING_ID,
   VaultIndex,
   type VaultIndexOptions,
   VERIFY_PAGE_SIZE,
@@ -1702,6 +1703,280 @@ describe("VaultIndex", () => {
       const after = await reader.search({ query: "prunable", collection: COLLECTION });
       expect(after.results.map((r) => r.vault_path)).toEqual([note.path]);
       expect(after.results[0].digest).toBe(sha256(note.markdown));
+    });
+  });
+  describe("a generation that is only partly there", () => {
+    const VERSION = "2.0";
+
+    /**
+     * Builds a collection holding several notes at a nonempty version.
+     *
+     * Several, deliberately: the failure these fixtures guard against repairs
+     * whichever note a caller happens to be holding and strands the rest, which
+     * one note cannot show.
+     */
+    async function builtCollection(): Promise<{
+      vault: FakeVault;
+      index: VaultIndex;
+      notes: ReturnType<typeof sourceNote>[];
+    }> {
+      const vault = new FakeVault();
+      const notes = ["alphacite", "betacite", "gammacite"].map((phrase) => {
+        const note = sourceNote({
+          url: `https://example.com/${phrase}`,
+          title: phrase,
+          body: body(phrase),
+          version: VERSION,
+        });
+        vault.notes.set(note.path, note.markdown);
+        return note;
+      });
+
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(3);
+      return { vault, index, notes };
+    }
+
+    /** Asserts every note is retrievable by its own phrase, at its version. */
+    async function allRetrievable(
+      index: VaultIndex,
+      notes: ReturnType<typeof sourceNote>[],
+    ): Promise<void> {
+      for (const note of notes) {
+        const phrase = note.document.title;
+        const response = await index.search({
+          query: phrase,
+          collection: COLLECTION,
+          version: VERSION,
+        });
+        expect(
+          response.results.map((r) => r.vault_path),
+          `"${phrase}" should be retrievable`,
+        ).toEqual([note.path]);
+        expect(response.results[0].digest).toBe(sha256(note.markdown));
+      }
+    }
+
+    /**
+     * Rewrites a generation into the shape the previous release wrote.
+     *
+     * The manifest keeps the current shape and version — that is the point,
+     * because a shape check would not notice — and loses only the encoding
+     * stamp. The stored version key is rewritten to the encoding that release
+     * used: the lowercased label with a digest suffix.
+     */
+    function downgradeToPriorEncoding(index: VaultIndex): void {
+      const directory = activeGenerationDir(index);
+
+      const manifestFile = path.join(directory, "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      expect(manifest.version).toBe(2);
+      delete manifest.storeEncoding;
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+
+      const db = new Database(path.join(directory, "documents.db"));
+      try {
+        const priorKey = `${VERSION.toLowerCase()}-${sha256(VERSION).slice(0, 12)}`;
+        const changed = db.prepare("UPDATE versions SET name = ?").run(priorKey);
+        expect(changed.changes).toBeGreaterThan(0);
+      } finally {
+        db.close();
+      }
+    }
+
+    it("rebuilds a generation written by the previous store encoding", async () => {
+      const { index, notes } = await builtCollection();
+      downgradeToPriorEncoding(index);
+      await index.shutdown();
+
+      // A fresh instance, exactly as a later process would see it: a valid
+      // manifest of the current shape over a database keyed by a mapping this
+      // build no longer produces.
+      const reader = makeIndex(new FakeVault());
+      expect(
+        JSON.parse(
+          fs.readFileSync(
+            path.join(activeGenerationDir(reader), "manifest.json"),
+            "utf8",
+          ),
+        ).version,
+      ).toBe(2);
+
+      await allRetrievable(index, notes);
+    });
+
+    it("keeps every sibling reachable when an upsert meets the previous encoding", async () => {
+      const { index, notes } = await builtCollection();
+      downgradeToPriorEncoding(index);
+
+      // The capture path touches exactly one note. Repairing only that one and
+      // leaving the other two unreachable is the failure being guarded against.
+      const touched = notes[0];
+      const result = await index.upsert({
+        path: touched.path,
+        markdown: touched.markdown,
+        sourceUrl: touched.document.sourceUrl,
+        collection: COLLECTION,
+        version: VERSION,
+        digest: sha256(touched.markdown),
+      });
+      expect(result.status).toBe("indexed");
+
+      await allRetrievable(index, notes);
+    });
+
+    it("changes the encoding identity whenever the mapping changes", () => {
+      // The stamp is derived from the mapping, so it cannot be left behind by a
+      // future change to it. This asserts the derivation, not a literal.
+      expect(STORE_ENCODING_ID).toMatch(/^[0-9a-f]{16}$/);
+      const recomputed = sha256(
+        ["", "1.0", "Release", "release", " Release", "Release ", "   "]
+          .map(
+            (label) =>
+              `${label}=>${label === "" ? "" : `sv${sha256(label).slice(0, 20)}`}`,
+          )
+          .join("\u0000"),
+      ).slice(0, 16);
+      expect(STORE_ENCODING_ID).toBe(recomputed);
+    });
+
+    it("rebuilds when only the database file has been deleted", async () => {
+      const { index, notes } = await builtCollection();
+      await index.shutdown();
+
+      // Pointer intact, manifest intact and non-empty, database gone. Opening
+      // an existing generation with create semantics would make a fresh empty
+      // one and answer from it.
+      const database = path.join(activeGenerationDir(index), "documents.db");
+      fs.rmSync(database);
+      expect(fs.existsSync(path.join(activeGenerationDir(index), "manifest.json"))).toBe(
+        true,
+      );
+
+      await allRetrievable(index, notes);
+    });
+
+    it("rebuilds when the database file cannot be read as a store", async () => {
+      const { index, notes } = await builtCollection();
+      await index.shutdown();
+
+      fs.writeFileSync(
+        path.join(activeGenerationDir(index), "documents.db"),
+        "this is not a SQLite database, it is a sentence",
+        "utf8",
+      );
+
+      await allRetrievable(index, notes);
+    });
+
+    it("rebuilds when the database holds fewer chunks than the manifest records", async () => {
+      const { index, notes } = await builtCollection();
+      await index.shutdown();
+
+      const db = new Database(path.join(activeGenerationDir(index), "documents.db"));
+      try {
+        // The store's own triggers mirror every write into companion tables,
+        // one of which needs a loadable extension this fixture has no reason to
+        // carry. Dropping them first is part of the damage being simulated: a
+        // file that has been got at is not a file whose invariants still hold.
+        const triggers = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+          .all() as { name: string }[];
+        for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name}"`);
+
+        // One page's rows removed: manifest and database no longer agree, and
+        // the note they disagree about would simply never come back.
+        const removed = db
+          .prepare("DELETE FROM documents WHERE page_id = (SELECT MIN(id) FROM pages)")
+          .run();
+        expect(removed.changes).toBeGreaterThan(0);
+      } finally {
+        db.close();
+      }
+
+      await allRetrievable(index, notes);
+    });
+
+    it("rebuilds when the database holds a page the manifest does not name", async () => {
+      const { index, notes } = await builtCollection();
+      await index.shutdown();
+
+      const manifestFile = path.join(activeGenerationDir(index), "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      manifest.entries = manifest.entries.slice(1);
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+
+      await allRetrievable(index, notes);
+    });
+
+    it("refuses to promote a generation whose full-text index answers nothing", async () => {
+      const { index, notes } = await builtCollection();
+      const generation = activeGeneration(index);
+
+      // Chunk rows are one thing and the searchable index built beside them is
+      // another. Emptying the second leaves every count intact and every query
+      // unanswerable, so verification has to look at it before promoting.
+      const LEGACY = `${FOLDER}/Legacy Fts Trigger.md`;
+      const vault = new FakeVault();
+      for (const note of notes) vault.notes.set(note.path, note.markdown);
+      vault.hooks.push((args) => {
+        if (args[0] !== "read" || args[1] !== LEGACY) return;
+        const db = new Database(path.join(pendingGenerationDir(second), "documents.db"));
+        try {
+          // `documents_fts` carries its own content, so emptying it leaves
+          // every chunk row and every count exactly as they were, and leaves
+          // nothing for a query to match.
+          const removed = db.prepare("DELETE FROM documents_fts").run();
+          expect(removed.changes).toBeGreaterThan(0);
+        } finally {
+          db.close();
+        }
+      });
+      const second = makeIndex(vault);
+
+      await expect(
+        second.rebuild({ collection: COLLECTION, inventory: [LEGACY] }),
+      ).rejects.toBeInstanceOf(IndexVerificationError);
+
+      expect(activeGeneration(second)).toBe(generation);
+      await allRetrievable(index, notes);
+    });
+
+    it("still answers directly when every part of the generation is intact", async () => {
+      const { index, notes } = await builtCollection();
+
+      // The guard against over-triggering: a healthy generation must not be
+      // rebuilt on every question, or the repair path becomes the normal one.
+      const before = activeGeneration(index);
+      await allRetrievable(index, notes);
+      expect(activeGeneration(index)).toBe(before);
+    });
+
+    it("names the specific problem it found in the log", async () => {
+      const events: { event: string; ctx: Record<string, unknown> }[] = [];
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/logged",
+        title: "Logged",
+        body: body("loggable"),
+        version: VERSION,
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault, {
+        logger: (event) => events.push({ event: event.event, ctx: event.ctx }),
+      });
+      await index.rebuild({ collection: COLLECTION });
+      await index.shutdown();
+      fs.rmSync(path.join(activeGenerationDir(index), "documents.db"));
+
+      events.length = 0;
+      await index.search({ query: "loggable", collection: COLLECTION, version: VERSION });
+
+      const missing = events.find((entry) => entry.event === "index.state_missing");
+      expect(missing?.ctx.reason).toBe("database-missing");
+      expect(events.map((entry) => entry.event)).toContain("index.rebuilt");
     });
   });
 });

@@ -45,6 +45,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { EventBusService } from "../events";
 import { FetchStatus } from "../scraper/fetcher/types";
 import { PipelineFactory } from "../scraper/pipelines/PipelineFactory";
@@ -277,13 +278,59 @@ export interface IndexManifestEntry {
 
 /** The manifest file's on-disk shape. */
 interface IndexManifest {
+  /** Shape of this document. Orthogonal to {@link IndexManifest.storeEncoding}. */
   version: number;
   generation: string;
   /** Normalized collection this generation indexes, and only that one. */
   collection: string;
+  /**
+   * {@link STORE_ENCODING_ID} as it stood when this generation was written.
+   *
+   * The manifest version describes what this file looks like; this describes
+   * what the database beside it is keyed by. They change for different reasons
+   * and are checked separately.
+   */
+  storeEncoding: string;
   createdAt: string;
   entries: IndexManifestEntry[];
 }
+
+/** Why a generation cannot be used to answer a question. */
+export type IndexStateProblem =
+  /** No pointer: nothing has ever indexed this collection. */
+  | "never-built"
+  /** The pointer names a generation directory that is not there. */
+  | "generation-missing"
+  /** Absent, corrupt, foreign, or written in a manifest shape this build does not read. */
+  | "manifest-unreadable"
+  /** Written by a different version-key encoding, so its rows are unfindable. */
+  | "encoding-changed"
+  /** The manifest is intact and the database file is gone. */
+  | "database-missing"
+  /** The database file is there and cannot be read as this store. */
+  | "database-unreadable"
+  /** The database holds a different number of chunks than the manifest records. */
+  | "database-inconsistent";
+
+/** A generation that can be trusted to answer, together with its manifest. */
+interface UsableGeneration {
+  usable: true;
+  generation: string;
+  manifest: IndexManifest;
+}
+
+/** A generation that cannot, and the reason a caller must act on. */
+interface BrokenGeneration {
+  usable: false;
+  /** The generation the pointer named, or null when there was no pointer. */
+  generation: string | null;
+  problem: IndexStateProblem;
+  /** Human-readable specifics, for the log only. */
+  detail?: string;
+}
+
+/** The full answer to "can this collection's index be used as it stands?". */
+type GenerationInspection = UsableGeneration | BrokenGeneration;
 
 /** The pointer file's on-disk shape. */
 interface IndexPointer {
@@ -362,6 +409,33 @@ function storeVersion(version: string): string {
   return `sv${sha256(version).slice(0, 20)}`;
 }
 
+/**
+ * Labels the store encoding is fingerprinted over.
+ *
+ * They are chosen to exercise every branch the mapping has ever had: the
+ * unversioned case, an ordinary label, a case pair, and the whitespace shapes
+ * upstream's two normalizations disagree about.
+ */
+const ENCODING_PROBES = ["", "1.0", "Release", "release", " Release", "Release ", "   "];
+
+/**
+ * Identity of the mapping from version labels to stored version keys.
+ *
+ * This is computed from {@link storeVersion} rather than declared, and that is
+ * the whole point. A generation's rows are only findable by the encoding that
+ * wrote them, so changing the mapping silently orphans every existing index:
+ * the manifest still parses, the pointer still resolves, and the store is asked
+ * for a key it has never held — which is a successful empty answer, the one
+ * outcome this module is not allowed to produce. A declared constant would have
+ * to be remembered; a fingerprint of the function's own output cannot be
+ * forgotten, because any change to the mapping changes it in the same commit.
+ *
+ * It is recorded in every manifest and checked before a generation is trusted.
+ */
+export const STORE_ENCODING_ID = sha256(
+  ENCODING_PROBES.map((label) => `${label}=>${storeVersion(label)}`).join("\u0000"),
+).slice(0, 16);
+
 /** Builds the manifest key for one source identity within its collection. */
 function manifestKey(input: { version: string; sourceUrl: string }): string {
   return `${input.version}${KEY_SEPARATOR}${input.sourceUrl}`;
@@ -380,6 +454,31 @@ function writeFileAtomic(file: string, data: string): void {
     fs.closeSync(handle);
   }
   fs.renameSync(temporary, file);
+}
+
+/**
+ * Counts the chunks a generation's database actually holds.
+ *
+ * Opened read-only and with `fileMustExist`, so probing a generation can never
+ * be the thing that creates the file it is checking for. Only the `documents`
+ * table is touched, which needs no loadable extension.
+ *
+ * @param file Absolute path of the generation's `documents.db`.
+ * @returns The row count, or null when the file cannot be read as this store.
+ */
+function countStoredChunks(file: string): number | null {
+  let db: DatabaseType | null = null;
+  try {
+    db = new Database(file, { readonly: true, fileMustExist: true });
+    const row = db.prepare("SELECT COUNT(*) AS total FROM documents").get() as
+      | { total: number }
+      | undefined;
+    return typeof row?.total === "number" ? row.total : null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
 }
 
 /** Reads and parses a JSON file, returning null when absent or corrupt. */
@@ -660,7 +759,48 @@ export class VaultIndex {
       });
     }
 
-    const generation = await this.ensureGeneration(collection);
+    // A writing caller may start a collection nothing has indexed yet, but it
+    // must never write one note into derived state that is broken or foreign:
+    // that repairs the note in the caller's hand and leaves every one of its
+    // siblings unreachable. Anything short of usable is rebuilt first.
+    const generation = await this.usableGeneration(collection, {
+      loc: "VaultIndex.upsertLocked",
+      initializeWhenNew: true,
+    });
+
+    return this.indexIntoLocked({
+      collection,
+      generation,
+      entry,
+      markdown: current,
+      digest,
+      refreshed,
+    });
+  }
+
+  /**
+   * Writes one note into a generation the caller has already established is
+   * usable.
+   *
+   * Split out so a search's stale-hit refresh can reuse the generation it is
+   * already reading, rather than reclassifying — and so it can never trigger a
+   * rebuild underneath the pass that is iterating that generation's hits.
+   *
+   * @param input.generation Generation to write into; already inspected.
+   * @param input.markdown The note's current bytes, as read from the vault.
+   * @returns The upsert outcome for those bytes.
+   */
+  private async indexIntoLocked(input: {
+    collection: string;
+    generation: string;
+    entry: IndexEntry;
+    markdown: string;
+    digest: string;
+    refreshed: boolean;
+  }): Promise<IndexUpsertResult> {
+    this.assertHeld("VaultIndex.indexIntoLocked");
+
+    const { collection, generation, entry } = input;
     const service = await this.openStore(collection, generation);
 
     const indexed = await this.indexNote(service, {
@@ -668,7 +808,7 @@ export class VaultIndex {
       version: entry.version,
       sourceUrl: entry.sourceUrl,
       vaultPath: entry.path,
-      markdown: current,
+      markdown: input.markdown,
     });
     const chunks = indexed.chunks;
 
@@ -685,7 +825,7 @@ export class VaultIndex {
       vaultPath: entry.path,
       collection,
       version: entry.version,
-      digest,
+      digest: input.digest,
       chunkCount: chunks,
       indexedAt: this.now().toISOString(),
       legacy: false,
@@ -695,18 +835,24 @@ export class VaultIndex {
     this.logger({
       level: "info",
       event: "index.upserted",
-      loc: "VaultIndex.upsertLocked",
+      loc: "VaultIndex.indexIntoLocked",
       ctx: {
         generation,
         collection,
         version: entry.version,
         vaultPath: entry.path,
         chunks,
-        refreshed,
+        refreshed: input.refreshed,
       },
     });
 
-    return { status: "indexed", path: entry.path, digest, chunks, refreshed };
+    return {
+      status: "indexed",
+      path: entry.path,
+      digest: input.digest,
+      chunks,
+      refreshed: input.refreshed,
+    };
   }
 
   /**
@@ -731,36 +877,15 @@ export class VaultIndex {
     const version = query.version ?? "";
     const limit = query.limit ?? 10;
 
-    // Three states have to be told apart here, and only one of them is an
-    // answer. A generation whose manifest reads is answerable, empty or not:
-    // something built it, and "it holds nothing" is a fact about the vault. No
-    // pointer, a pointer naming a generation that is gone, or a manifest this
-    // build cannot read — including one written by the single-pointer layout
-    // that preceded per-collection indexes — are all *missing* derived state,
-    // which is a fact about this directory and about nothing else. Initializing
-    // an empty generation here and reporting `ok` with no results would answer
-    // a question about the vault with an observation about the state directory.
-    let generation = this.activeGeneration(collection);
-    const reason =
-      generation === null
-        ? "never-built"
-        : this.loadManifest(collection, generation) === null
-          ? "manifest-unreadable"
-          : null;
-
-    if (reason !== null) {
-      this.logger({
-        level: "warn",
-        event: "index.state_missing",
-        loc: "VaultIndex.searchLocked",
-        ctx: { collection, generation, reason },
-      });
-      generation = (await this.rebuildLocked({ collection })).generation;
-    }
-    if (generation === null) {
-      throw new Error(`no index generation for ${collection} after a rebuild`);
-    }
-    const active = generation;
+    // A reader never initializes. Everything this needs to tell apart — no
+    // pointer, a vanished generation, an unreadable or foreign manifest, an old
+    // store encoding, a missing or unreadable or inconsistent database — is
+    // decided in one place, and every one of them rebuilds rather than
+    // answering.
+    const active = await this.usableGeneration(collection, {
+      loc: "VaultIndex.searchLocked",
+      initializeWhenNew: false,
+    });
 
     // Keyed, and filled as the reasons are discovered rather than at the end:
     // a hit reconciled away on the first pass simply does not come back on the
@@ -817,15 +942,24 @@ export class VaultIndex {
         const digest = sha256(saved);
         if (digest !== entry.digest) {
           if (attempt === 0) {
-            // Refreshed under the caller's lock: the non-reentrant lock must
-            // not be reacquired here.
-            await this.upsertLocked({
-              path: entry.vaultPath,
-              markdown: saved,
-              sourceUrl: entry.sourceUrl,
+            // Refreshed under the caller's lock, into the generation this pass
+            // is already reading: the non-reentrant lock must not be reacquired
+            // here, and a reclassification must not move the generation out
+            // from under the loop.
+            await this.indexIntoLocked({
               collection,
-              version: entry.version,
+              generation: active,
+              entry: {
+                path: entry.vaultPath,
+                markdown: saved,
+                sourceUrl: entry.sourceUrl,
+                collection,
+                version: entry.version,
+                digest,
+              },
+              markdown: saved,
               digest,
+              refreshed: true,
             });
             refreshed += 1;
             repaired += 1;
@@ -1326,6 +1460,34 @@ export class VaultIndex {
         );
       }
     }
+
+    // Everything above reads the chunk rows directly, which proves they are
+    // there and proves nothing about the full-text index built beside them —
+    // and searching is the one thing this generation exists to do. A generation
+    // promoted with an unpopulated FTS index would answer every question with a
+    // successful empty result forever.
+    //
+    // The assertion is deliberately weak in the one way that matters: *some*
+    // hit, not a particular one. Which note a ranked search returns first is a
+    // ranking question and no business of verification — that conflation is
+    // what made an earlier probe reject sound rebuilds — but a token known to
+    // be in the index returning nothing at all is not a ranking question.
+    for (const [key, probe] of probes) {
+      const entry = expected.get(key);
+      if (entry === undefined) continue;
+      const hits = await service.searchStore(
+        input.collection,
+        storeVersion(entry.version),
+        probe,
+        1,
+      );
+      if (hits.length === 0) {
+        throw new IndexVerificationError(
+          `rebuilt index answers no search at all: "${probe}" is stored and finds nothing`,
+        );
+      }
+      return;
+    }
   }
 
   /**
@@ -1371,39 +1533,126 @@ export class VaultIndex {
   }
 
   /**
-   * Resolves a collection's active generation, if it has one.
+   * Decides whether a collection's derived state can answer as it stands.
    *
-   * "Has one" means the pointer exists *and* the generation it names is still
-   * on disk. Either being absent is missing derived state, never an empty
-   * index: the difference decides whether a caller may answer a question or has
-   * to rebuild first, and conflating them is how a search reports "nothing
-   * found" about a vault full of notes.
+   * A generation is five things — a pointer, a directory, a manifest, a
+   * database file, and rows inside it keyed by a particular encoding — and any
+   * of them can be present while another is not. Every one of those states used
+   * to end the same way: a query the store could not satisfy, reported as a
+   * successful empty result. An index that cannot answer must never be
+   * indistinguishable from an index with nothing to say, so all five are
+   * checked here, in one place, and every caller goes through it.
    *
-   * @returns The generation name, or null when this collection has no usable
-   *   derived state.
+   * The checks run cheapest first and stop at the first problem, so the common
+   * case costs a JSON read and one `COUNT(*)`.
+   *
+   * @param collection Normalized collection identifier.
+   * @returns The usable generation and its manifest, or the reason it is not.
    */
-  private activeGeneration(collection: string): string | null {
+  private inspectGeneration(collection: string): GenerationInspection {
     const pointer = readJson<IndexPointer>(this.pointerFile(collection));
-    if (pointer === null || typeof pointer.generation !== "string") return null;
-    if (!fs.existsSync(this.generationDir(collection, pointer.generation))) return null;
-    return pointer.generation;
+    if (pointer === null || typeof pointer.generation !== "string") {
+      return { usable: false, generation: null, problem: "never-built" };
+    }
+
+    const generation = pointer.generation;
+    const directory = this.generationDir(collection, generation);
+    if (!fs.existsSync(directory)) {
+      return { usable: false, generation, problem: "generation-missing" };
+    }
+
+    const manifest = this.loadManifest(collection, generation);
+    if (manifest === null) {
+      return { usable: false, generation, problem: "manifest-unreadable" };
+    }
+
+    if (manifest.storeEncoding !== STORE_ENCODING_ID) {
+      // The rows are all there and every one of them is keyed by a mapping this
+      // build no longer produces, so every query would miss.
+      return {
+        usable: false,
+        generation,
+        problem: "encoding-changed",
+        detail: `written by ${manifest.storeEncoding ?? "an unrecorded encoding"}, this build uses ${STORE_ENCODING_ID}`,
+      };
+    }
+
+    const database = path.join(directory, "documents.db");
+    if (!fs.existsSync(database)) {
+      return { usable: false, generation, problem: "database-missing" };
+    }
+
+    const stored = countStoredChunks(database);
+    if (stored === null) {
+      return { usable: false, generation, problem: "database-unreadable" };
+    }
+
+    const recorded = manifest.entries.reduce((sum, entry) => sum + entry.chunkCount, 0);
+    if (stored !== recorded) {
+      return {
+        usable: false,
+        generation,
+        problem: "database-inconsistent",
+        detail: `${stored} chunks stored, ${recorded} recorded`,
+      };
+    }
+
+    return { usable: true, generation, manifest };
   }
 
   /**
-   * Resolves a collection's active generation, initializing an empty one when
-   * it has none.
+   * Resolves a generation this caller may use, repairing the state if it must.
    *
-   * Only a caller that is *writing* may initialize: an upsert is being handed a
-   * note to index, so creating the collection's first generation is exactly
-   * what it was asked to do. A reader must never take this path — see
-   * {@link VaultIndex.searchLocked}, which rebuilds from discovery instead.
+   * @param collection Normalized collection identifier.
+   * @param options.loc Emitting location, for the log.
+   * @param options.initializeWhenNew Whether a collection nothing has ever
+   *   indexed may be initialized empty rather than rebuilt. A writing caller
+   *   sets this — it is holding the first note and there is nothing to lose. A
+   *   reader never does: an empty answer about an unbuilt collection is a
+   *   statement about the state directory dressed up as one about the vault.
+   * @returns A generation that {@link VaultIndex.inspectGeneration} accepts.
+   */
+  private async usableGeneration(
+    collection: string,
+    options: { loc: string; initializeWhenNew: boolean },
+  ): Promise<string> {
+    const inspection = this.inspectGeneration(collection);
+    if (inspection.usable) return inspection.generation;
+
+    if (inspection.problem === "never-built" && options.initializeWhenNew) {
+      return this.ensureGeneration(collection);
+    }
+
+    this.logger({
+      level: "warn",
+      event: "index.state_missing",
+      loc: options.loc,
+      ctx: {
+        collection,
+        generation: inspection.generation,
+        reason: inspection.problem,
+        ...(inspection.detail === undefined ? {} : { detail: inspection.detail }),
+      },
+    });
+
+    // Rebuilding is the only repair that restores every note rather than the
+    // one a caller happens to be holding.
+    return (await this.rebuildLocked({ collection })).generation;
+  }
+
+  /**
+   * Creates a collection's first generation, empty.
+   *
+   * Reached only from {@link VaultIndex.usableGeneration}, and only for a
+   * collection nothing has ever indexed *and* a caller that is writing: an
+   * upsert holding the first note is being asked to create exactly this. Every
+   * other state — including a generation that exists and is broken — rebuilds
+   * instead, because initializing over one of those would strand every note it
+   * already held.
    *
    * @returns The generation name that collection's pointer now names.
    */
-  private async ensureGeneration(collection: string): Promise<string> {
-    const existing = this.activeGeneration(collection);
-    if (existing !== null) return existing;
-
+  private ensureGeneration(collection: string): string {
     const generation = this.nextGenerationName(collection);
     fs.mkdirSync(this.generationDir(collection, generation), { recursive: true });
     this.saveManifest(collection, generation, this.emptyManifest(collection, generation));
@@ -1479,6 +1728,7 @@ export class VaultIndex {
       version: INDEX_MANIFEST_VERSION,
       generation,
       collection,
+      storeEncoding: STORE_ENCODING_ID,
       createdAt: this.now().toISOString(),
       entries: [],
     };
