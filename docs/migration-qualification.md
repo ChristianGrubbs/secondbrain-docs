@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-seven further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8 and
-9 — see those sections near the end). Task 6 as a whole is **not accepted**:
-F06 fails on an unresolved operator decision, F07 fails on a confirmed
-external converter limit, and D01/D03 are confirmed limits/defects
+eight further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9
+and 10 — see those sections near the end). Task 6 as a whole is **not
+accepted**: F06 fails on an unresolved operator decision, F07 fails on a
+confirmed external converter limit, and D01/D03 are confirmed limits/defects
 deliberately left unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **152 files / 2442 tests passed**, exit 0 both times.
+head, run twice: **152 files / 2457 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -358,6 +358,23 @@ Packet 9 (controller unist-util-visit fix + Codex scoped re-review round 7 fixes
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2442 tests passed**, exit 0; run 2 — **152 files / 2442 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 9's edits (the boundary sentinel is a Unicode Private Use Area character, `U+E000`, never a NUL byte).
 
+Packet 10 (Codex scoped re-review round 8 fixes, BLOCKER resolved):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npm run build` — clean.
+- `npx vitest run src/vault/markdownLinks.test.ts` — **38 passed / 38** (12 new cases: 5 Markdown-escape/character-reference fixtures, 1 imageReference fragmentation fixture, 2 U+E000-target fixtures, 1 cache-sequence regression, plus the performance test's absent-case ceiling widened from <50ms to <3000ms to reflect the always-parse design).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **90 passed / 90** (3 new end-to-end regressions: escaped-hyphen link, character-reference link, and U+E000-target link all recognized as already-linked, no duplicate inserted).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **34 passed / 34** (3 new acceptance cases: escaped-hyphen target, character-reference target, U+E000-containing target).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (unaffected).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected).
+- Both majors verified test-first: a standalone reproduction of the round-6-third-pass sentinel-character implementation returned 1 (bug, false positive) for a pseudo-link fragmented by an inline code span checked against a target containing the literal `U+E000` character, before the array-of-runs rewrite; the same reproduction against the new implementation returned 0. The escape/character-reference fixtures were confirmed to fail against the (now-removed) fast path before its removal. Benchmark re-measured with two distinct MOC strings (so the parse cache could not mask either "cold" measurement): absent-case and present-case both now cost ~500ms at 10k entries, ~1.3-1.4s at 20k, ~7-15s at 50k (no longer asymmetric, since there is no fast path); a repeat call on the exact same string still costs ~2-7ms via the retained single-entry cache.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault after the rewrite — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2457 tests passed**, exit 0; run 2 — **152 files / 2457 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 10's edits (every U+E000 fixture was written via an explicit `\uE000` JS/TS escape sequence, verified byte-for-byte, never a literal glyph typed through an edit tool, and never a NUL byte).
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -586,6 +603,26 @@ the exact commands; this round's coordinator guidance was "full suite once
 is enough for this change unless anything else changes" for the controller
 finding, but since the r7-scoped findings changed more, the full suite was
 run twice per the standing rule.
+
+## Packet 10: Codex scoped re-review round 8 fixes (2026-09-13, BLOCKER resolved)
+
+A scoped Codex re-review (label `task6-qualification-r8-scoped`) of the
+packet-9 diff (`3f7b1dd...fed86b6`) returned a **BLOCKER**: 2 major + 1 minor,
+both majors on the exact constructs round 8's own coordinator guidance had
+asked for the previous round, so the fix approach changed rather than just
+patching the prior fix. Both addressed with a design change, not a patch:
+
+| Finding | Decision and what changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1 | The raw-substring fast path ignored Markdown escapes (`\-`) and character references (`&amp;`/`&#x26;`) that remark resolves differently from the raw bytes, so `[[collection/Foo\-Bar]]` for target `collection/Foo-Bar` returned 0 unless unrelated markup happened to force the parse path -- the publisher would then insert a duplicate note. **The fast path and its gating regex (`POSSIBLE_FRAGMENTING_MARKUP`) are REMOVED entirely; `countLinksTo`/`hasLinkTo` always parse.** The single-entry parse cache is kept (correctness-preserving: it never changes the result, only whether a repeat call on the exact same string re-parses). The measured full-parse cost is now documented in the module's own top comment and here as an accepted, measured limit: ~508ms at 10k entries, ~1.4s at 20k, ~13.8s at 50k in a single flat-list MOC -- real collection MOCs are orders of magnitude smaller. No fast path, no threshold beyond the loose benchmark ceilings already present (the absent-target ceiling was raised from <50ms to <3000ms, since it is no longer parse-free). | `src/vault/markdownLinks.test.ts` (5 new cases: escaped hyphen/underscore/asterisk, named and numeric character references; performance test's absent-case ceiling widened and its own comment corrected), `src/vault/VaultPublisher.test.ts` (2 new end-to-end regressions: escaped-hyphen and character-reference links recognized as already-linked, no duplicate inserted), `scripts/lib/qualification-contract.test.ts` (2 new acceptance cases) |
+| MAJOR 2 | `U+E000` (the boundary sentinel introduced in round 6's third pass) is valid filename/source text -- nothing stops a real note title (user-controlled free text) from containing it, colliding with the sentinel and letting a fragmented pseudo-link falsely match a target that happens to contain that exact code point (confirmed by a standalone reproduction: the sentinel-based implementation returned 1, not 0, for this construct before the fix). **Boundaries are no longer serialized as a character at all.** `collectVisibleText` was replaced by `collectVisibleTextRuns`/`textRunsOf`, which appends into an ARRAY of independent text runs (mutated in place), starting a brand-new run at every opaque node and joining only transparent children (emphasis, strong, link, ...) into the current run; wikilinks are counted per run. No sentinel, no possible collision. | `src/vault/markdownLinks.test.ts` (2 new cases: a real, unfragmented link to a U+E000-containing target counts exactly once; a pseudo-link fragmented by an opaque node does not collide with such a target), `src/vault/VaultPublisher.test.ts` (1 new end-to-end regression), `scripts/lib/qualification-contract.test.ts` (1 new acceptance case) |
+| MINOR | `markdownLinks.test.ts` lacked a dedicated `imageReference` (`![alt][ref]`) fragmentation fixture (distinct mdast node type from a direct image) and a cache-sequence regression proving the single-entry cache never serves a stale result across a modify-then-revert sequence. | `src/vault/markdownLinks.test.ts` (1 new imageReference fixture; 1 new cache-sequence test: original → one-character-modified → original → a genuinely-different count → back to original, asserting the count at every step) |
+
+Both majors were verified test-first, including a direct reproduction of the
+U+E000 collision against the pre-fix sentinel-character implementation
+(returned 1, confirmed the bug, before switching to the array-of-runs
+design). See "Verification run log" for the exact commands and the two
+full-suite runs required for this packet.
 
 ## What this packet does not claim
 
