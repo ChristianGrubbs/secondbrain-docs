@@ -931,6 +931,106 @@ describe("qualifyNote", () => {
     },
   );
 
+  it(
+    // MAJOR (2026-09-13 Codex frontier review round 9, scoped): the alias
+    // group used to stop at the FIRST `]`, so an alias containing a
+    // literal `]` (a backslash escape, which remark resolves to a literal
+    // `]`) made the whole link fail to match, wrongly reporting MOC link
+    // count 0 for an actually-qualified note.
+    "accepts a MOC link whose alias contains a backslash-escaped closing bracket",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-KAPPA2-1034");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${target}|Foo\\]Bar]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-KAPPA2-1034"],
+        collection: "collection",
+        query: "FACT-KAPPA2-1034",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // Same bug shape, character reference: `&#93;` is resolved by remark
+    // to a literal `]`.
+    "accepts a MOC link whose alias contains a numeric HTML character reference for ]",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-LAMBDA2-1035");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${target}|Foo&#93;Bar]]\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-LAMBDA2-1035"],
+        collection: "collection",
+        query: "FACT-LAMBDA2-1035",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
+  it(
+    // MINOR 1 (2026-09-13 Codex frontier review round 9, scoped): an image
+    // REFERENCE (`![alt][ref]`) is a distinct mdast node type from a
+    // direct image, and lacked dedicated contract-level coverage.
+    "rejects a MOC whose only mention of the target is a pseudo-link fragmented by an image reference",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-MU2-1036");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `[[${target.slice(0, 5)}![alt][ref]${target.slice(5)}]]\n\n[ref]: https://example.com\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-MU2-1036"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

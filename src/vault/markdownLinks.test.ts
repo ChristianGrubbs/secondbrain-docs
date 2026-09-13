@@ -162,7 +162,7 @@ describe("markdownLinks", () => {
   // character, so a target containing this exact code point cannot
   // collide with anything.
   "target containing the former sentinel character (U+E000)", () => {
-    const PUA = "";
+    const PUA = "\uE000";
     const puaTarget = `collection/Foo${PUA}Bar`;
 
     it("counts a real, unfragmented link to a target containing U+E000 exactly once", () => {
@@ -216,6 +216,34 @@ describe("markdownLinks", () => {
     it("counts a link whose target contains a numeric HTML character reference (&#x26;)", () => {
       const markdown = "[[collection/Foo&#x26;Bar]]\n";
       expect(countLinksTo({ markdown, target: "collection/Foo&Bar" })).toBe(1);
+    });
+  });
+
+  describe(// MAJOR (2026-09-13 Codex frontier review round 9, scoped): the alias
+  // group `[^\]]*` stopped at the FIRST `]`, so an alias containing a
+  // literal `]` -- written as a backslash escape (remark resolves `\]`
+  // to a literal `]`) or an HTML character reference (`&#93;` also
+  // resolves to `]`) -- was cut short there, the regex never found the
+  // real `]]` closer, and the whole link failed to match at all
+  // (returning 0), which would make the publisher insert a duplicate
+  // note even though a real, well-formed link already exists.
+  "alias containing a literal ] via escape or character reference", () => {
+    it("counts a link whose alias contains a backslash-escaped closing bracket", () => {
+      const markdown = `[[${TARGET}|Foo\\]Bar]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it("counts a link whose alias contains a numeric HTML character reference for ] (&#93;)", () => {
+      const markdown = `[[${TARGET}|Foo&#93;Bar]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(1);
+    });
+
+    it(// The target portion must still be exact -- an alias's literal `]`
+    // must never let the match creep past the real closing `]]` into
+    // trailing document text.
+    "does not let an alias's literal ] swallow trailing document text past the real closing ]]", () => {
+      const markdown = `[[${TARGET}|Foo\\]Bar]] trailing text [[${TARGET}]]\n`;
+      expect(countLinksTo({ markdown, target: TARGET })).toBe(2);
     });
   });
 

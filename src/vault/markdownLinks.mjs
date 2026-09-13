@@ -226,7 +226,19 @@ function parseCached(markdown) {
  */
 export function countLinksTo({ markdown, target }) {
   const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`, "g");
+  // MAJOR (2026-09-13 Codex frontier review round 9, scoped): the alias
+  // group used to be `[^\]]*`, which stops at the FIRST `]`. An alias
+  // containing a literal `]` -- written as a backslash escape (`Foo\]Bar`,
+  // remark resolves this to a literal `]`) or an HTML character reference
+  // (`Foo&#93;Bar`, remark resolves this to `]` too) -- was cut short there,
+  // so the regex never found the real `]]` closer and returned 0, which
+  // would make the publisher insert a duplicate note. The alias group now
+  // matches ANY character, including a lone `]`, and only stops right
+  // before the actual closing `]]` (a negative lookahead per character,
+  // not a greedy/lazy match against a single excluded character), so a
+  // single `]` inside an alias is accepted and only a true `]]` ends the
+  // link. The target portion is untouched -- still an exact, escaped match.
+  const pattern = new RegExp(`\\[\\[${escaped}(\\|(?:(?!\\]\\]).)*)?\\]\\]`, "gs");
 
   const tree = parseCached(markdown);
   let count = 0;

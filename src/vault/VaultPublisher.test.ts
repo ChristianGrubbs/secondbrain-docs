@@ -1304,6 +1304,63 @@ describe("VaultPublisher review regressions", () => {
       expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
     });
 
+    it(// MAJOR (2026-09-13 Codex frontier review round 9, scoped): the
+    // alias group used to stop at the FIRST `]`, so an alias containing
+    // a literal `]` (written as a backslash escape, which remark
+    // resolves to a literal `]`) made the whole `[[target|alias]]` match
+    // fail entirely, and the publisher would insert a duplicate note.
+    "recognizes an existing link whose alias contains a backslash-escaped closing bracket as already linked", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${target}|Foo\\]Bar]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug shape, character reference: `&#93;` is resolved by remark
+    // to a literal `]`.
+    "recognizes an existing link whose alias contains a numeric HTML character reference for ] as already linked", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n- [[${target}|Foo&#93;Bar]]\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MINOR 1 (2026-09-13 Codex frontier review round 9, scoped): an
+    // image REFERENCE (`![alt][ref]`) is a distinct mdast node type from
+    // a direct image, and lacked dedicated end-to-end coverage: a
+    // pseudo-link fragmented by one must not be recognized as a live
+    // link, and the publisher must still add the real one.
+    "does not count a pseudo-link fragmented by an image reference as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n[[${target.slice(0, 5)}![alt][ref]${target.slice(5)}]]\n\n[ref]: https://example.com\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
     it("cannot be made to inject a second link through a hostile title", async () => {
       const publication = await publisher.publish(
         makeDocument({ title: "Innocent]]\n- [[Evil Injected Note|pwned" }),
