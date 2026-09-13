@@ -24,6 +24,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sha256 } from "../src/vault/identity";
+import { qualifyNote } from "../scripts/lib/qualification-contract.mjs";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const vaultCliEntry = path.join(projectRoot, "dist", "vault-cli.js");
@@ -279,70 +280,27 @@ async function assertQualifiedNote(options: {
   } = options;
   expect(outcome.publication?.status).toBe("published");
   const notePath = outcome.publication?.path ?? "";
-  expect(notePath.length, "outcome must carry a saved note path").toBeGreaterThan(0);
 
-  const savedBytes = fs.readFileSync(path.join(vaultPath, notePath), "utf8");
-  for (const fact of facts) {
-    expect(savedBytes, `expected fact ${JSON.stringify(fact)} in saved note ${notePath}`).toContain(
-      fact,
-    );
-  }
-
-  // Frontmatter identity metadata.
-  const sourceId = frontmatterField(savedBytes, "source_id");
-  expect(sourceId, `${notePath} frontmatter missing source_id`).toBeTruthy();
-  const frontmatterVersion = frontmatterField(savedBytes, "version");
-  expect(frontmatterVersion).toBe(version ?? "");
-  if (sourceUrlContains !== undefined) {
-    const sourceUrl =
-      frontmatterField(savedBytes, "source_url") ??
-      frontmatterField(savedBytes, "requested_url");
-    expect(sourceUrl, `${notePath} frontmatter source_url/requested_url`).toContain(
-      sourceUrlContains,
-    );
-  }
-
-  // Whole-note digest: the outcome's own digest (over the saved bytes) must
-  // match what is actually on disk right now.
-  expect(sha256(savedBytes)).toBe(outcome.publication?.digest);
-
-  // Exactly one MOC link for this note.
-  const moc = readMoc(path.dirname(notePath), vaultPath);
-  expect(countOccurrences(moc, mocLinkTarget(notePath)), `MOC link count for ${notePath}`).toBe(
-    1,
-  );
-
-  // `sb-docs search` resolves this note's identity under the right scope.
-  const searchArgs = [
-    "search",
-    query,
-    "--collection",
-    collection,
-    "--state-dir",
-    stateDirOverride,
-    "--json",
-  ];
-  if (version !== undefined) searchArgs.push("--version", version);
-  const found = await runVaultCli(searchArgs, { vaultPath, configFile: configFileOverride });
-  expect(found.code, `search "${query}" for ${notePath}`).toBe(0);
-  const results = (envelopeOf(found).results as Array<{
-    vault_path: string;
-    digest: string;
-  }>) ?? [];
-  const match = results.find((r) => r.vault_path === notePath);
-  expect(
-    match,
-    `search "${query}" should resolve ${notePath}; got ${JSON.stringify(results)}`,
-  ).toBeDefined();
-  expect(match?.digest).toBe(outcome.publication?.digest);
-
-  // `sb-docs read` returns the complete saved bytes.
-  const readBack = await runVaultCli(["read", notePath], {
+  const result = await qualifyNote({
     vaultPath,
-    configFile: configFileOverride,
+    notePath,
+    expectedDigest: outcome.publication?.digest,
+    facts,
+    collection,
+    query,
+    version: version ?? "",
+    sourceUrlContains,
+    runCli: async (args: string[]) => {
+      const withStateDir = args[0] === "read" ? args : [...args, "--state-dir", stateDirOverride];
+      const run = await runVaultCli(withStateDir, {
+        vaultPath,
+        configFile: configFileOverride,
+      });
+      return { code: run.code ?? 1, stdout: run.stdout, stderr: run.stderr };
+    },
   });
-  expect(readBack.code, `read ${notePath}`).toBe(0);
-  expect(readBack.stdout).toBe(`${savedBytes}\n`);
+
+  expect(result.ok, result.reason ?? "qualifyNote failed with no reason").toBe(true);
 }
 
 describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", () => {
@@ -746,16 +704,31 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(first.code).toBe(0);
-    const notePath = (
-      envelopeOf(first).outcomes as Array<{ publication?: { path: string } }>
-    )[0].publication?.path as string;
+    const firstOutcome = (
+      envelopeOf(first).outcomes as Array<{
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>
+    )[0];
+    const notePath = firstOutcome.publication?.path as string;
+
+    // MAJOR C (2026-09-13 Codex frontier review, round 2): the full
+    // contract on the initial publication, before the human edit -- not
+    // only checked after the conflict, which previously left the first
+    // capture's own facts/frontmatter/digest/MOC-link/search/read
+    // unverified.
+    await assertQualifiedNote({
+      outcome: firstOutcome,
+      facts: ["SNOZZBERRY-3301", "original body"],
+      query: "SNOZZBERRY-3301",
+      collection: "f11-edited",
+      version: "",
+      sourceUrlContains: "editable.md",
+    });
 
     // A human appends a note directly in the vault, outside any capture.
     const before = fs.readFileSync(path.join(sandbox, notePath), "utf8");
-    fs.writeFileSync(
-      path.join(sandbox, notePath),
-      `${before}\n> HUMAN-EDIT-4401: manual annotation, must survive recapture.\n`,
-    );
+    const expectedAfterEdit = `${before}\n> HUMAN-EDIT-4401: manual annotation, must survive recapture.\n`;
+    fs.writeFileSync(path.join(sandbox, notePath), expectedAfterEdit);
 
     // The upstream source is unchanged but the saved note's whole-note
     // digest no longer matches what capture last wrote, so this is a manual
@@ -776,9 +749,20 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       envelopeOf(second).outcomes as Array<{ publication?: { status: string; moc: string } }>
     )[0].publication;
     expect(secondOutcome?.status).toBe("conflict");
+
+    // MAJOR C: exact whole-note byte equality, not just two surviving
+    // substrings (other manual bytes -- e.g. the blank line, the original
+    // frontmatter, the exact quote-block formatting -- could otherwise
+    // silently vanish and still pass a substring-only check).
     const after = fs.readFileSync(path.join(sandbox, notePath), "utf8");
-    expect(after).toContain("HUMAN-EDIT-4401");
-    expect(after).toContain("SNOZZBERRY-3301");
+    expect(after).toBe(expectedAfterEdit);
+
+    // Retrieval after the conflict still returns the complete manually
+    // edited bytes -- the conflict must not have clobbered anything a
+    // reader would see.
+    const readAfterConflict = await runVaultCli(["read", notePath]);
+    expect(readAfterConflict.code).toBe(0);
+    expect(readAfterConflict.stdout).toBe(`${expectedAfterEdit}\n`);
   });
 
   it("F12: an acquisition failure (404 root) is a genuine no-useful-publication exit 1", async () => {
@@ -1056,59 +1040,34 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         ).toBe("published");
       }
 
-      // XML and JSON share the query "WonderWidgets" (both fixtures encode
-      // the same slideshow data in different formats): scope each search to
-      // its own note by also checking file identity, since a shared query
-      // resolves multiple notes in the same collection.
+      // MAJOR C (2026-09-13 Codex frontier review, round 2): every member
+      // now runs the full contract (facts, frontmatter identity, digest,
+      // one MOC link, search identity, full read) via `qualifyNote`, not
+      // just facts + digest + MOC + a separately re-derived search check.
+      // `qualifyNote`'s search step only requires this note's identity to
+      // be present among the results, so XML and JSON legitimately sharing
+      // the query "WonderWidgets" is not a problem.
       for (const expected of expectedMembers) {
         const outcome = outcomes.find((o) => o.sourceUrl.endsWith(`/${expected.member}`));
         expect(outcome, `outcome for ${expected.member}`).toBeDefined();
         const notePath = outcome?.publication?.path ?? "";
-        const savedBytes = fs.readFileSync(path.join(sandbox, notePath), "utf8");
-        for (const fact of expected.facts) {
-          expect(savedBytes, `${expected.member} missing fact ${JSON.stringify(fact)}`).toContain(
-            fact,
-          );
-        }
-        expect(sha256(savedBytes)).toBe(outcome?.publication?.digest);
-
-        const moc = readMoc(path.dirname(notePath));
-        expect(
-          countOccurrences(moc, mocLinkTarget(notePath)),
-          `MOC link count for ${notePath}`,
-        ).toBe(1);
-
-        const readBack = await runVaultCli(["read", notePath]);
-        expect(readBack.code).toBe(0);
-        expect(readBack.stdout).toBe(`${savedBytes}\n`);
-      }
-
-      // Search identity, scoped per member (not via the shared helper here
-      // because two members legitimately share a query term).
-      const searchTargets = new Map(
-        outcomes.map((o) => [o.sourceUrl.split("/").pop() ?? "", o]),
-      );
-      for (const expected of expectedMembers) {
-        const outcome = searchTargets.get(expected.member);
-        const notePath = outcome?.publication?.path ?? "";
-        const found = await runVaultCli([
-          "search",
-          expected.query,
-          "--collection",
-          "f20-zip",
-          "--state-dir",
-          stateDir,
-          "--json",
-        ]);
-        expect(found.code, `search "${expected.query}"`).toBe(0);
-        const results =
-          (envelopeOf(found).results as Array<{ vault_path: string; digest: string }>) ?? [];
-        const match = results.find((r) => r.vault_path === notePath);
-        expect(
-          match,
-          `search "${expected.query}" should resolve ${notePath}; got ${JSON.stringify(results)}`,
-        ).toBeDefined();
-        expect(match?.digest).toBe(outcome?.publication?.digest);
+        const result = await qualifyNote({
+          vaultPath: sandbox,
+          notePath,
+          expectedDigest: outcome?.publication?.digest,
+          facts: expected.facts,
+          collection: "f20-zip",
+          query: expected.query,
+          version: "",
+          sourceUrlContains: expected.member,
+          runCli: async (args: string[]) => {
+            const withStateDir =
+              args[0] === "read" ? args : [...args, "--state-dir", stateDir];
+            const run = await runVaultCli(withStateDir);
+            return { code: run.code ?? 1, stdout: run.stdout, stderr: run.stderr };
+          },
+        });
+        expect(result.ok, `${expected.member}: ${result.reason ?? "unknown failure"}`).toBe(true);
       }
     },
   );
@@ -1248,6 +1207,24 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         expect(
           fs.existsSync(path.join(vaultPath, "30 Tools-Models/Doc Sets/MixedCase-Docs/index.md")),
         ).toBe(true);
+        const firstOutcome = (
+          envelopeOf(first).outcomes as Array<{
+            publication?: { status: string; path: string; markdown: string; digest?: string };
+          }>
+        )[0];
+        // MAJOR C (2026-09-13 Codex frontier review, round 2): qualify both
+        // captures fully, not only their exit codes and the folder count.
+        await assertQualifiedNote({
+          outcome: firstOutcome,
+          facts: ["C04-MIXEDCASE-1004"],
+          query: "C04-MIXEDCASE-1004",
+          collection: "MixedCase-Docs",
+          version: "",
+          sourceUrlContains: "c04-first.txt",
+          vaultPath,
+          stateDirOverride: statePath,
+          configFileOverride: configPath,
+        });
 
         const secondFile = path.join(sourceDir, "c04-second.txt");
         fs.writeFileSync(secondFile, "C04-MIXEDCASE-1005 second capture reuses the same folder.\n");
@@ -1259,6 +1236,22 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
           { vaultPath, configFile: configPath },
         );
         expect(second.code).toBe(0);
+        const secondOutcome = (
+          envelopeOf(second).outcomes as Array<{
+            publication?: { status: string; path: string; markdown: string; digest?: string };
+          }>
+        )[0];
+        await assertQualifiedNote({
+          outcome: secondOutcome,
+          facts: ["C04-MIXEDCASE-1005"],
+          query: "C04-MIXEDCASE-1005",
+          collection: "mixedcase-docs",
+          version: "",
+          sourceUrlContains: "c04-second.txt",
+          vaultPath,
+          stateDirOverride: statePath,
+          configFileOverride: configPath,
+        });
 
         // The required invariant is "no second case variant" (a genuinely
         // new sibling folder differing only by case), not preservation of
@@ -1358,122 +1351,341 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       }
     });
 
-    /** Live pids of any process whose command line touches the cached Playwright browser. */
-    function playwrightPids(): string[] {
+    interface PsEntry {
+      pid: number;
+      ppid: number;
+      command: string;
+    }
+
+    /** One snapshot of every live process on the machine (pid, ppid, full command line). */
+    function psSnapshot(): PsEntry[] {
+      const raw = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" });
+      return raw
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const match = line.match(/^(\d+)\s+(\d+)\s+(.*)$/);
+          if (!match) return null;
+          return { pid: Number(match[1]), ppid: Number(match[2]), command: match[3] };
+        })
+        .filter((entry): entry is PsEntry => entry !== null);
+    }
+
+    /**
+     * Every live descendant of `rootPid` (any depth), walked from a single
+     * `ps` snapshot rather than a machine-wide substring match — this is
+     * what makes the assertion immune to other concurrently-running test
+     * files' own Chromium processes under vitest parallelism (MAJOR B,
+     * 2026-09-13 Codex frontier review, round 2; a prior version of this
+     * test used a machine-wide `pgrep -f ms-playwright`, which the
+     * coordinator's independent full-`npm test` run demonstrated flaking
+     * when other suites launched Chromium concurrently).
+     */
+    function descendantsOf(rootPid: number, snapshot: PsEntry[]): PsEntry[] {
+      const byParent = new Map<number, PsEntry[]>();
+      for (const entry of snapshot) {
+        const siblings = byParent.get(entry.ppid) ?? [];
+        siblings.push(entry);
+        byParent.set(entry.ppid, siblings);
+      }
+      const result: PsEntry[] = [];
+      const queue = [rootPid];
+      while (queue.length > 0) {
+        const pid = queue.shift() as number;
+        for (const child of byParent.get(pid) ?? []) {
+          result.push(child);
+          queue.push(child.pid);
+        }
+      }
+      return result;
+    }
+
+    /** This child's own Chromium descendants (by ancestry, not a global command-line match). */
+    function chromiumDescendantsOf(rootPid: number): PsEntry[] {
+      return descendantsOf(rootPid, psSnapshot()).filter((e) => /ms-playwright/.test(e.command));
+    }
+
+    /** The `--user-data-dir=<path>` Playwright passed to one Chromium command line, if any. */
+    function userDataDirOf(command: string): string | undefined {
+      return command.match(/--user-data-dir=(\S+)/)?.[1];
+    }
+
+    /** Polls until `predicate()` returns a non-empty/truthy value, or the timeout elapses. */
+    async function pollUntil<T>(
+      predicate: () => T,
+      { timeoutMs, intervalMs = 200 }: { timeoutMs: number; intervalMs?: number },
+    ): Promise<T> {
+      const deadline = Date.now() + timeoutMs;
+      let last: T = predicate();
+      while (Date.now() < deadline) {
+        last = predicate();
+        if (Array.isArray(last) ? last.length > 0 : Boolean(last)) return last;
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+      return last;
+    }
+
+    /** True if `pid` is still a live process (per POSIX kill(pid, 0) semantics). */
+    function isAlive(pid: number): boolean {
       try {
-        return execFileSync("pgrep", ["-f", "ms-playwright"], { encoding: "utf8" })
-          .trim()
-          .split("\n")
-          .filter(Boolean);
+        process.kill(pid, 0);
+        return true;
       } catch {
-        return [];
+        return false;
       }
     }
 
-    /** Directories under the system temp root whose name looks like a Playwright browser profile. */
-    function playwrightProfileDirs(): string[] {
+    /**
+     * Runs one signal-cleanup case: spawns a browser-rendered capture whose
+     * child page NEVER responds (so the process cannot finish naturally,
+     * closing the "waits for natural completion" loophole), waits for a
+     * real Chromium descendant of THIS child's own pid to appear, sends
+     * the signal, and reports what happened for the caller to assert on.
+     */
+    async function runSignalCleanupCase(
+      signal: "SIGINT" | "SIGTERM" | "SIGHUP",
+      options: { disableCleanup?: boolean } = {},
+    ): Promise<{
+      chromiumFoundBeforeSignal: PsEntry[];
+      userDataDir: string | undefined;
+      chromiumStillAliveAfter: PsEntry[];
+      userDataDirLeaked: boolean;
+      hostStillAlive: boolean;
+      closeCode: number | null;
+      closeSignal: NodeJS.Signals | null;
+      childPid: number;
+    }> {
+      const server = http.createServer((req, res) => {
+        if (req.url === "/llms.txt") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        if (req.url === "/") {
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(
+            `<html><body><h1>SIGCLEAN-ROOT</h1><a href="${baseUrl}/slow">Slow</a></body></html>`,
+          );
+          return;
+        }
+        // "/slow": never respond. The capture can never finish naturally,
+        // so any observed cleanup is genuinely caused by the signal.
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("bind failed");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+
+      let childPid = 0;
+      let closeCode: number | null = null;
+      let closeSignal: NodeJS.Signals | null = null;
+      let resolveClosed = (): void => undefined;
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
+
+      const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-sigclean-log-"));
+      const logFile = path.join(logDir, "listen.log");
+      const proc = spawn(
+        vaultCliEntry,
+        [
+          "capture",
+          `${baseUrl}/`,
+          "--collection",
+          `sigclean-${signal.toLowerCase()}${options.disableCleanup ? "-negctl" : ""}`,
+          "--max-pages",
+          "5",
+          "--max-depth",
+          "1",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ],
+        {
+          cwd: projectRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            VITEST_WORKER_ID: undefined,
+            NODE_OPTIONS: [
+              process.env.NODE_OPTIONS,
+              `--import ${pathToFileURL(listenGuard).href}`,
+            ]
+              .filter(Boolean)
+              .join(" "),
+            SB_DOCS_LISTEN_LOG: logFile,
+            OBSIDIAN_VAULT: sandbox,
+            DOCS_MCP_CONFIG: configFile,
+            ...(options.disableCleanup
+              ? { SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP: "1" }
+              : {}),
+          },
+        },
+      );
+      childPid = proc.pid ?? 0;
+      proc.on("close", (code, sig) => {
+        closeCode = code;
+        closeSignal = sig;
+        resolveClosed();
+      });
+
       try {
-        return fs
-          .readdirSync(os.tmpdir())
-          .filter((name) => /playwright/i.test(name))
-          .map((name) => path.join(os.tmpdir(), name));
-      } catch {
-        return [];
+        // Synchronize on THIS child's own browser launch, not a fixed
+        // delay: poll for a Chromium process whose ancestry leads back to
+        // childPid.
+        const chromiumFoundBeforeSignal = await pollUntil(() => chromiumDescendantsOf(childPid), {
+          timeoutMs: 20_000,
+          intervalMs: 250,
+        });
+
+        const userDataDir = chromiumFoundBeforeSignal
+          .map((e) => userDataDirOf(e.command))
+          .find((dir): dir is string => dir !== undefined);
+
+        proc.kill(signal);
+
+        // Give the signal handler (Playwright's own, or the CLI's for
+        // SIGINT) time to act, polling until every previously-found
+        // Chromium descendant pid is gone or the timeout elapses (this
+        // loop's exit condition is the opposite of `pollUntil`'s, which
+        // stops on the first non-empty result -- here we want to stop once
+        // the "still alive" set becomes empty).
+        const deadline = Date.now() + 8_000;
+        let finalStillAlive = chromiumFoundBeforeSignal.filter((e) => isAlive(e.pid));
+        while (finalStillAlive.length > 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          finalStillAlive = chromiumFoundBeforeSignal.filter((e) => isAlive(e.pid));
+        }
+
+        const userDataDirLeaked = userDataDir !== undefined && fs.existsSync(userDataDir);
+        const hostStillAlive = isAlive(childPid);
+
+        // Wait briefly for a natural close (SIGINT's bridged case), without
+        // blocking forever on SIGTERM/SIGHUP against a hung fixture.
+        await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 500))]);
+
+        return {
+          chromiumFoundBeforeSignal,
+          userDataDir,
+          chromiumStillAliveAfter: finalStillAlive,
+          userDataDirLeaked,
+          hostStillAlive,
+          closeCode,
+          closeSignal,
+          childPid,
+        };
+      } finally {
+        // Test cleanup: the fixture never completes naturally for
+        // SIGTERM/SIGHUP (the "/slow" request never responds), so the host
+        // process must be force-killed regardless of outcome.
+        if (isAlive(childPid)) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
+        for (const entry of chromiumDescendantsOf(childPid)) {
+          try {
+            process.kill(entry.pid, "SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(logDir, { recursive: true, force: true });
       }
     }
 
     it.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)(
-      // MAJOR 1 (2026-09-13 Codex frontier review): a real %s sent to a
-      // browser-rendered capture must not leak Chromium descendant
-      // processes or their temp profile directories — regardless of
-      // whether the CLI itself bridges that signal into cancellation
-      // (only SIGINT is bridged; SIGTERM/SIGHUP rely entirely on
-      // Playwright's own default handlers, deliberately left enabled in
-      // BrowserFetcher.launchBrowser for exactly this reason).
-      "%s during a browser-rendered capture leaves no Chromium descendants or leaked temp profile dirs",
+      // MAJOR 1 / MAJOR B (2026-09-13 Codex frontier review, rounds 1 and
+      // 2): a real %s sent to a browser-rendered capture must not leak
+      // Chromium descendant processes or their temp profile directory —
+      // regardless of whether the CLI itself bridges that signal into
+      // cancellation (only SIGINT is bridged; SIGTERM/SIGHUP rely entirely
+      // on Playwright's own default handlers). The fixture page never
+      // responds, so the process cannot finish naturally and satisfy this
+      // test by ordinary shutdown; the Chromium descendant set and temp
+      // profile dir are THIS child's own (via ps ancestry), not a
+      // machine-wide match that other concurrent test files' browsers could
+      // satisfy.
+      "%s during a browser-rendered capture leaves no Chromium descendants or a leaked temp profile dir",
       async (signal) => {
-        const server = http.createServer((req, res) => {
-          // Short enough to keep this test's wall time bounded even when
-          // SIGTERM/SIGHUP don't cancel the run (only SIGINT does): the CLI
-          // simply finishes naturally a couple of seconds after signalling.
-          const delayMs = req.url === "/slow" ? 6000 : 0;
-          setTimeout(() => {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            if (req.url === "/") {
-              res.end(
-                `<html><body><h1>SIGCLEAN-ROOT</h1><a href="${baseUrl}/slow">Slow</a></body></html>`,
-              );
-              return;
-            }
-            res.end("<html><body><h1>SIGCLEAN-SLOW</h1></body></html>");
-          }, delayMs);
-        });
-        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-        const address = server.address();
-        if (address === null || typeof address === "string") throw new Error("bind failed");
-        const baseUrl = `http://127.0.0.1:${address.port}`;
-
-        const profilesBefore = new Set(playwrightProfileDirs());
-        let pidsAtSignalTime: string[] = [];
-
-        try {
-          await runVaultCli(
-            [
-              "capture",
-              `${baseUrl}/`,
-              "--collection",
-              `sigclean-${signal.toLowerCase()}`,
-              "--max-pages",
-              "5",
-              "--max-depth",
-              "1",
-              "--state-dir",
-              stateDir,
-              "--json",
-            ],
-            {
-              onSpawn: (proc) => {
-                setTimeout(() => {
-                  // Chromium has launched and the root page has published by
-                  // now (same 4s window X03 uses); record the live pids
-                  // right before signaling so the post-signal check has an
-                  // exact set to prove is gone, rather than a fuzzy "no
-                  // playwright pids anywhere" check that could be fooled by
-                  // an unrelated concurrent test run.
-                  pidsAtSignalTime = playwrightPids();
-                  proc.kill(signal);
-                }, 4000);
-              },
-            },
-          );
-        } finally {
-          await new Promise<void>((resolve) => server.close(() => resolve()));
-        }
+        const result = await runSignalCleanupCase(signal);
 
         expect(
-          pidsAtSignalTime.length,
-          "expected Chromium to actually be running at signal time for this test to prove anything",
+          result.chromiumFoundBeforeSignal.length,
+          "expected a Chromium descendant of this child to actually be running before signalling",
         ).toBeGreaterThan(0);
+        expect(result.userDataDir, "expected a --user-data-dir on the Chromium command line").toBeDefined();
 
-        // Grace period for Playwright's own cleanup handlers to reap the
-        // browser process tree.
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-
-        const stillAlive = pidsAtSignalTime.filter((pid) => playwrightPids().includes(pid));
         expect(
-          stillAlive,
-          `Chromium descendants from signal time still alive after ${signal}: ${stillAlive.join(", ")}`,
+          result.chromiumStillAliveAfter.map((e) => e.pid),
+          `this child's own Chromium descendants still alive after ${signal}`,
         ).toEqual([]);
+        expect(result.userDataDirLeaked, `temp profile dir leaked after ${signal}`).toBe(false);
 
-        const leakedProfiles = playwrightProfileDirs().filter(
-          (dir) => !profilesBefore.has(dir),
-        );
-        expect(
-          leakedProfiles,
-          `temp profile dirs leaked after ${signal}: ${leakedProfiles.join(", ")}`,
-        ).toEqual([]);
+        if (signal === "SIGINT") {
+          // The CLI bridges SIGINT into graceful cancellation and exits
+          // itself -- assert the actual delivered outcome.
+          expect(result.closeCode).toBe(130);
+        } else {
+          // SIGTERM/SIGHUP are not bridged by the CLI; with the fixture
+          // page never responding, the host process is expected to still
+          // be alive (only the browser was reaped) -- proving the browser
+          // cleanup was genuinely caused by Playwright's own signal
+          // handler, not by the host process exiting on its own.
+          expect(result.hostStillAlive, "expected the host process to still be alive").toBe(true);
+        }
       },
       30_000,
+    );
+
+    it(
+      // MAJOR B negative control (2026-09-13 Codex frontier review, round
+      // 2): proves the assertion mechanism itself -- not just this one
+      // lucky run -- actually detects a leaked descendant. A genuine
+      // leaked process is spawned directly (a real, long-lived child whose
+      // pid this test controls) and the exact same liveness-filtering
+      // logic the SIGINT/SIGTERM/SIGHUP tests use is applied to it,
+      // proving that a real leak would show up as non-empty rather than
+      // being silently swallowed.
+      //
+      // (`SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1` was tried as a full
+      // end-to-end negative control first, per the coordinator's ask, but
+      // disabling Playwright's own SIGTERM/SIGHUP handling also removes
+      // Node's *only* listener for that signal, so the host process itself
+      // dies on the default disposition -- and Chromium's CDP pipe
+      // transport treats the parent's death as its own shutdown signal
+      // regardless of `handleSIGTERM`/`handleSIGHUP`, closing the browser
+      // as a side effect of the host dying rather than of any cleanup
+      // logic. That makes it unable to isolate "cleanup disabled" from
+      // "host process gone", so it cannot demonstrate the intended failure
+      // mode. `chromium.launch()` still accepts and forwards the env-gated
+      // override (see `BrowserFetcher.test.ts`), documented here for any
+      // future negative control that can isolate the two.)
+      "negative control: a genuinely leaked descendant is detected as still alive by the same check",
+      async () => {
+        const leaked = spawn("sleep", ["30"], { stdio: "ignore" });
+        try {
+          expect(leaked.pid, "expected the dummy leaked process to have a pid").toBeDefined();
+          const fakeChromiumEntry = {
+            pid: leaked.pid as number,
+            ppid: process.pid,
+            command: "/fake/ms-playwright/chrome-headless-shell --user-data-dir=/tmp/fake",
+          };
+
+          // The exact filter the real assertions use.
+          const stillAlive = [fakeChromiumEntry].filter((e) => isAlive(e.pid));
+          expect(
+            stillAlive.map((e) => e.pid),
+            "the leaked dummy process should be detected as still alive",
+          ).toEqual([leaked.pid]);
+        } finally {
+          leaked.kill("SIGKILL");
+        }
+      },
     );
   });
 
@@ -1851,9 +2063,24 @@ describe.skipIf(!cliAvailable)(
           const configPath = sandboxedConfigPath(home);
           expect(fs.existsSync(configPath)).toBe(false);
 
+          // MINOR E (2026-09-13 Codex frontier review, round 2): seed a real
+          // note and assert `read` returns its complete bytes with exit 0,
+          // rather than reading a nonexistent path and accepting a weak
+          // "stderr doesn't look like a yargs usage error" check (which
+          // trivially passes on empty stderr or an unrelated startup
+          // failure). `symlinkObsidianCliInto` (called inside
+          // `runWithUnsetConfig`) puts the REAL obsidian-cli in the
+          // sandbox's `$HOME/ai-stack/bin/obsidian-cli` lookup path, so an
+          // ENOENT there can no longer masquerade as "note not found".
+          const seededNoteBody = "D03-READ-PROBE-2001 seeded note body.\n";
+          if (command === "read") {
+            fs.mkdirSync(path.join(vaultPath, "00 Inbox"), { recursive: true });
+            fs.writeFileSync(path.join(vaultPath, "00 Inbox", "d03-seed.md"), seededNoteBody);
+          }
+
           const commandArgs: Record<string, string[]> = {
             search: ["search", "anything", "--state-dir", localStateDir, "--json"],
-            read: ["read", "00 Inbox/nonexistent.md"],
+            read: ["read", "00 Inbox/d03-seed.md"],
             reindex: ["reindex", "--state-dir", localStateDir, "--json"],
             capture: [
               "capture",
@@ -1874,11 +2101,13 @@ describe.skipIf(!cliAvailable)(
           // on an argument-parsing error before ever touching config: every
           // command here produces either a JSON envelope on stdout (the
           // `--json` cases) or, for `read` (no `--json` in its real usage),
-          // a specific "note not found"-shaped message rather than yargs'
-          // own "Unknown argument"/"Not enough non-option arguments" usage
-          // text.
+          // the complete seeded note bytes with exit 0.
           if (command === "read") {
-            expect(result.stderr).not.toMatch(/Unknown argument|not enough non-option/i);
+            expect(
+              result.code,
+              `read exit code: stdout=${result.stdout} stderr=${result.stderr}`,
+            ).toBe(0);
+            expect(result.stdout).toBe(`${seededNoteBody}\n`);
           } else {
             const line = result.stdout.split("\n").find((l) => l.startsWith("{"));
             expect(line, `expected a JSON envelope on stdout: ${result.stdout}\n${result.stderr}`).toBeDefined();
@@ -1899,6 +2128,71 @@ describe.skipIf(!cliAvailable)(
         }
       });
     }
+
+    it(
+      // MINOR E negative control (2026-09-13 Codex frontier review, round
+      // 2): a failing backend (obsidian-cli symlink pointing at a
+      // nonexistent binary) must fail visibly, never be silently absorbed
+      // into "configCreated=false" as if it were a clean, successful
+      // no-op. This proves the D03 rows above are actually exercising a
+      // working `read`, not accidentally passing because any failure looks
+      // the same as "no config written".
+      "D03 negative control: a broken obsidian-cli backend fails read visibly, not silently",
+      async () => {
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-broken-"));
+        const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-broken-vault-"));
+        const localStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-broken-state-"));
+        fs.mkdirSync(path.join(vaultPath, "00 Inbox"), { recursive: true });
+        try {
+          // Deliberately broken: a symlink target that does not exist,
+          // instead of the real obsidian-cli.
+          const binDir = path.join(home, "ai-stack", "bin");
+          fs.mkdirSync(binDir, { recursive: true });
+          fs.symlinkSync(
+            path.join(home, "does-not-exist-obsidian-cli"),
+            path.join(binDir, "obsidian-cli"),
+          );
+          fs.writeFileSync(
+            path.join(vaultPath, "00 Inbox", "d03-seed.md"),
+            "D03-NEGATIVE-CONTROL-2002\n",
+          );
+
+          const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+            (resolve, reject) => {
+              const proc = spawn(vaultCliEntry, ["read", "00 Inbox/d03-seed.md"], {
+                cwd: projectRoot,
+                stdio: ["ignore", "pipe", "pipe"],
+                env: {
+                  PATH: process.env.PATH,
+                  USER: process.env.USER,
+                  HOME: home,
+                  XDG_CONFIG_HOME: path.join(home, ".config"),
+                  OBSIDIAN_VAULT: vaultPath,
+                },
+                timeout: 60_000,
+              });
+              let stdout = "";
+              let stderr = "";
+              proc.stdout.on("data", (d) => {
+                stdout += d.toString();
+              });
+              proc.stderr.on("data", (d) => {
+                stderr += d.toString();
+              });
+              proc.on("error", reject);
+              proc.on("close", (code) => resolve({ code, stdout, stderr }));
+            },
+          );
+
+          expect(result.code).not.toBe(0);
+          expect(result.stdout).not.toBe("D03-NEGATIVE-CONTROL-2002\n\n");
+        } finally {
+          fs.rmSync(home, { recursive: true, force: true });
+          fs.rmSync(vaultPath, { recursive: true, force: true });
+          fs.rmSync(localStateDir, { recursive: true, force: true });
+        }
+      },
+    );
 
     it(
       // RECORDED FINDING, not a passing guarantee: the plan asks this probe
