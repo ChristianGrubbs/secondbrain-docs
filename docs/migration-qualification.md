@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-three further reviewer-driven correction rounds (packets 3, 4 and 5 — see
+four further reviewer-driven correction rounds (packets 3, 4, 5 and 6 — see
 those sections near the end). Task 6 as a whole is **not accepted**: F06 fails
 on an unresolved operator decision, F07 fails on a confirmed external
 converter limit, and D01/D03 are confirmed limits/defects deliberately left
 unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **150 files / 2368 tests passed**, exit 0 both times.
+head, run twice: **151 files / 2380 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -298,6 +298,19 @@ Packet 5 (Codex frontier review round 3 fixes):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **150 files / 2368 tests passed**, exit 0; run 2 — **150 files / 2368 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 5's edits (a stray NUL byte introduced by a tool-encoding artifact mid-edit was caught and removed before committing).
 
+Packet 6 (Codex frontier review round 4 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (no fixes needed on `.mjs` files; formatting only elsewhere).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **15 passed / 15** (5 new MOC-matching cases: plain-text-only, longer-prefix sibling, malformed syntax, valid aliased link, plus the pre-existing zero/duplicate case).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **12 passed / 12** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **8 passed / 8** (new file: `resolveGuardedState` throwaway/live-vault/symlink-alias/existing-config/overwrite cases).
+- `npx vitest run src/vault/VaultIndex.test.ts` — **97 passed / 97** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (every F/C row's MOC assertion now runs through the corrected real-link matcher, since `assertQualifiedNote` delegates to `qualifyNote`).
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault after the `isMainModule`/`resolveGuardedState` refactor — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **151 files / 2380 tests passed**, exit 0; run 2 — **151 files / 2380 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 6's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -437,6 +450,22 @@ Row-status honesty: **R12/R13's database-identity claim and X03b's negative
 control were both weaker than represented prior to this packet** (see the
 row entries above for what actually changed). See "Verification run log" for
 the exact commands and the two full-suite runs required for this packet.
+
+## Packet 6: Codex frontier review round 4 fixes (2026-09-13)
+
+Codex round 4 (label `task6-qualification-r4`) on `8a6b85f...a50fc4e` returned
+issues-found with 2 major findings. All three round-3 findings were confirmed
+closed, both test-only hooks confirmed inert in production, and the
+`storeVersion` export confirmed fine. Both new findings are addressed on this
+branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1 | The shared contract's MOC check counted substring occurrences of the extensionless note path, so a MOC containing only plain text mentioning the path (or a longer sibling path sharing the same prefix) qualified with zero navigable links. `countMocLinksTo` now mirrors `hasLinkTo`/`stripCodeFences` in `src/vault/VaultPublisher.ts` exactly -- the fork's own publisher-emitted `[[target]]`/`[[target\|alias]]` syntax -- and counts real link matches. The suite's own dead-code duplicate matcher (`readMoc`/`countOccurrences`/`mocLinkTarget`/`frontmatterField` in `test/vault-capture-e2e.test.ts`, unused once every row routed through `qualifyNote`) was removed rather than left to rot. | `scripts/lib/qualification-contract.mjs`, `.test.ts` (5 new cases); `test/vault-capture-e2e.test.ts` |
+| MAJOR 2 | Only `--vault` went through the live-vault guard in `live-check-vault.mjs`; a supplied `--state-dir` inside the live vault (or a symlink alias into it) was created and its `config.yaml` overwritten immediately, before any capture ran. The state directory and config path now go through the same containment check as `--vault`, and an existing `config.yaml` is never silently overwritten (requires `--overwrite-config`), all before any write. The validation logic was extracted into an exported, side-effect-free `resolveGuardedState` so it could be unit-tested against a fake live vault without ever touching the real one; the script's CLI body now runs only when the file is the program's entry point (`isMainModule`), so importing that function for testing does not trigger argv parsing or an exit. | `scripts/live-check-vault.mjs`, new `scripts/live-check-vault.test.ts` (8 cases) |
+
+See "Verification run log" for the exact commands and the two full-suite runs
+required for this packet.
 
 ## What this packet does not claim
 
