@@ -2159,6 +2159,198 @@ describe("VaultIndex", () => {
       expect(pointer.generation).toMatch(/^gen-/);
     });
   });
+  describe("the upsert path recovers everything the search path does", () => {
+    /**
+     * Two saved notes and an index that has indexed both.
+     *
+     * Two, because the defect this covers is invisible with one: writing into
+     * damaged state repairs whichever note the writer is holding, and only a
+     * sibling can show that the rest were lost.
+     */
+    async function twoIndexed(): Promise<{
+      vault: FakeVault;
+      index: VaultIndex;
+      touched: ReturnType<typeof sourceNote>;
+      sibling: ReturnType<typeof sourceNote>;
+    }> {
+      const vault = new FakeVault();
+      const [touched, sibling] = ["touchable", "siblingual"].map((phrase) => {
+        const note = sourceNote({
+          url: `https://example.com/${phrase}`,
+          title: phrase,
+          body: body(phrase),
+        });
+        vault.notes.set(note.path, note.markdown);
+        return note;
+      });
+
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(2);
+      return { vault, index, touched, sibling };
+    }
+
+    /** Every way a generation can be damaged, applied to the active one. */
+    const damages: [string, (index: VaultIndex) => void][] = [
+      [
+        "a pointer naming an impossible generation",
+        (index) => {
+          fs.writeFileSync(
+            path.join(index.collectionRoot(COLLECTION), "current.json"),
+            JSON.stringify({
+              generation: "../../../../escape",
+              switchedAt: "2026-09-13",
+            }),
+            "utf8",
+          );
+        },
+      ],
+      [
+        "a pointer that is not readable JSON",
+        (index) => {
+          fs.writeFileSync(
+            path.join(index.collectionRoot(COLLECTION), "current.json"),
+            "{ this is not json",
+            "utf8",
+          );
+        },
+      ],
+      [
+        "a pointer file that has been deleted",
+        (index) => {
+          fs.rmSync(path.join(index.collectionRoot(COLLECTION), "current.json"));
+        },
+      ],
+      [
+        "a generation directory that has been deleted",
+        (index) => {
+          fs.rmSync(activeGenerationDir(index), { recursive: true, force: true });
+        },
+      ],
+      [
+        "a manifest written by an older format",
+        (index) => {
+          const file = path.join(activeGenerationDir(index), "manifest.json");
+          const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+          fs.writeFileSync(file, JSON.stringify({ ...manifest, version: 1 }), "utf8");
+        },
+      ],
+      [
+        "a manifest row that is not an object",
+        (index) => {
+          const file = path.join(activeGenerationDir(index), "manifest.json");
+          const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+          manifest.entries = [null, ...manifest.entries.slice(1)];
+          fs.writeFileSync(file, JSON.stringify(manifest), "utf8");
+        },
+      ],
+      [
+        "a generation written by the previous store encoding",
+        (index) => {
+          const file = path.join(activeGenerationDir(index), "manifest.json");
+          const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+          manifest.storeEncoding = "0000000000000000";
+          fs.writeFileSync(file, JSON.stringify(manifest), "utf8");
+        },
+      ],
+      [
+        "a database that has been deleted",
+        (index) => {
+          fs.rmSync(path.join(activeGenerationDir(index), "documents.db"));
+        },
+      ],
+      [
+        "a database that cannot be read as a store",
+        (index) => {
+          fs.writeFileSync(
+            path.join(activeGenerationDir(index), "documents.db"),
+            "not a database",
+            "utf8",
+          );
+        },
+      ],
+    ];
+
+    it.each(damages)(
+      "keeps both notes searchable after an upsert meets %s",
+      async (_name, damage) => {
+        const { index, touched, sibling } = await twoIndexed();
+        await index.shutdown();
+        damage(index);
+
+        // The capture path: one note, published and now offered to the index.
+        const result = await index.upsert(entryFor(touched));
+        expect(result.status).toBe("indexed");
+
+        // Both, not just the one the writer was holding.
+        for (const note of [touched, sibling]) {
+          const response = await index.search({
+            query: note.document.title,
+            collection: COLLECTION,
+          });
+          expect(
+            response.results.map((r) => r.vault_path),
+            `${note.document.title} should still be searchable`,
+          ).toEqual([note.path]);
+        }
+        expect(index.manifestEntries(COLLECTION)).toHaveLength(2);
+      },
+    );
+
+    it.each(damages)(
+      "recovers the same way for a reader after %s",
+      async (_name, damage) => {
+        const { index, touched, sibling } = await twoIndexed();
+        await index.shutdown();
+        damage(index);
+
+        // The same damage, entered through search instead of upsert, must reach
+        // the same place. This is the audit as an assertion rather than a claim.
+        const response = await index.search({
+          query: touched.document.title,
+          collection: COLLECTION,
+        });
+        expect(response.results.map((r) => r.vault_path)).toEqual([touched.path]);
+        expect(
+          index
+            .manifestEntries(COLLECTION)
+            .map((e) => e.vaultPath)
+            .sort(),
+        ).toEqual([touched.path, sibling.path].sort());
+      },
+    );
+
+    it("still starts a collection from empty when nothing has ever indexed it", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/genuinelynew",
+        title: "Genuinely New",
+        body: body("genuinelynew"),
+      });
+      const neighbour = sourceNote({
+        url: "https://example.com/unindexed",
+        title: "Unindexed",
+        body: body("unindexedium"),
+      });
+      vault.notes.set(note.path, note.markdown);
+      vault.notes.set(neighbour.path, neighbour.markdown);
+
+      // No pointer and no generations: there is no prior indexing to strand, so
+      // the writer initializes rather than scanning the whole collection. This
+      // is the one divergence between the two paths and it stays.
+      const index = makeIndex(vault);
+      await index.upsert(entryFor(note));
+
+      expect(index.manifestEntries(COLLECTION).map((e) => e.vaultPath)).toEqual([
+        note.path,
+      ]);
+      const other = await index.search({
+        query: "unindexedium",
+        collection: COLLECTION,
+      });
+      expect(other.results).toEqual([]);
+    });
+  });
 });
 
 /**

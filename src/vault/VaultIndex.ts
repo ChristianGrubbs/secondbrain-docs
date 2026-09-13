@@ -297,8 +297,19 @@ interface IndexManifest {
 
 /** Why a generation cannot be used to answer a question. */
 export type IndexStateProblem =
-  /** No pointer: nothing has ever indexed this collection. */
+  /**
+   * No pointer and no generations: nothing has ever indexed this collection.
+   *
+   * This is the only problem a *writing* caller may answer by initializing an
+   * empty generation, so it has to mean exactly what it says. Every other
+   * problem below is evidence that notes were indexed here before, and
+   * initializing over that evidence would strand every one of them.
+   */
   | "never-built"
+  /** No pointer, but generations exist: the pointer was lost, not never written. */
+  | "pointer-missing"
+  /** The pointer is there and does not name a generation this build could write. */
+  | "pointer-unreadable"
   /** The pointer names a generation directory that is not there. */
   | "generation-missing"
   /** Absent, corrupt, foreign, or written in a manifest shape this build does not read. */
@@ -1631,9 +1642,34 @@ export class VaultIndex {
    * @returns The usable generation and its manifest, or the reason it is not.
    */
   private inspectGeneration(collection: string): GenerationInspection {
-    const pointer = readJson<IndexPointer>(this.pointerFile(collection));
+    const pointerFile = this.pointerFile(collection);
+
+    if (!fs.existsSync(pointerFile)) {
+      // A missing pointer is only a new collection when there is nothing else
+      // here. Beside existing generations it is a collection that lost its
+      // pointer, which is damage: the notes were indexed once and a writer that
+      // starts again from empty loses every one of them.
+      return {
+        usable: false,
+        generation: null,
+        problem: this.hasGenerations(collection) ? "pointer-missing" : "never-built",
+      };
+    }
+
+    const pointer = readJson<IndexPointer>(pointerFile);
     if (pointer === null || !isGenerationName(pointer.generation)) {
-      return { usable: false, generation: null, problem: "never-built" };
+      // The file exists, so something wrote it, so something was indexed. Its
+      // contents being unusable says nothing about whether this collection has
+      // notes — only that this build cannot find them from here.
+      return {
+        usable: false,
+        generation: null,
+        problem: "pointer-unreadable",
+        detail:
+          pointer === null
+            ? "pointer is not readable JSON"
+            : "pointer does not name a generation this build could have written",
+      };
     }
 
     const generation = pointer.generation;
@@ -1700,6 +1736,12 @@ export class VaultIndex {
     const inspection = this.inspectGeneration(collection);
     if (inspection.usable) return inspection.generation;
 
+    // The single point where a writer and a reader diverge, and the only one.
+    // `never-built` means no pointer and no generations — there is no prior
+    // indexing to preserve, so a caller holding the first note may simply start
+    // the collection. Every other problem is evidence of prior indexing and
+    // rebuilds for writers exactly as it does for readers, because writing one
+    // note into damaged state repairs that note and strands its siblings.
     if (inspection.problem === "never-built" && options.initializeWhenNew) {
       return this.ensureGeneration(collection);
     }
@@ -1719,6 +1761,25 @@ export class VaultIndex {
     // Rebuilding is the only repair that restores every note rather than the
     // one a caller happens to be holding.
     return (await this.rebuildLocked({ collection })).generation;
+  }
+
+  /**
+   * Reports whether this collection has any generation directory at all.
+   *
+   * Used only to tell "nothing has ever been indexed here" apart from "the
+   * pointer to what was indexed here is gone". The difference decides whether a
+   * writing caller may start from empty, so it is answered from the filesystem
+   * rather than assumed from the pointer's absence.
+   */
+  private hasGenerations(collection: string): boolean {
+    try {
+      return (
+        fs.readdirSync(path.join(this.collectionRoot(collection), "generations")).length >
+        0
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
