@@ -1,11 +1,13 @@
 # CLI vault capture: Task 6 qualification report
 
-Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2).
-Task 6 as a whole is **not accepted**: F06 fails on an unresolved operator
-decision, F07 fails on a confirmed external converter limit, and D01/D03 are
-confirmed limits/defects deliberately left unfixed per this packet's scope.
-See `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
-definition and acceptance criteria.
+Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
+a further reviewer-driven correction round (packet 3 — see that section near
+the end). Task 6 as a whole is **not accepted**: F06 fails on an unresolved
+operator decision, F07 fails on a confirmed external converter limit, and
+D01/D03 are confirmed limits/defects deliberately left unfixed per this
+packet's scope. See `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for
+the full task definition and acceptance criteria. Final full-suite result on
+this branch's head: **149 files / 2346 tests passed**, exit 0.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -258,6 +260,19 @@ Packet 2 (F06/F07 corrections, 6C, 6D):
 - `npx vitest run test/vault-index-e2e.test.ts` — **21 passed / 21** (new R10 × 8 cases, R16 × 3 cases, plus all pre-existing coverage; wall time ~226s — real subprocess spawns).
 - `npm test` (full suite) — **148 files / 2333 tests passed**, exit 0 (packet-1 total was 148 files / 2312 tests; packet 2 adds 21 new/extended assertions across `VaultIndex.test.ts`, `test/vault-index-e2e.test.ts` and `test/vault-capture-e2e.test.ts`'s D03 describe, net of test-count changes from renaming rather than adding two existing F06/F07 tests).
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts` sources by packet 2's edits.
+
+Packet 3 (Codex frontier review fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npx vitest run src/scraper/fetcher/BrowserFetcher.test.ts` — **12 passed / 12**.
+- `npx vitest run src/vault/ObsidianCli.test.ts` — **10 passed / 10**.
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **7 passed / 7**.
+- `npx vitest run src/vault/VaultIndex.test.ts` — **95 passed / 95**.
+- `npx vitest run test/vault-capture-e2e.test.ts` — **38 passed / 38** (wall time ~150-158s; adds three SIGTERM/SIGHUP browser-cleanup tests and reworks every F/C row onto the shared contract).
+- `npx vitest run test/vault-index-e2e.test.ts` — **21 passed / 21** (wall time ~226s).
+- `npm test` (full suite, exact final commit) — **149 files / 2346 tests passed**, exit 0.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs` sources by packet 3's edits.
 
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
