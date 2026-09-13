@@ -224,6 +224,26 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
       const onSigint = (): void => controller.abort();
       process.on("SIGINT", onSigint);
 
+      // TEST-ONLY escape hatch (dated 2026-09-13, MAJOR B/3 negative-control
+      // support): `SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL=1` registers no-op
+      // SIGTERM/SIGHUP listeners so the host process survives those signals
+      // instead of dying on Node's default disposition. This isolates
+      // "Playwright's own cleanup is disabled" (the
+      // `SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP` hook in
+      // `BrowserFetcher.launchBrowser`) from "the host process died", which
+      // otherwise made it impossible to observe a genuinely leaked browser
+      // process tree in isolation — Chromium's own CDP pipe transport
+      // treats the parent process dying as its own shutdown signal
+      // regardless of Playwright's `handleSIGTERM`/`handleSIGHUP` launch
+      // options. Inert unless explicitly set; never set outside
+      // test/vault-capture-e2e.test.ts.
+      const keepAliveNoop = (): void => undefined;
+      const keepAliveOnSignal = process.env.SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL === "1";
+      if (keepAliveOnSignal) {
+        process.on("SIGTERM", keepAliveNoop);
+        process.on("SIGHUP", keepAliveNoop);
+      }
+
       let result: CaptureResult;
       try {
         result = await capture(
@@ -236,6 +256,10 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
         );
       } finally {
         process.off("SIGINT", onSigint);
+        if (keepAliveOnSignal) {
+          process.off("SIGTERM", keepAliveNoop);
+          process.off("SIGHUP", keepAliveNoop);
+        }
         await ownedIndex?.shutdown();
       }
 

@@ -1518,7 +1518,13 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
             OBSIDIAN_VAULT: sandbox,
             DOCS_MCP_CONFIG: configFile,
             ...(options.disableCleanup
-              ? { SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP: "1" }
+              ? {
+                  SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP: "1",
+                  // Keeps the host alive on SIGTERM/SIGHUP so "Playwright's
+                  // own cleanup is disabled" can be observed in isolation
+                  // from "the host process died" (MAJOR 3, round 3).
+                  SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL: "1",
+                }
               : {}),
           },
         },
@@ -1642,50 +1648,50 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       30_000,
     );
 
-    it(
-      // MAJOR B negative control (2026-09-13 Codex frontier review, round
-      // 2): proves the assertion mechanism itself -- not just this one
-      // lucky run -- actually detects a leaked descendant. A genuine
-      // leaked process is spawned directly (a real, long-lived child whose
-      // pid this test controls) and the exact same liveness-filtering
-      // logic the SIGINT/SIGTERM/SIGHUP tests use is applied to it,
-      // proving that a real leak would show up as non-empty rather than
-      // being silently swallowed.
-      //
-      // (`SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1` was tried as a full
-      // end-to-end negative control first, per the coordinator's ask, but
-      // disabling Playwright's own SIGTERM/SIGHUP handling also removes
-      // Node's *only* listener for that signal, so the host process itself
-      // dies on the default disposition -- and Chromium's CDP pipe
-      // transport treats the parent's death as its own shutdown signal
-      // regardless of `handleSIGTERM`/`handleSIGHUP`, closing the browser
-      // as a side effect of the host dying rather than of any cleanup
-      // logic. That makes it unable to isolate "cleanup disabled" from
-      // "host process gone", so it cannot demonstrate the intended failure
-      // mode. `chromium.launch()` still accepts and forwards the env-gated
-      // override (see `BrowserFetcher.test.ts`), documented here for any
-      // future negative control that can isolate the two.)
-      "negative control: a genuinely leaked descendant is detected as still alive by the same check",
-      async () => {
-        const leaked = spawn("sleep", ["30"], { stdio: "ignore" });
-        try {
-          expect(leaked.pid, "expected the dummy leaked process to have a pid").toBeDefined();
-          const fakeChromiumEntry = {
-            pid: leaked.pid as number,
-            ppid: process.pid,
-            command: "/fake/ms-playwright/chrome-headless-shell --user-data-dir=/tmp/fake",
-          };
+    it.each(["SIGTERM", "SIGHUP"] as const)(
+      // MAJOR 3 (2026-09-13 Codex frontier review, round 3): the prior
+      // "negative control" only proved kill(pid, 0) recognizes a supplied
+      // sleep pid -- it never exercised browser discovery, signal
+      // delivery, profile tracking, or the actual cleanup case, so it
+      // proved nothing about whether the REAL assertions above would catch
+      // a genuine regression. This runs the ACTUAL cleanup case with
+      // Playwright's own SIGTERM/SIGHUP handling disabled
+      // (`SB_DOCS_TEST_DISABLE_SIGNAL_CLEANUP=1`), while a test-only no-op
+      // signal listener (`SB_DOCS_TEST_KEEP_ALIVE_ON_SIGNAL=1`, registered
+      // in `capture.ts`, inert unless explicitly set) keeps the host
+      // process alive so "cleanup disabled" can be observed in isolation
+      // from "the host process died" (Chromium's CDP pipe transport
+      // otherwise treats the parent's death as its own shutdown signal
+      // regardless of `handleSIGTERM`/`handleSIGHUP`). With cleanup
+      // genuinely disabled, the exact same browser-descendant and
+      // profile-dir assertions the healthy-case tests use must REJECT this
+      // run.
+      "negative control: with cleanup disabled, %s leaves a real Chromium descendant and its profile dir alive (proves the assertions can fail)",
+      async (signal) => {
+        const result = await runSignalCleanupCase(signal, { disableCleanup: true });
 
-          // The exact filter the real assertions use.
-          const stillAlive = [fakeChromiumEntry].filter((e) => isAlive(e.pid));
-          expect(
-            stillAlive.map((e) => e.pid),
-            "the leaked dummy process should be detected as still alive",
-          ).toEqual([leaked.pid]);
-        } finally {
-          leaked.kill("SIGKILL");
-        }
+        expect(
+          result.chromiumFoundBeforeSignal.length,
+          "expected a Chromium descendant of this child to actually be running before signalling",
+        ).toBeGreaterThan(0);
+        expect(result.userDataDir).toBeDefined();
+        expect(
+          result.hostStillAlive,
+          "the keep-alive hook should have kept the host process alive despite cleanup being disabled",
+        ).toBe(true);
+
+        // The exact assertions the healthy-case test uses -- here they
+        // must FAIL to hold, proving they are not vacuous.
+        expect(
+          result.chromiumStillAliveAfter.length,
+          `expected at least one Chromium descendant to still be alive after ${signal} with cleanup disabled`,
+        ).toBeGreaterThan(0);
+        expect(
+          result.userDataDirLeaked,
+          `expected the temp profile dir to still exist after ${signal} with cleanup disabled`,
+        ).toBe(true);
       },
+      30_000,
     );
   });
 
