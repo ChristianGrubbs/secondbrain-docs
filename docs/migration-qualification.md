@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-six further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7 and 8 —
-see those sections near the end). Task 6 as a whole is **not accepted**: F06
-fails on an unresolved operator decision, F07 fails on a confirmed external
-converter limit, and D01/D03 are confirmed limits/defects deliberately left
-unfixed per this packet's scope. See
+seven further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8 and
+9 — see those sections near the end). Task 6 as a whole is **not accepted**:
+F06 fails on an unresolved operator decision, F07 fails on a confirmed
+external converter limit, and D01/D03 are confirmed limits/defects
+deliberately left unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **152 files / 2422 tests passed**, exit 0 both times.
+head, run twice: **152 files / 2442 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -341,6 +341,23 @@ Packet 8 (Codex scoped re-review round 6 fixes):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2422 tests passed**, exit 0; run 2 — **152 files / 2422 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 8's edits.
 
+Packet 9 (controller unist-util-visit fix + Codex scoped re-review round 7 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npm run build` — clean; confirms Vite bundles `remark`/`remark-parse`/`unified` fine without `unist-util-visit`.
+- `npx vitest run src/vault/markdownLinks.test.ts` — **26 passed / 26** (13 new cases: 4 boundary-sentinel fragmentation regressions, 1 block-HTML scope-decision fixture, 7 structural-coverage fixtures, 1 benchmark test).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **87 passed / 87** (3 new end-to-end regressions for inline-code/hard-break/image fragmentation).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **31 passed / 31** (4 new cases: 3 fragmentation rejections, 1 block-HTML rejection).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (unaffected).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected).
+- Standalone scripts confirmed both majors test-first: the pre-fix module returned 1 (bug) instead of 0 for inline-code/hard-break/image fragmentation fixtures before the boundary sentinel; the MAJOR 2 fast path's first draft itself broke the emphasis/strong/link reassembly tests (caught by the committed test suite, not a standalone script) before the `POSSIBLE_FRAGMENTING_MARKUP` gate was added. Benchmark measured absent-case ~0.1-0.4ms, present-cold-case ~1.4s at 20k entries (matching the reviewer's own measured numbers), present-cached-case ~4-13ms.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault after the rewrite — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2442 tests passed**, exit 0; run 2 — **152 files / 2442 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 9's edits (the boundary sentinel is a Unicode Private Use Area character, `U+E000`, never a NUL byte).
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -539,6 +556,36 @@ instead of 1) for every one of them; the same script against the new
 `remark`-based implementation returned exactly 1 for all 8 constructs. See
 "Verification run log" for the exact commands and the two full-suite runs
 required for this packet.
+
+## Packet 9: Codex scoped re-review round 7 fixes (2026-09-13)
+
+Two controller/reviewer findings on the packet-8 diff, addressed together:
+
+1. A controller finding (fix-now, small): `src/vault/markdownLinks.mjs`
+   imported `unist-util-visit`, which is not declared in `package.json` --
+   only a transitive dependency of `remark-parse`. Replaced with a small
+   local recursive `walk(node, visitor)` over `node.children`, keeping the
+   `code`/`inlineCode` skip semantics identical. No `package.json`/
+   `package-lock.json` change.
+2. A scoped Codex re-review (label `task6-qualification-r7-scoped`) of
+   `2a57d39...3f7b1dd` returned issues-found: 2 major, 1 minor, all in
+   `src/vault/markdownLinks.mjs`. Addressed on this branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR 1 | `collectVisibleText` returned `""` for a skipped node (`inlineCode`, `break`, `image`) and simply concatenated the surrounding siblings, so a wikilink fragmented by one of those (e.g. `[[collection/` + `` `x` `` + `Fixture]]`) was silently reassembled into a false match -- the exact bug this module exists to prevent, moved up one level. Every node whose content must never be concatenated with its neighbours (`code`, `inlineCode`, `break`, `image`, `imageReference`, `html`, `footnote`, `footnoteReference`) now contributes a Unicode Private Use Area boundary character (`U+E000`, never a NUL byte) instead of an empty string, so a wikilink can never span across one. | `src/vault/markdownLinks.test.ts` (4 new cases: inline-code-split, hard-break-split, image-split, inline-HTML-split, all must count 0), `src/vault/VaultPublisher.test.ts` (3 new end-to-end regressions: the publisher still adds the real link when the only pre-existing mention is fragmented), `scripts/lib/qualification-contract.test.ts` (3 new rejection cases) |
+| MAJOR 2 | Every `countLinksTo`/`hasLinkTo` call reparsed the whole MOC; measured ~508ms at 10k entries, ~1.4s at 20k, ~13.8s at 50k, and `VaultPublisher` calls it once per publication, trending quadratic on bulk capture. Added a substring fast path (`markdown.includes("[[" + target)`) that returns 0 without parsing when the literal target text is absent, plus a single-entry parse cache keyed by exact markdown-string identity. **Correctness note beyond the finding's literal proposal:** the naive fast path as first implemented broke MAJOR 1's own emphasis/strong/link reassembly requirement (a target split by `*`/`_`/a real link can be raw-byte-absent yet parse-present) -- fixed by only trusting the substring-absence shortcut when the document also contains none of `*`, `_`, `` ]( ``, `` ][ `` (the only "transparent" constructs that remove characters on parse); a hard break/inline code/image/HTML can only ever ADD an unmatchable boundary character, so those never risk a false negative and don't need to gate the fast path. This is a link-check cost, not the plan's protected full-collection scan. | `src/vault/markdownLinks.test.ts` (benchmark-style test: 20k-entry flat-list MOC, absent case < 50ms measured ~0.1-0.4ms, present-cold case < 3s measured ~1.4s, present-cached case < 500ms measured ~4-13ms) |
+| MINOR | Root-level (block) `html` nodes were never scanned (not `paragraph`/`heading`/`tableCell`), so `<div>\n[[target]]\n</div>` counted 0. Read `src/vault/render.ts`: `renderCollectionIndex` never emits block HTML -- the publisher's own MOCs are always a heading plus a flat Markdown bullet list -- so this is now a documented deliberate scope decision: ALL `html` nodes (block or inline) are opaque, exactly like `code`/`inlineCode`. Added dedicated committed tests for the previously-probed-only structural cases: inline HTML, headings, list items, blockquotes, a pipe-table line (remark-parse core has no GFM table support, so it is scanned as plain paragraph text), strong/link reassembly, and cross-block non-merging. | `src/vault/markdownLinks.test.ts` (1 block-HTML fixture + 7 structural-coverage fixtures), `scripts/lib/qualification-contract.test.ts` (1 new rejection case for the block-HTML scope decision) |
+
+Both majors were verified test-first: the failing assertions surfaced
+immediately when the new fixtures were added against the pre-fix module
+(reassembly fixtures failed with "expected 1, got 0" before the boundary
+sentinel; the MAJOR 2 fast path's own regression against MAJOR 1 was caught
+the same way and fixed before committing). See "Verification run log" for
+the exact commands; this round's coordinator guidance was "full suite once
+is enough for this change unless anything else changes" for the controller
+finding, but since the r7-scoped findings changed more, the full suite was
+run twice per the standing rule.
 
 ## What this packet does not claim
 
