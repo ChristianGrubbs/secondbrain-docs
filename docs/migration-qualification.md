@@ -1,14 +1,14 @@
 # CLI vault capture: Task 6 qualification report
 
 Status: 6A, 6B, 6C and 6D are all evidence-backed below (packets 1 and 2), with
-nine further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9,
-10 and 11 — see those sections near the end). Task 6 as a whole is **not
+ten further reviewer-driven correction rounds (packets 3, 4, 5, 6, 7, 8, 9,
+10, 11 and 12 — see those sections near the end). Task 6 as a whole is **not
 accepted**: F06 fails on an unresolved operator decision, F07 fails on a
 confirmed external converter limit, and D01/D03 are confirmed limits/defects
 deliberately left unfixed per this packet's scope. See
 `docs/plans/2026-09-13-cli-vault-capture-tasks-6-7.md` for the full task
 definition and acceptance criteria. Final full-suite result on this branch's
-head, run twice: **152 files / 2466 tests passed**, exit 0 both times.
+head, run twice: **152 files / 2470 tests passed**, exit 0 both times.
 
 **Packet-2 corrections to packet 1:** **F06 and F07 are recorded as fail**,
 not "pass with known gap" — the plan requires local-asset preservation (F06)
@@ -375,6 +375,40 @@ Packet 10 (Codex scoped re-review round 8 fixes, BLOCKER resolved):
 - **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2457 tests passed**, exit 0; run 2 — **152 files / 2457 tests passed**, exit 0. Identical counts both times.
 - `git diff --numstat` — no new binary blobs; no literal NUL bytes introduced in `.ts`/`.mjs`/`.test.ts` sources by packet 10's edits (every U+E000 fixture was written via an explicit `\uE000` JS/TS escape sequence, verified byte-for-byte, never a literal glyph typed through an edit tool, and never a NUL byte).
 
+Packet 11 (Codex scoped re-review round 9 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npm run build` — clean.
+- `npx vitest run src/vault/markdownLinks.test.ts` — **38 passed / 38** (3 new alias-bracket cases: escaped `]`, character-referenced `]`, trailing-text-not-swallowed).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **93 passed / 93** (2 new alias-bracket duplicate-prevention regressions, 1 new imageReference end-to-end regression).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **37 passed / 37** (2 new alias-bracket acceptance cases, 1 new imageReference rejection case).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (unaffected).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected).
+- The MAJOR finding verified test-first: both alias-bracket fixtures returned 0 against the pre-fix regex before the alias-group fix (`(?:(?!\]\]).)*`) landed. Confirmed no regression across the existing duplicate-link, malformed-syntax, and longer-sibling-prefix rejection tests.
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2466 tests passed**, exit 0; run 2 — **152 files / 2466 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes or PUA glyphs introduced by packet 11's edits; the one pre-existing literal `U+E000` glyph found in `markdownLinks.test.ts:165` (a round-10-reviewer-caught leftover from an earlier edit-tool call) was converted to an explicit `\uE000` escape sequence as part of this packet's MINOR 2 fix.
+
+Packet 12 (Codex scoped re-review round 10 fixes):
+
+- `npm run typecheck` — clean (no errors).
+- `npm run lint` — clean after `npm run lint:fix` (formatting only; no logic changes).
+- `npm run build` — clean.
+- `npx vitest run src/vault/markdownLinks.test.ts` — **40 passed / 40** (2 new cases: malformed-unterminated-link-before-valid-link correctness, and a performance regression proving this module's own scan step completes well under 200ms once the parse cache is warm).
+- `npx vitest run src/vault/VaultPublisher.test.ts` — **94 passed / 94** (1 new end-to-end regression: the publisher adds the real link for a malformed/unterminated target without duplicating the well-formed link that follows it).
+- `npx vitest run scripts/lib/qualification-contract.test.ts` — **38 passed / 38** (1 new acceptance case).
+- `npx vitest run scripts/lib/vault-guard.test.ts` — **17 passed / 17** (unaffected).
+- `npx vitest run scripts/live-check-vault.test.ts` — **11 passed / 11** (unaffected).
+- `npx vitest run test/vault-publish-e2e.test.ts` — **16 passed / 16** (unaffected).
+- `npx vitest run test/vault-capture-e2e.test.ts` — **41 passed / 41** (unaffected).
+- The MAJOR finding verified test-first: `countLinksTo({ markdown: "[[a|unterminated ] text [[b]]\n", target: "a" })` returned `1` (bug) against the round-9 regex before the linear-scanner rewrite. Root-caused the reported performance regression by isolating `processor.parse()` alone (see this packet's table entry above and the module's own top comment) — confirmed the superlinear cost lives in `remark-parse`/`micromark`'s own bracket-resolution algorithm for pathologically bracket-dense malformed input, not in this module's counting logic (measured linear, sub-5ms even at 224KB, once isolated from parsing).
+- Smoke-tested `scripts/live-check-vault.mjs` directly against a real throwaway vault — still `allPassed: true`, exit 0, for all four live rows.
+- **Full `npm test` run TWICE** on the exact final commit: run 1 — **152 files / 2470 tests passed**, exit 0; run 2 — **152 files / 2470 tests passed**, exit 0. Identical counts both times.
+- `git diff --numstat` — no new binary blobs; no literal NUL bytes or PUA glyphs introduced by packet 12's edits.
+
 ## 6C rows: damaged state cannot become a false miss (packet 2)
 
 Unit-level evidence: `src/vault/VaultIndex.test.ts`, `describe("the upsert path
@@ -642,6 +676,20 @@ character-referenced-bracket alias fixtures both returned 0 against the
 pre-fix regex (confirmed via a standalone script) before the alias-group
 fix landed. See "Verification run log" for the exact commands and the two
 full-suite runs required for this packet.
+
+## Packet 12: Codex scoped re-review round 10 fixes (2026-09-13)
+
+A scoped Codex re-review (label `task6-qualification-r10-scoped`) of the
+packet-11 diff (`814dad7...c765cd1`) confirmed valid aliases, adjacency,
+`]]]`, duplicate/prefix rejection, imageReference coverage, report counts,
+and PUA escaping all sound, and returned 1 major finding, addressed on this
+branch:
+
+| Finding | What changed | Evidence |
+| --- | --- | --- |
+| MAJOR | The round-9 alias scan `(?:(?!\]\]).)*` stops only at `]]`, never at a nested `[[`, so an unterminated link's alias scan could cross a NESTED `[[` and "borrow" a LATER link's closing `]]`: `[[a\|unterminated ] text [[b]]` wrongly matched from `a`'s opener all the way to `b`'s closer, counting `a` as already linked (a false "already linked" result the publisher would trust, suppressing the real link `a` still needs) while also correctly counting `b`. Repeated malformed prefixes were also superlinear (measured: ~257ms at 28KB, ~1.87s at 112KB with the round-9 regex). Fixed by replacing the regex-based alias matching ENTIRELY with an explicit linear two-pointer scanner (`countWikilinksInRun`): for each `[[`, find the next `]]`; if a nested `[[` occurs first, the outer `[[` is unterminated/malformed and is skipped (retried from the nested `[[`) rather than ever borrowing a later closer. Target and alias are both compared as plain strings (no regex, no escaping needed). **Root-caused the reported performance regression while building this fix**: measuring `processor.parse()` alone (before any of this module's own counting logic runs) on the same repeated-malformed-prefix input reproduces the identical superlinear growth (~1.2s at 112KB, ~4.9s at 224KB) -- essentially all of the wall-clock cost is `remark-parse`'s/`micromark`'s own CommonMark link/bracket-resolution algorithm for documents with many unmatched `[[` sequences, not this module's counting logic (verified linear and sub-5ms even at 224KB, isolated from parsing). A real, publisher-authored MOC is always a flat list of individually-balanced `- [[target\|alias]]` lines and can never reach this pathological shape (a 112KB WELL-FORMED flat list parses in ~110ms); only a hand-corrupted or deliberately hostile MOC could. This is a genuine upstream dependency-level limitation, not something fixable in this module without either abandoning full CommonMark parsing (rejected for correctness reasons in round 8's BLOCKER) or upgrading `remark-parse`/`micromark`, which is out of this module's scope -- flagged here for the coordinator/controller to decide whether a dedicated dependency-upgrade investigation is warranted. | `src/vault/markdownLinks.mjs` (`countWikilinksInRun`, replacing the regex entirely), `src/vault/markdownLinks.test.ts` (2 new cases: malformed-unterminated-link-before-valid-link counting 0/1 correctly, and a performance regression proving this module's OWN scan step -- isolated by warming the single-entry parse cache first -- completes well under 200ms even on a 112KB repeated-malformed-prefix document), `src/vault/VaultPublisher.test.ts` (1 new end-to-end regression: the publisher adds the real link for the malformed/unterminated target without duplicating the genuinely well-formed link that follows it), `scripts/lib/qualification-contract.test.ts` (1 new acceptance case) |
+
+The MAJOR finding was verified test-first: `countLinksTo({ markdown: "[[a|unterminated ] text [[b]]\n", target: "a" })` returned `1` (bug) against the pre-fix regex, and the same repeated-malformed-prefix content measured ~1.7-1.8s end-to-end before this fix (dominated by parse, as established above). See "Verification run log" for the exact commands and the two full-suite runs required for this packet.
 
 ## What this packet does not claim
 
