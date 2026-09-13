@@ -70,7 +70,9 @@ Upstream files changed, and nothing else:
 - **One frontmatter parser.** `parseNoteFrontmatter` in `src/vault/render.ts` is the only one. The migration plan suggested `gray-matter` for indexing; using the existing parser instead keeps the body bytes an index chunk is built from identical to the body bytes publication compares, and adds no dependency.
 - **The index is derived, the vault is not.** Everything under `<stateDir>/index` can be deleted and rebuilt from the notes themselves. Reconciliation removes a vanished note from the index only — never from the vault — and no index path ever writes a note.
 - **One index per collection.** Each collection owns its generations and its pointer under `<stateDir>/index/collections/<key>`, so rebuilding one collection cannot discard another and restoring a deleted index is one `reindex` per collection.
-- **Store identity is injective.** Upstream lowercases every version it is given, while source identity is case sensitive, so the index keys its store by a lowercase token carrying a digest of the exact label. `Release` and `release` are two documents, and neither can ever be answered with the other's text.
+- **Store identity is injective.** Upstream normalizes versions in two places with two rules — lowercase on write and search, lowercase *and trim* through `normalizeVersionRef` — while source identity is case- and whitespace-sensitive. The index therefore keys its store by `sv` plus a digest of the exact label: hexadecimal, so neither rule can alter it, and injective, so `Release`, `release` and `" Release"` are three documents and none can be answered with another's text. The readable label lives in the manifest, which is what every envelope reports.
+- **Missing derived state is never an empty answer.** A search distinguishes "this collection was built and holds nothing" from "this collection has no pointer, or its generation is gone, or its manifest is unreadable". The first is an answer about the vault; the second rebuilds from discovery first. Only a writing caller may initialize an empty generation.
+- **Verification samples the splitter's output, not the note.** A Markdown body is converted before it is chunked, so a token in an HTML comment or an unused reference definition exists in the note and in no chunk. Probes are chosen from what was actually persisted, so a probe can only fail when persistence failed.
 - **Upstream semantics stay untouched.** Existing upstream commands, their meanings, the web UI and the MCP source all remain as shipped, so rebases stay cheap.
 - **Both build defines are preserved.** `__APP_VERSION__` and `__POSTHOG_API_KEY__` are still injected, and the native externals list is unchanged.
 
@@ -89,6 +91,15 @@ npm ci
 ```
 
 `npm ci` installs from the lockfile without mutating it. Use `npm install` only for an intentional dependency change.
+
+### Environment
+
+| Variable | Role |
+| --- | --- |
+| `OBSIDIAN_VAULT` | Vault every `obsidian-cli` call operates on. |
+| `SB_DOCS_LOG` | `1`/`true`/`yes` enables the JSONL event log; off by default. |
+| `SB_DOCS_LOG_FILE` | Redirects that log away from `~/Library/Logs/SecondBrainDocs/events.jsonl`, which is what lets a test assert on a run's own events. |
+| `DOCS_MCP_CONFIG` | Upstream's read-only configuration file. Setting it also stops a run rewriting the operator's own `config.yaml`. |
 
 ### Provision the browser
 

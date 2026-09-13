@@ -97,7 +97,13 @@ export const nullLogger: VaultLogger = () => undefined;
 /**
  * Builds a JSONL logger.
  *
- * @param options.filePath Sink path; defaults to {@link DEFAULT_LOG_FILE}.
+ * The sink is a fixed path so a later agent can reconstruct a run from the log
+ * rather than by rerunning it. `SB_DOCS_LOG_FILE` redirects that path, which is
+ * what makes the log itself observable: a process-level test can assert on the
+ * events a run emitted without writing into the operator's own log.
+ *
+ * @param options.filePath Sink path; defaults to `SB_DOCS_LOG_FILE`, then to
+ *   {@link DEFAULT_LOG_FILE}.
  * @param options.enabled Overrides the `SB_DOCS_LOG` environment gate.
  * @param options.runId Correlation id shared by every line of one run.
  * @returns A logger that appends one JSON object per line, or {@link nullLogger}
@@ -110,7 +116,10 @@ export function createJsonlLogger(
     options.enabled ?? ["1", "true", "yes"].includes(process.env.SB_DOCS_LOG ?? "");
   if (!enabled) return nullLogger;
 
-  const filePath = options.filePath ?? DEFAULT_LOG_FILE;
+  const override = process.env.SB_DOCS_LOG_FILE;
+  const filePath =
+    options.filePath ??
+    (override !== undefined && override.length > 0 ? override : DEFAULT_LOG_FILE);
   const runId = options.runId ?? randomUUID();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 

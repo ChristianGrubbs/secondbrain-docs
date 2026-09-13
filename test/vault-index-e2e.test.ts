@@ -23,6 +23,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { sha256 } from "../src/vault/identity";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
@@ -70,6 +71,8 @@ interface VaultCliRun {
   stderr: string;
   /** One entry per `net.Server.prototype.listen` call made by the child. */
   listenCalls: string[];
+  /** Every JSONL event the run emitted, in order. */
+  events: { event: string; ctx: Record<string, unknown> }[];
 }
 
 /**
@@ -94,6 +97,7 @@ let sandbox: string;
 let stateDir: string;
 let sourceFile: string;
 let configFile: string;
+let logFile: string;
 
 /**
  * Runs the built vault CLI executable directly and captures its output plus
@@ -113,6 +117,9 @@ async function runVaultCli(args: string[]): Promise<VaultCliRun> {
         .join(" ");
 
       // Deliberately NOT `spawn("node", [vaultCliEntry, ...])`.
+      // Truncated per run, so `events` describes this invocation alone.
+      fs.writeFileSync(logFile, "", "utf8");
+
       const proc = spawn(vaultCliEntry, args, {
         cwd: projectRoot,
         stdio: ["ignore", "pipe", "pipe"],
@@ -122,6 +129,11 @@ async function runVaultCli(args: string[]): Promise<VaultCliRun> {
           NODE_OPTIONS: nodeOptions,
           SB_DOCS_LISTEN_LOG: logPath,
           OBSIDIAN_VAULT: sandbox,
+          // The run's own structured log, redirected into this suite's
+          // temporary directory so its events can be asserted on without ever
+          // touching the operator's log.
+          SB_DOCS_LOG: "1",
+          SB_DOCS_LOG_FILE: logFile,
           // A read-only config, so the run neither inherits nor rewrites the
           // operator's own `config.yaml`, and local sources under this run's
           // temporary directory are inside the allowed roots.
@@ -150,7 +162,16 @@ async function runVaultCli(args: string[]): Promise<VaultCliRun> {
         const listenCalls = fs.existsSync(logPath)
           ? fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean)
           : [];
-        resolve({ code, stdout, stderr, listenCalls });
+        const events = fs.existsSync(logFile)
+          ? fs
+              .readFileSync(logFile, "utf8")
+              .split("\n")
+              .filter((line) => line.startsWith("{"))
+              .map(
+                (line) => JSON.parse(line) as { event: string; ctx: Record<string, unknown> },
+              )
+          : [];
+        resolve({ code, stdout, stderr, listenCalls, events });
       });
     });
   } finally {
@@ -184,6 +205,58 @@ function activeGeneration(collection = "inbox"): string {
       "utf8",
     ),
   ).generation as string;
+}
+
+/** Absolute path of one collection's index directory. */
+function collectionRoot(collection: string): string {
+  const key = `${collection
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)}-${sha256(collection.toLowerCase()).slice(0, 12)}`;
+  return path.join(stateDir, "index", "collections", key);
+}
+
+/** One collection's derived state, read straight off disk. */
+interface IndexState {
+  generation: string;
+  /** Vault paths the manifest names, sorted. */
+  vaultPaths: string[];
+  /** Rows in the generation's `documents` table. */
+  chunkRows: number;
+}
+
+/**
+ * Reads a collection's pointer, manifest and database directly.
+ *
+ * Deliberately not through `search`: a search rebuilds missing derived state on
+ * the spot, so asserting reconstruction through one would assert that the
+ * repair path works rather than that the rebuild did anything.
+ */
+function readIndexState(collection: string): IndexState {
+  const root = collectionRoot(collection);
+  const generation = (
+    JSON.parse(fs.readFileSync(path.join(root, "current.json"), "utf8")) as {
+      generation: string;
+    }
+  ).generation;
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(root, "generations", generation, "manifest.json"), "utf8"),
+  ) as { entries: { vaultPath: string }[] };
+
+  const db = new Database(path.join(root, "generations", generation, "documents.db"), {
+    readonly: true,
+  });
+  try {
+    const row = db.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number };
+    return {
+      generation,
+      vaultPaths: manifest.entries.map((entry) => entry.vaultPath).sort(),
+      chunkRows: row.n,
+    };
+  } finally {
+    db.close();
+  }
 }
 
 /** Holds the index lock in a separate process until the returned release runs. */
@@ -252,6 +325,7 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     // local fixture therefore needs this run's own directory named explicitly;
     // pointing DOCS_MCP_CONFIG at it also keeps the run read-only with respect
     // to the operator's real configuration file.
+    logFile = path.join(stateDir, "events.jsonl");
     configFile = path.join(stateDir, "config.yaml");
     fs.writeFileSync(
       configFile,
@@ -458,7 +532,7 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     const otherSource = path.join(path.dirname(sourceFile), "toolboxical.md");
     fs.writeFileSync(
       otherSource,
-      SOURCE_MARKDOWN.replace(new RegExp(PHRASE, "g"), "toolboxical"),
+      SOURCE_MARKDOWN.replace(new RegExp(PHRASE, "gi"), "toolboxical"),
       "utf8",
     );
 
@@ -474,13 +548,15 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
     expect(captured.code).toBe(0);
 
     /**
-     * Asserts one collection holds a retrievable note carrying `phrase`.
+     * Asserts one collection holds a retrievable note carrying `phrase`, and
+     * that answering did not rebuild anything.
      *
-     * Not an exact result count: earlier tests in this file deliberately leave
-     * more than one note in the inbox, and a count would then be asserting how
-     * many fixtures ran rather than whether retrieval works.
+     * The rebuild check is the point: a search repairs missing derived state on
+     * the spot, so a retrieval assertion on its own cannot tell "the index was
+     * rebuilt correctly" from "the index was missing and the search rebuilt it".
      */
     const retrievable = async (collection: string, phrase: string): Promise<void> => {
+      const before = readIndexState(collection);
       const found = await runVaultCli([
         "search",
         phrase,
@@ -491,6 +567,7 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
         "--json",
       ]);
       expect(found.code).toBe(0);
+
       const results = envelopeOf(found).results as { vault_path: string }[];
       expect(results.length).toBeGreaterThanOrEqual(1);
       const bodies = results.map((result) =>
@@ -498,13 +575,24 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
       );
       expect(bodies.some((body) => body.toLowerCase().includes(phrase))).toBe(true);
       expect(found.listenCalls).toEqual([]);
+
+      // The search emitted no rebuild and moved no pointer.
+      expect(found.events.map((entry) => entry.event)).not.toContain("index.rebuilt");
+      expect(found.events.map((entry) => entry.event)).not.toContain(
+        "index.state_missing",
+      );
+      expect(readIndexState(collection)).toEqual(before);
     };
 
-    // Both collections retrievable before anything is deleted.
+    // Both collections are retrievable, and answering leaves them alone.
     await retrievable("inbox", PHRASE);
     await retrievable("toolbox", "toolboxical");
 
-    // Rebuilding one collection leaves the other's index in place.
+    // Snapshot the collection that is about to be left alone, in full.
+    const toolboxBefore = readIndexState("toolbox");
+    expect(toolboxBefore.vaultPaths.length).toBeGreaterThan(0);
+    expect(toolboxBefore.chunkRows).toBeGreaterThan(0);
+
     const rebuiltInbox = await runVaultCli([
       "reindex",
       "--collection",
@@ -514,11 +602,19 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
       "--json",
     ]);
     expect(rebuiltInbox.code).toBe(0);
-    const toolboxGeneration = activeGeneration("toolbox");
-    expect(toolboxGeneration).toBeTruthy();
+    // The rebuild really did rebuild, and it named only the collection asked for.
+    const rebuildEvents = rebuiltInbox.events.filter(
+      (entry) => entry.event === "index.rebuilt",
+    );
+    expect(rebuildEvents).toHaveLength(1);
+    expect(rebuildEvents[0].ctx.collection).toBe("inbox");
+
+    // Its sibling is untouched: same generation, same manifest, same rows.
+    expect(readIndexState("toolbox")).toEqual(toolboxBefore);
 
     // Now delete the whole index and rebuild it, collection by collection.
     fs.rmSync(path.join(stateDir, "index"), { recursive: true, force: true });
+    expect(fs.existsSync(path.join(stateDir, "index"))).toBe(false);
 
     for (const collection of ["inbox", "toolbox"]) {
       const rebuilt = await runVaultCli([
@@ -532,6 +628,18 @@ describe.skipIf(!cliAvailable)("sb-docs index E2E", () => {
       expect(rebuilt.code).toBe(0);
       expect(envelopeOf(rebuilt).status).toBe("rebuilt");
     }
+
+    // Both indexes exist, on disk, before anything searches them.
+    const inboxAfter = readIndexState("inbox");
+    const toolboxAfter = readIndexState("toolbox");
+    expect(inboxAfter.chunkRows).toBeGreaterThan(0);
+    expect(toolboxAfter.chunkRows).toBeGreaterThan(0);
+    expect(toolboxAfter.vaultPaths).toEqual(toolboxBefore.vaultPaths);
+    expect(inboxAfter.vaultPaths.every((p) => p.startsWith("00 Inbox/"))).toBe(true);
+    expect(
+      toolboxAfter.vaultPaths.every((p) => p.startsWith("30 Tools-Models/Doc Sets/")),
+    ).toBe(true);
+    expect(inboxAfter.generation).not.toBe(toolboxAfter.generation);
 
     await retrievable("inbox", PHRASE);
     await retrievable("toolbox", "toolboxical");

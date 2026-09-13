@@ -388,6 +388,53 @@ describe("createJsonlLogger", () => {
       else process.env.SB_DOCS_LOG = previous;
     }
   });
+
+  it("writes to the sink SB_DOCS_LOG_FILE names", () => {
+    // Redirecting the sink is what makes a run's own events assertable from
+    // outside it, without writing into the operator's log.
+    const file = path.join(stateDir, "redirected.jsonl");
+    const enabled = process.env.SB_DOCS_LOG;
+    const sink = process.env.SB_DOCS_LOG_FILE;
+    process.env.SB_DOCS_LOG = "1";
+    process.env.SB_DOCS_LOG_FILE = file;
+    try {
+      createJsonlLogger()({ level: "info", event: "redirected", loc: "l", ctx: {} });
+
+      const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0]).event).toBe("redirected");
+    } finally {
+      if (enabled === undefined) delete process.env.SB_DOCS_LOG;
+      else process.env.SB_DOCS_LOG = enabled;
+      if (sink === undefined) delete process.env.SB_DOCS_LOG_FILE;
+      else process.env.SB_DOCS_LOG_FILE = sink;
+    }
+  });
+
+  it("prefers an explicit sink over the environment override", () => {
+    const explicit = path.join(stateDir, "explicit.jsonl");
+    const overridden = path.join(stateDir, "overridden.jsonl");
+    const enabled = process.env.SB_DOCS_LOG;
+    const sink = process.env.SB_DOCS_LOG_FILE;
+    process.env.SB_DOCS_LOG = "1";
+    process.env.SB_DOCS_LOG_FILE = overridden;
+    try {
+      createJsonlLogger({ filePath: explicit })({
+        level: "info",
+        event: "e",
+        loc: "l",
+        ctx: {},
+      });
+
+      expect(fs.existsSync(explicit)).toBe(true);
+      expect(fs.existsSync(overridden)).toBe(false);
+    } finally {
+      if (enabled === undefined) delete process.env.SB_DOCS_LOG;
+      else process.env.SB_DOCS_LOG = enabled;
+      if (sink === undefined) delete process.env.SB_DOCS_LOG_FILE;
+      else process.env.SB_DOCS_LOG_FILE = sink;
+    }
+  });
 });
 
 describe("PublicationJournal durability", () => {

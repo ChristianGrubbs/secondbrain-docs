@@ -24,6 +24,7 @@ import {
   IndexVerificationError,
   VaultIndex,
   type VaultIndexOptions,
+  VERIFY_PAGE_SIZE,
 } from "./VaultIndex";
 import { SOURCE_UPDATES_PATH } from "./VaultPublisher";
 
@@ -1273,6 +1274,434 @@ describe("VaultIndex", () => {
         note.path,
       ]);
       expect(vault.writes).toEqual([]);
+    });
+  });
+  describe("verification probes come from what was stored", () => {
+    it("promotes a note whose longest raw token is dropped by the converter", async () => {
+      const vault = new FakeVault();
+      // Two long tokens that exist in the Markdown and in nothing the splitter
+      // stores: one inside an HTML comment, one in an unused link reference
+      // definition. A probe chosen from the raw note would look for a string
+      // that is nowhere in any chunk and reject a perfectly good rebuild.
+      const note = sourceNote({
+        url: "https://example.com/invisible",
+        title: "Invisible",
+        body: [
+          "# Retrievable Heading",
+          "",
+          "The retrievable prose of this note mentions cromulently several",
+          "times so that ordinary search has something to find.",
+          "",
+          "<!-- supercalifragilisticexpialidocious hidden in a comment -->",
+          "",
+          "[unusedreferencedefinitionlabel]: https://example.com/never-rendered",
+          "",
+          "More retrievable prose, cromulently again, to give the splitter a",
+          "second paragraph of ordinary text.",
+        ].join("\n"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(1);
+
+      // The fixture is only meaningful if those tokens really are the longest
+      // in the raw note and really are absent from every stored chunk.
+      const stored = storedChunks(index)
+        .map((chunk) => chunk.content)
+        .join("\n");
+      expect(note.markdown).toContain("supercalifragilisticexpialidocious");
+      expect(note.markdown).toContain("unusedreferencedefinitionlabel");
+      expect(stored).not.toContain("supercalifragilisticexpialidocious");
+      expect(stored).not.toContain("unusedreferencedefinitionlabel");
+
+      const response = await index.search({
+        query: "cromulently",
+        collection: COLLECTION,
+      });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+    });
+  });
+
+  describe("missing derived state", () => {
+    /** Indexes one note, then returns it and the vault it lives in. */
+    async function built(): Promise<{
+      vault: FakeVault;
+      note: ReturnType<typeof sourceNote>;
+      index: VaultIndex;
+    }> {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/derived",
+        title: "Derived",
+        body: body("derivative"),
+      });
+      vault.notes.set(note.path, note.markdown);
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      return { vault, note, index };
+    }
+
+    it("rebuilds rather than reporting an empty index when no pointer exists", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/unbuilt",
+        title: "Unbuilt",
+        body: body("unbuiltium"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      // Nothing has ever indexed this collection. The vault holds the note, so
+      // "ok, nothing found" would be a false statement about the vault.
+      const index = makeIndex(vault);
+      const response = await index.search({
+        query: "unbuiltium",
+        collection: COLLECTION,
+      });
+
+      expect(response.status).toBe("ok");
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(index.manifestEntries(COLLECTION)).toHaveLength(1);
+    });
+
+    it("rebuilds when the pointer names a generation that is gone", async () => {
+      const { note, index } = await built();
+      fs.rmSync(activeGenerationDir(index), { recursive: true, force: true });
+
+      const response = await index.search({
+        query: "derivative",
+        collection: COLLECTION,
+      });
+
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+    });
+
+    it("rebuilds when the pointer file has been removed", async () => {
+      const { note, index } = await built();
+      fs.rmSync(path.join(index.collectionRoot(COLLECTION), "current.json"));
+
+      const response = await index.search({
+        query: "derivative",
+        collection: COLLECTION,
+      });
+
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+    });
+
+    it("rebuilds when the manifest was written by an older format", async () => {
+      const { note, index } = await built();
+      const manifestFile = path.join(activeGenerationDir(index), "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      fs.writeFileSync(
+        manifestFile,
+        JSON.stringify({ ...manifest, version: 1 }, null, 2),
+        "utf8",
+      );
+
+      const response = await index.search({
+        query: "derivative",
+        collection: COLLECTION,
+      });
+
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(index.manifestEntries(COLLECTION)).toHaveLength(1);
+    });
+
+    it("rebuilds when only the single-pointer layout that preceded this one exists", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/legacylayout",
+        title: "Legacy Layout",
+        body: body("legacium"),
+      });
+      vault.notes.set(note.path, note.markdown);
+      const index = makeIndex(vault);
+
+      // The layout before per-collection indexes: one pointer and one
+      // generations directory directly under `index/`, with no collections
+      // directory at all.
+      const legacyRoot = path.join(stateDir, "index");
+      const legacyGeneration = "gen-2026-09-12T00-00-00-000Z-legacy";
+      fs.mkdirSync(path.join(legacyRoot, "generations", legacyGeneration), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(legacyRoot, "current.json"),
+        JSON.stringify({ generation: legacyGeneration, switchedAt: "2026-09-12" }),
+        "utf8",
+      );
+      fs.writeFileSync(
+        path.join(legacyRoot, "generations", legacyGeneration, "manifest.json"),
+        JSON.stringify({ version: 1, generation: legacyGeneration, entries: [] }),
+        "utf8",
+      );
+
+      const response = await index.search({ query: "legacium", collection: COLLECTION });
+
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(
+        fs.existsSync(path.join(index.collectionRoot(COLLECTION), "current.json")),
+      ).toBe(true);
+    });
+
+    it("answers from what an upsert built, without rebuilding behind it", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/upsertfirst",
+        title: "Upsert First",
+        body: body("upsertium"),
+      });
+      const neighbour = sourceNote({
+        url: "https://example.com/neighbour",
+        title: "Neighbour",
+        body: body("neighbourium"),
+      });
+      vault.notes.set(note.path, note.markdown);
+      vault.notes.set(neighbour.path, neighbour.markdown);
+
+      // A capture indexes one note into a collection nothing has rebuilt.
+      const index = makeIndex(vault);
+      await index.upsert(entryFor(note));
+
+      const response = await index.search({ query: "upsertium", collection: COLLECTION });
+      expect(response.results.map((r) => r.vault_path)).toEqual([note.path]);
+
+      // The search answered from the generation the upsert built rather than
+      // rebuilding from discovery, so the neighbour it never indexed is still
+      // absent.
+      expect(index.manifestEntries(COLLECTION).map((e) => e.vaultPath)).toEqual([
+        note.path,
+      ]);
+      const other = await index.search({
+        query: "neighbourium",
+        collection: COLLECTION,
+      });
+      expect(other.results).toEqual([]);
+    });
+
+    it("reports an empty answer for a collection a rebuild found nothing in", async () => {
+      const vault = new FakeVault();
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(0);
+
+      // Built, and genuinely empty: this answer is about the vault.
+      const response = await index.search({ query: "anything", collection: COLLECTION });
+      expect(response.status).toBe("ok");
+      expect(response.results).toEqual([]);
+    });
+  });
+
+  describe("version labels that upstream would normalize", () => {
+    it.each([
+      ["a leading space", " Release", "leadingspacium"],
+      ["a trailing space", "Release ", "trailingspacium"],
+      ["only whitespace", "   ", "whitespacium"],
+    ])("indexes and retrieves a version with %s", async (_name, version, phrase) => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/spaced",
+        title: "Spaced",
+        body: body(phrase),
+        version,
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      const index = makeIndex(vault);
+      const report = await index.rebuild({ collection: COLLECTION });
+      expect(report.notesIndexed).toBe(1);
+
+      const response = await index.search({
+        query: phrase,
+        collection: COLLECTION,
+        version,
+      });
+      expect(response.status).toBe("ok");
+      expect(response.results).toHaveLength(1);
+      expect(response.results[0]).toMatchObject({
+        vault_path: note.path,
+        version,
+        digest: sha256(note.markdown),
+      });
+    });
+
+    it("keeps a padded version and its trimmed twin apart", async () => {
+      const vault = new FakeVault();
+      const padded = sourceNote({
+        url: "https://example.com/padding",
+        title: "Padding",
+        body: body("paddedium"),
+        version: " Release",
+      });
+      const trimmed = sourceNote({
+        url: "https://example.com/padding",
+        title: "Padding",
+        body: body("trimmedium"),
+        version: "Release",
+      });
+      vault.notes.set(padded.path, padded.markdown);
+      vault.notes.set(trimmed.path, trimmed.markdown);
+      expect(padded.path).not.toBe(trimmed.path);
+
+      const index = makeIndex(vault);
+      await index.rebuild({ collection: COLLECTION });
+      expect(index.manifestEntries(COLLECTION)).toHaveLength(2);
+
+      const first = await index.search({
+        query: "paddedium",
+        collection: COLLECTION,
+        version: " Release",
+      });
+      expect(first.results.map((r) => r.vault_path)).toEqual([padded.path]);
+      expect(first.results[0].excerpt).not.toContain("trimmedium");
+
+      const second = await index.search({
+        query: "trimmedium",
+        collection: COLLECTION,
+        version: "Release",
+      });
+      expect(second.results.map((r) => r.vault_path)).toEqual([trimmed.path]);
+      expect(second.results[0].excerpt).not.toContain("paddedium");
+    });
+  });
+
+  describe("generations larger than one verification page", () => {
+    /**
+     * Splitter sizes small enough that a modest fixture crosses the 1,000-chunk
+     * paging boundary. These are ordinary configuration, not a test seam: the
+     * store, the splitter and the verification paging all read them.
+     */
+    function tinyChunkConfig(): AppConfig {
+      return {
+        ...appConfig,
+        splitter: {
+          ...appConfig.splitter,
+          minChunkSize: 10,
+          preferredChunkSize: 20,
+          maxChunkSize: 60,
+        },
+      };
+    }
+
+    /** Builds `count` notes whose URLs sort in the order they are created. */
+    function manyNotes(vault: FakeVault, count: number): ReturnType<typeof sourceNote>[] {
+      return Array.from({ length: count }, (_unused, n) => {
+        const ordinal = String(n).padStart(4, "0");
+        const note = sourceNote({
+          url: `https://example.com/paged/${ordinal}`,
+          title: `Paged ${ordinal}`,
+          body: [
+            `# Paged ${ordinal}`,
+            "",
+            `Paragraph one of note ${ordinal} with enough words to split.`,
+            "",
+            `Paragraph two of note ${ordinal}, mentioning pagination plainly.`,
+            "",
+            `Paragraph three of note ${ordinal}, closing this document out.`,
+          ].join("\n"),
+        });
+        vault.notes.set(note.path, note.markdown);
+        return note;
+      });
+    }
+
+    it("verifies and retrieves a generation of more than one page of chunks", async () => {
+      const vault = new FakeVault();
+      const notes = manyNotes(vault, 260);
+
+      const index = makeIndex(vault, { appConfig: tinyChunkConfig() });
+      const report = await index.rebuild({ collection: COLLECTION });
+
+      expect(report.notesIndexed).toBe(notes.length);
+      // The point of the fixture: verification had to page.
+      expect(report.chunks).toBeGreaterThan(VERIFY_PAGE_SIZE);
+      expect(storedChunks(index).length).toBe(report.chunks);
+
+      // A note whose chunks sit beyond the first page is still retrievable.
+      const last = notes[notes.length - 1];
+      const response = await index.search({
+        query: `note ${String(notes.length - 1).padStart(4, "0")}`,
+        collection: COLLECTION,
+        limit: 20,
+      });
+      expect(response.results.map((r) => r.vault_path)).toContain(last.path);
+    });
+
+    it("catches corruption that only shows up on a later verification page", async () => {
+      const vault = new FakeVault();
+      manyNotes(vault, 260);
+      const index = makeIndex(vault, { appConfig: tinyChunkConfig() });
+      await index.rebuild({ collection: COLLECTION });
+      const generation = activeGeneration(index);
+
+      const LEGACY = `${FOLDER}/Legacy Paging Trigger.md`;
+      vault.hooks.push((args) => {
+        if (args[0] !== "read" || args[1] !== LEGACY) return;
+        const db = new Database(path.join(pendingGenerationDir(index), "documents.db"));
+        try {
+          // The highest-sorting page only, so its rows are read well past the
+          // first verification page rather than in the opening window.
+          db.prepare(
+            "UPDATE pages SET url = ? WHERE url = (SELECT MAX(url) FROM pages)",
+          ).run("https://example.com/zzz-ghosted");
+        } finally {
+          db.close();
+        }
+      });
+
+      await expect(
+        index.rebuild({ collection: COLLECTION, inventory: [LEGACY] }),
+      ).rejects.toBeInstanceOf(IndexVerificationError);
+
+      expect(activeGeneration(index)).toBe(generation);
+      const response = await index.search({
+        query: "pagination",
+        collection: COLLECTION,
+        limit: 5,
+      });
+      expect(response.results.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("generation pruning", () => {
+    it("keeps the current generation and its parent across repeated rebuilds", async () => {
+      const vault = new FakeVault();
+      const note = sourceNote({
+        url: "https://example.com/pruned",
+        title: "Pruned",
+        body: body("prunable"),
+      });
+      vault.notes.set(note.path, note.markdown);
+
+      // One instance holds an open store on the first generation for the whole
+      // sequence, so pruning happens underneath a live reader.
+      const reader = makeIndex(vault);
+      const writer = makeIndex(vault);
+      await writer.rebuild({ collection: COLLECTION });
+      const first = await reader.search({ query: "prunable", collection: COLLECTION });
+      expect(first.results).toHaveLength(1);
+      const generations = [activeGeneration(reader)];
+
+      for (let round = 0; round < 3; round += 1) {
+        await writer.rebuild({ collection: COLLECTION });
+        generations.push(activeGeneration(reader));
+      }
+
+      const root = path.join(reader.collectionRoot(COLLECTION), "generations");
+      const kept = fs.readdirSync(root).sort();
+      const current = generations[generations.length - 1];
+      const parent = generations[generations.length - 2];
+
+      expect(kept).toEqual([parent, current].sort());
+      expect(generations[0]).not.toBe(current);
+      expect(kept).not.toContain(generations[0]);
+
+      // The reader, still holding a handle to a generation that has been
+      // deleted, follows the pointer to the current one on its next query.
+      const after = await reader.search({ query: "prunable", collection: COLLECTION });
+      expect(after.results.map((r) => r.vault_path)).toEqual([note.path]);
+      expect(after.results[0].digest).toBe(sha256(note.markdown));
     });
   });
 });
