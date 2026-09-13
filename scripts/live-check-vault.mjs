@@ -69,7 +69,7 @@ export function resolveGuardedState({ stateDirArg, liveVaultPath, overwriteConfi
   // still follow the symlink into the live vault. Symlinks are rejected
   // outright here, before the containment check ever runs, rather than
   // attempting to resolve a target that may not exist.
-  assertNotSymlink(stateDir, "state directory");
+  assertNotSymlink({ candidatePath: stateDir, label: "state directory" });
   assertNotLiveVault(stateDir, liveVaultPath);
 
   const configFile = path.join(stateDir, "config.yaml");
@@ -77,7 +77,7 @@ export function resolveGuardedState({ stateDirArg, liveVaultPath, overwriteConfi
   // `configFile`-shaped symlink alias distinct from `stateDir` itself in a
   // future revision of this script, and this keeps the guard from
   // depending on that never changing.
-  assertNotSymlink(configFile, "config.yaml");
+  assertNotSymlink({ candidatePath: configFile, label: "config.yaml" });
   assertNotLiveVault(configFile, liveVaultPath);
 
   const configPreexisted = fs.existsSync(configFile);

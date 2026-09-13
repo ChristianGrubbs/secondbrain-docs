@@ -201,8 +201,12 @@ describe("vault-guard", () => {
         const link = path.join(scratch, "another-dangling-link");
         fs.symlinkSync(path.join(scratch, "nonexistent-target-2"), link);
 
-        expect(() => assertNotSymlink(link, "config.yaml")).toThrow(/symlinked config\.yaml/);
-        expect(() => assertNotSymlink(plainFile, "config.yaml")).not.toThrow();
+        expect(() => assertNotSymlink({ candidatePath: link, label: "config.yaml" })).toThrow(
+          /symlinked config\.yaml/,
+        );
+        expect(() =>
+          assertNotSymlink({ candidatePath: plainFile, label: "config.yaml" }),
+        ).not.toThrow();
       });
     },
   );

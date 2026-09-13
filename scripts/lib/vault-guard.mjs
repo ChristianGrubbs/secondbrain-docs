@@ -48,20 +48,6 @@ export function resolveNearestExistingAncestor(targetPath) {
 }
 
 /**
- * Reports whether `candidatePath` is the live vault itself or somewhere
- * inside it, after resolving both through symlinks (so a symlink alias
- * pointing into the live vault is caught, not just a direct path match).
- *
- * A live-vault path that does not exist on this machine is handled
- * explicitly: nothing can be a real symlink alias into a path that isn't
- * there, so the check safely reports `false` for every candidate rather than
- * throwing `ENOENT` out of `realpathSync`.
- *
- * @param {string} candidatePath The destination a caller wants to use.
- * @param {string} liveVaultPath The operator's real vault path.
- * @returns {boolean} True if `candidatePath` resolves inside `liveVaultPath`.
- */
-/**
  * Reports whether `candidatePath` itself is a symlink (dangling or not),
  * without following it.
  *
@@ -84,6 +70,20 @@ export function isSymlinkPath(candidatePath) {
   }
 }
 
+/**
+ * Reports whether `candidatePath` is the live vault itself or somewhere
+ * inside it, after resolving both through symlinks (so a symlink alias
+ * pointing into the live vault is caught, not just a direct path match).
+ *
+ * A live-vault path that does not exist on this machine is handled
+ * explicitly: nothing can be a real symlink alias into a path that isn't
+ * there, so the check safely reports `false` for every candidate rather than
+ * throwing `ENOENT` out of `realpathSync`.
+ *
+ * @param {string} candidatePath The destination a caller wants to use.
+ * @param {string} liveVaultPath The operator's real vault path.
+ * @returns {boolean} True if `candidatePath` resolves inside `liveVaultPath`.
+ */
 export function isInsideLiveVault(candidatePath, liveVaultPath) {
   let liveVaultReal;
   try {
@@ -136,10 +136,10 @@ export function assertNotLiveVault(candidatePath, liveVaultPath) {
  * both an existing-target and a dangling-target alias into the live vault,
  * and never allows a case this guard cannot fully verify.
  *
- * @param {string} candidatePath
- * @param {string} label Human-readable description used in the error message.
+ * @param options.candidatePath The path to check.
+ * @param options.label Human-readable description used in the error message.
  */
-export function assertNotSymlink(candidatePath, label) {
+export function assertNotSymlink({ candidatePath, label }) {
   if (isSymlinkPath(candidatePath)) {
     throw new Error(
       `refusing to use a symlinked ${label} -- symlinks are never permitted here because a dangling one can alias the live vault without being resolvable: ${candidatePath}`,

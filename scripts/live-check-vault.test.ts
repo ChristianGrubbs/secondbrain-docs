@@ -96,6 +96,31 @@ describe(
       expect(fs.readdirSync(fakeLiveVault)).toEqual([]);
     });
 
+    it(
+      // MINOR 1 (2026-09-13 Codex frontier review, round 6): the two
+      // existing symlink-alias cases above symlink to the live vault
+      // ROOT (an existing directory). This proves the `stateDirArg`
+      // call-site itself is rejected when it is a DANGLING symlink whose
+      // target is a nonexistent path inside the live vault -- the state
+      // dir is never created, and nothing appears at the dangling target.
+      "rejects a stateDirArg that is a dangling symlink into a nonexistent live-vault path, before any write",
+      () => {
+        const alias = path.join(scratch, "dangling-alias-into-live-vault");
+        const nonexistentLiveVaultTarget = path.join(fakeLiveVault, "not-yet-created-state");
+        fs.symlinkSync(nonexistentLiveVaultTarget, alias);
+
+        expect(() =>
+          resolveGuardedState({
+            stateDirArg: alias,
+            liveVaultPath: fakeLiveVault,
+            overwriteConfig: false,
+          }),
+        ).toThrow(/live vault|symlink/);
+        expect(fs.existsSync(nonexistentLiveVaultTarget)).toBe(false);
+        expect(fs.readdirSync(fakeLiveVault)).toEqual([]);
+      },
+    );
+
     it("refuses to overwrite an existing config.yaml without --overwrite-config, and leaves its bytes untouched", () => {
       const stateDirArg = path.join(scratch, "existing-state");
       fs.mkdirSync(stateDirArg, { recursive: true });
