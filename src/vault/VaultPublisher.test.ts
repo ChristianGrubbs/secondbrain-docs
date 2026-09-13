@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
+import { stripCodeAndInlineSpans } from "./markdownLinks.mjs";
 import { ObsidianCli } from "./ObsidianCli";
 import { PublicationJournal } from "./PublicationJournal";
 import { renderSourceNote } from "./render";
@@ -204,12 +205,15 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-/** Counts index lines that live-link a note path. */
+/**
+ * Counts index lines that live-link a note path, using the same shared
+ * fence/inline-code stripper the publisher itself uses (MAJOR 2, 2026-09-13
+ * Codex frontier review round 5) -- not a test-local re-implementation that
+ * only strips backtick fences and would misclassify a link mentioned inside
+ * a tilde fence or inline code span as live.
+ */
 function linksTo(index: string, target: string): string[] {
-  return index
-    .split("```")
-    .filter((_, i) => i % 2 === 0)
-    .join("")
+  return stripCodeAndInlineSpans(index)
     .split("\n")
     .filter((line) => line.includes(`[[${target}`));
 }
@@ -993,6 +997,44 @@ describe("VaultPublisher review regressions", () => {
       cli.notes.set(
         indexPath,
         `# Source Captures\n\n## Sources\n\n\`\`\`\n- [[${target}]]\n\`\`\`\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// MAJOR 2 (2026-09-13 Codex frontier review, round 5): the fence
+    // stripper round 4 added only recognized backtick fences. A target
+    // mentioned only inside a tilde-fenced code block was still counted
+    // as a live link, so `linkFromIndex` believed the note was already
+    // linked and never added the real one.
+    "does not count a link inside a tilde-fenced code block as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\n~~~\n- [[${target}]]\n~~~\n`,
+      );
+
+      const republished = await publisher.publish(makeDocument());
+
+      expect(republished.moc).toBe("linked");
+      expect(linksTo(cli.notes.get(indexPath) ?? "", target)).toHaveLength(1);
+    });
+
+    it(// Same bug, inline-code-span shape: a target mentioned only inside
+    // `` `[[...]]` `` inline code (not a fenced block) must not be
+    // treated as a live link either.
+    "does not count a link inside an inline code span as a live link", async () => {
+      const first = await publisher.publish(makeDocument());
+      const indexPath = "00 Inbox/Source Captures/index.md";
+      const target = first.path.replace(/\.md$/, "");
+      cli.notes.set(
+        indexPath,
+        `# Source Captures\n\n## Sources\n\nSee the example \`[[${target}]]\` above.\n`,
       );
 
       const republished = await publisher.publish(makeDocument());

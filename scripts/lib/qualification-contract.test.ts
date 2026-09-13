@@ -305,6 +305,125 @@ describe("qualifyNote", () => {
     expect(result.reason).toMatch(/MOC link count 0/);
   });
 
+  it(
+    // MAJOR 2 (2026-09-13 Codex frontier review, round 5): a target that
+    // appears only inside a backtick-fenced code block must not count as a
+    // real link.
+    "rejects a MOC whose only mention of the target is inside a backtick-fenced code block",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-OMICRON-1015");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Example:\n\`\`\`\n- [[${target}]]\n\`\`\`\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-OMICRON-1015"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // MAJOR 2 (2026-09-13 Codex frontier review, round 5): round 4's
+    // stripCodeFences only recognized backtick fences; a target mentioned
+    // only inside a tilde-fenced code block was still counted as a real
+    // link.
+    "rejects a MOC whose only mention of the target is inside a tilde-fenced code block",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-PI-1016");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `Example:\n~~~\n- [[${target}]]\n~~~\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-PI-1016"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // MAJOR 2 (2026-09-13 Codex frontier review, round 5): a target
+    // mentioned only inside an inline code span (not a fenced block) must
+    // not count as a real link either.
+    "rejects a MOC whose only mention of the target is inside an inline code span",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-RHO-1017");
+      const target = notePath.replace(/\.md$/, "");
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `See the example \`[[${target}]]\` above.\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: sha256(savedBytes),
+        facts: ["FACT-RHO-1017"],
+        runCli: fakeRunCli(),
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/MOC link count 0/);
+    },
+  );
+
+  it(
+    // A real link alongside an unrelated code example mentioning the same
+    // target must still count as exactly one real link -- the code example
+    // must not be double-counted, and must not suppress the real link
+    // either.
+    "counts exactly one real link when a code example also mentions the target",
+    async () => {
+      const { notePath, savedBytes } = writeNoteAndMoc("FACT-SIGMA-1018");
+      const target = notePath.replace(/\.md$/, "");
+      const digest = sha256(savedBytes);
+      fs.writeFileSync(
+        path.join(vaultPath, "collection", "index.md"),
+        `- [[${target}|Fixture]]\n\nExample:\n\`\`\`\n- [[${target}]]\n\`\`\`\n`,
+        "utf8",
+      );
+
+      const result = await qualifyNote({
+        vaultPath,
+        notePath,
+        expectedDigest: digest,
+        facts: ["FACT-SIGMA-1018"],
+        collection: "collection",
+        query: "FACT-SIGMA-1018",
+        runCli: fakeRunCli({
+          search: {
+            code: 0,
+            stdout: JSON.stringify({ results: [{ vault_path: notePath, digest }] }),
+            stderr: "",
+          },
+          read: { code: 0, stdout: `${savedBytes}\n`, stderr: "" },
+        }),
+      });
+
+      expect(result.ok).toBe(true);
+    },
+  );
+
   it("accepts a valid single wikilink with an alias, matching the publisher's own emitted syntax", async () => {
     const { notePath, savedBytes } = writeNoteAndMoc("FACT-XI-1014");
     const target = notePath.replace(/\.md$/, "");

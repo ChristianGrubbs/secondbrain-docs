@@ -17,6 +17,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { countLinksTo } from "../../src/vault/markdownLinks.mjs";
 
 /** SHA-256 of a UTF-8 string, hex-encoded — matches `src/vault/identity.ts`'s `sha256`. */
 export function sha256(value) {
@@ -46,35 +47,28 @@ export function mocLinkTarget(notePath) {
 }
 
 /**
- * Removes fenced code blocks so a link shown as an example is not mistaken
- * for a live link. Mirrors `stripCodeFences` in `src/vault/VaultPublisher.ts`
- * exactly (MAJOR 1, 2026-09-13 Codex frontier review, round 4).
- */
-function stripCodeFences(markdown) {
-  return markdown
-    .split(/^```.*$/m)
-    .filter((_, index) => index % 2 === 0)
-    .join("\n");
-}
-
-/**
  * Counts real wikilink references to `target` in a MOC, using the exact
  * link syntax the fork's own publisher emits and detects
- * (`- [[target|alias]]` or `[[target]]`, from `VaultPublisher.ts`'s
- * `linkFromIndex`/`hasLinkTo`) -- not a substring match, which a MOC
- * containing only plain text mentioning the note's path (or a longer
+ * (`- [[target|alias]]` or `[[target]]`, from
+ * `src/vault/markdownLinks.mjs`'s `hasLinkTo`, shared with
+ * `VaultPublisher.ts`'s `linkFromIndex`) -- not a substring match, which a
+ * MOC containing only plain text mentioning the note's path (or a longer
  * sibling target sharing the same prefix, e.g. `collection/Fixture 2`)
  * would satisfy without a single navigable link (MAJOR 1, 2026-09-13 Codex
  * frontier review, round 4).
+ *
+ * Fenced code blocks (both ``` and ~~~ styles) and inline code spans are
+ * stripped before counting, by the ONE shared implementation
+ * `src/vault/markdownLinks.mjs` also uses -- not a second, independently
+ * drifting copy that only handled backtick fences (MAJOR 2, 2026-09-13
+ * Codex frontier review, round 5).
  *
  * @param moc The MOC note's Markdown.
  * @param target Vault path of the note, without its `.md` extension.
  * @returns The number of distinct `[[target]]`/`[[target|alias]]` matches.
  */
 export function countMocLinksTo(moc, target) {
-  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`\\[\\[${escaped}(\\|[^\\]]*)?\\]\\]`, "g");
-  return (stripCodeFences(moc).match(pattern) ?? []).length;
+  return countLinksTo(moc, target);
 }
 
 /**
