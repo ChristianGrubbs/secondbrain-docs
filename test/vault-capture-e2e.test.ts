@@ -71,6 +71,9 @@ const COLLECTIONS_UNDER_TEST = [
   "x03-cancelled",
   "m01-two-page",
   "m02-mixed-dir",
+  "sigclean-sigint",
+  "sigclean-sigterm",
+  "sigclean-sighup",
 ];
 
 interface VaultCliRun {
@@ -211,8 +214,8 @@ function writeConfig(configPath: string): void {
 }
 
 /** Reads one collection's MOC (`index.md`) under the sandbox vault. */
-function readMoc(folder: string): string {
-  return fs.readFileSync(path.join(sandbox, folder, "index.md"), "utf8");
+function readMoc(folder: string, vaultRoot: string = sandbox): string {
+  return fs.readFileSync(path.join(vaultRoot, folder, "index.md"), "utf8");
 }
 
 /** Counts occurrences of `needle` in `haystack`. */
@@ -223,6 +226,123 @@ function countOccurrences(haystack: string, needle: string): number {
 /** The MOC's wiki-link target for a saved note path (extensionless). */
 function mocLinkTarget(notePath: string): string {
   return notePath.replace(/\.md$/, "");
+}
+
+/** One frontmatter field extracted from saved note bytes, by exact YAML key. */
+function frontmatterField(markdown: string, key: string): string | undefined {
+  const frontmatterBlock = markdown.match(/^---\n([\s\S]*?)\n---/);
+  if (!frontmatterBlock) return undefined;
+  const line = frontmatterBlock[1]
+    .split("\n")
+    .find((l) => l.startsWith(`${key}:`));
+  if (!line) return undefined;
+  return line
+    .slice(key.length + 1)
+    .trim()
+    .replace(/^"(.*)"$/, "$1");
+}
+
+/**
+ * MAJOR 3 (2026-09-13 Codex frontier review): the one shared end-to-end
+ * publication-contract assertion every qualifying note in every row goes
+ * through. Establishes, for one already-published outcome: every required
+ * fact is present in the saved bytes, frontmatter identity metadata is
+ * correct, exactly one MOC link exists for it, `sb-docs search` resolves it
+ * by identity (path + digest) under the right collection/version scope, and
+ * `sb-docs read` returns the complete saved bytes — not merely that capture
+ * printed an envelope containing the right substring.
+ */
+async function assertQualifiedNote(options: {
+  outcome: {
+    publication?: { status: string; path: string; markdown: string; digest?: string };
+  };
+  facts: string[];
+  query: string;
+  collection: string;
+  version?: string;
+  sourceUrlContains?: string;
+  /** Overrides for a note published outside the shared sandbox (the C-rows' own throwaway vaults). */
+  vaultPath?: string;
+  stateDirOverride?: string;
+  configFileOverride?: string;
+}): Promise<void> {
+  const {
+    outcome,
+    facts,
+    query,
+    collection,
+    version,
+    sourceUrlContains,
+    vaultPath = sandbox,
+    stateDirOverride = stateDir,
+    configFileOverride = configFile,
+  } = options;
+  expect(outcome.publication?.status).toBe("published");
+  const notePath = outcome.publication?.path ?? "";
+  expect(notePath.length, "outcome must carry a saved note path").toBeGreaterThan(0);
+
+  const savedBytes = fs.readFileSync(path.join(vaultPath, notePath), "utf8");
+  for (const fact of facts) {
+    expect(savedBytes, `expected fact ${JSON.stringify(fact)} in saved note ${notePath}`).toContain(
+      fact,
+    );
+  }
+
+  // Frontmatter identity metadata.
+  const sourceId = frontmatterField(savedBytes, "source_id");
+  expect(sourceId, `${notePath} frontmatter missing source_id`).toBeTruthy();
+  const frontmatterVersion = frontmatterField(savedBytes, "version");
+  expect(frontmatterVersion).toBe(version ?? "");
+  if (sourceUrlContains !== undefined) {
+    const sourceUrl =
+      frontmatterField(savedBytes, "source_url") ??
+      frontmatterField(savedBytes, "requested_url");
+    expect(sourceUrl, `${notePath} frontmatter source_url/requested_url`).toContain(
+      sourceUrlContains,
+    );
+  }
+
+  // Whole-note digest: the outcome's own digest (over the saved bytes) must
+  // match what is actually on disk right now.
+  expect(sha256(savedBytes)).toBe(outcome.publication?.digest);
+
+  // Exactly one MOC link for this note.
+  const moc = readMoc(path.dirname(notePath), vaultPath);
+  expect(countOccurrences(moc, mocLinkTarget(notePath)), `MOC link count for ${notePath}`).toBe(
+    1,
+  );
+
+  // `sb-docs search` resolves this note's identity under the right scope.
+  const searchArgs = [
+    "search",
+    query,
+    "--collection",
+    collection,
+    "--state-dir",
+    stateDirOverride,
+    "--json",
+  ];
+  if (version !== undefined) searchArgs.push("--version", version);
+  const found = await runVaultCli(searchArgs, { vaultPath, configFile: configFileOverride });
+  expect(found.code, `search "${query}" for ${notePath}`).toBe(0);
+  const results = (envelopeOf(found).results as Array<{
+    vault_path: string;
+    digest: string;
+  }>) ?? [];
+  const match = results.find((r) => r.vault_path === notePath);
+  expect(
+    match,
+    `search "${query}" should resolve ${notePath}; got ${JSON.stringify(results)}`,
+  ).toBeDefined();
+  expect(match?.digest).toBe(outcome.publication?.digest);
+
+  // `sb-docs read` returns the complete saved bytes.
+  const readBack = await runVaultCli(["read", notePath], {
+    vaultPath,
+    configFile: configFileOverride,
+  });
+  expect(readBack.code, `read ${notePath}`).toBe(0);
+  expect(readBack.stdout).toBe(`${savedBytes}\n`);
 }
 
 describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", () => {
@@ -302,7 +422,14 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       const envelope = envelopeOf(run);
       const outcomes = envelope.outcomes as Array<{
         index: string;
-        publication?: { status: string; path: string; markdown: string; moc: string };
+        sourceUrl: string;
+        publication?: {
+          status: string;
+          path: string;
+          markdown: string;
+          moc: string;
+          digest?: string;
+        };
       }>;
       expect(outcomes).toHaveLength(2);
       for (const outcome of outcomes) {
@@ -310,39 +437,27 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         expect(outcome.index).toBe("indexed");
       }
 
-      const rootFound = await runVaultCli([
-        "search",
-        "PLUMTASTIC-1101",
-        "--collection",
-        "f04-two-page",
-        "--state-dir",
-        stateDir,
-        "--json",
-      ]);
-      expect(rootFound.code).toBe(0);
-      const rootResults = (envelopeOf(rootFound).results as Array<{ vault_path: string }>) ?? [];
-      expect(rootResults).toHaveLength(1);
+      const root = outcomes.find((o) => o.sourceUrl === `${baseUrl}/`);
+      const child = outcomes.find((o) => o.sourceUrl === `${baseUrl}/child`);
+      expect(root, "root outcome").toBeDefined();
+      expect(child, "child outcome").toBeDefined();
 
-      const childFound = await runVaultCli([
-        "search",
-        "GRAVELWORTH-1102",
-        "--collection",
-        "f04-two-page",
-        "--state-dir",
-        stateDir,
-        "--json",
-      ]);
-      const childResults =
-        (envelopeOf(childFound).results as Array<{ vault_path: string }>) ?? [];
-      expect(childResults).toHaveLength(1);
-
-      const moc = readMoc("30 Tools-Models/Doc Sets/f04-two-page");
-      expect(
-        countOccurrences(moc, mocLinkTarget(outcomes[0].publication?.path ?? "***")),
-      ).toBe(1);
-      expect(
-        countOccurrences(moc, mocLinkTarget(outcomes[1].publication?.path ?? "***")),
-      ).toBe(1);
+      await assertQualifiedNote({
+        outcome: root as (typeof outcomes)[number],
+        facts: ["PLUMTASTIC-1101"],
+        query: "PLUMTASTIC-1101",
+        collection: "f04-two-page",
+        version: "",
+        sourceUrlContains: baseUrl,
+      });
+      await assertQualifiedNote({
+        outcome: child as (typeof outcomes)[number],
+        facts: ["GRAVELWORTH-1102"],
+        query: "GRAVELWORTH-1102",
+        collection: "f04-two-page",
+        version: "",
+        sourceUrlContains: `${baseUrl}/child`,
+      });
     });
   });
 
@@ -466,10 +581,19 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
     // sample.docx is a Word-to-Markdown conversion fixture with a stable
     // "Continued Lists" section; a hit proves real conversion, not a stub.
-    expect(outcomes[0].publication?.markdown).toContain("Continued Lists");
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["Continued Lists"],
+      query: "Continued Lists",
+      collection: "f08-docx",
+      version: "",
+      sourceUrlContains: "sample.docx",
+    });
   });
 
   it("F09: mixed-file directory publishes one note per file, each linked once", async () => {
@@ -490,26 +614,36 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     expect(run.code).toBe(0);
     const envelope = envelopeOf(run);
     const outcomes = envelope.outcomes as Array<{
-      publication?: { path: string; markdown: string };
+      sourceUrl: string;
+      publication?: { status: string; path: string; markdown: string; digest?: string };
     }>;
     expect(outcomes).toHaveLength(3);
-    const bodies = outcomes.map((o) => o.publication?.markdown ?? "").join("\n");
-    expect(bodies).toContain("ALPHA-SENTINEL-7701");
-    expect(bodies).toContain("BETA-SENTINEL-7702");
-    expect(bodies).toContain("GAMMA-SENTINEL-7703");
 
-    const moc = readMoc("30 Tools-Models/Doc Sets/f09-mixed-dir");
-    for (const outcome of outcomes) {
-      expect(
-        countOccurrences(moc, mocLinkTarget(outcome.publication?.path ?? "***")),
-      ).toBe(1);
+    // Per file: the full qualification contract, not just a joined-bodies
+    // substring check.
+    const perFile: Array<{ sentinel: string; query: string; source: string }> = [
+      { sentinel: "ALPHA-SENTINEL-7701", query: "ALPHA-SENTINEL-7701", source: "alpha.md" },
+      { sentinel: "BETA-SENTINEL-7702", query: "BETA-SENTINEL-7702", source: "beta.txt" },
+      { sentinel: "GAMMA-SENTINEL-7703", query: "GAMMA-SENTINEL-7703", source: "gamma.json" },
+    ];
+    for (const file of perFile) {
+      const outcome = outcomes.find((o) => o.sourceUrl.endsWith(`/${file.source}`));
+      expect(outcome, `outcome for ${file.source}`).toBeDefined();
+      await assertQualifiedNote({
+        outcome: outcome as (typeof outcomes)[number],
+        facts: [file.sentinel],
+        query: file.query,
+        collection: "f09-mixed-dir",
+        version: "",
+        sourceUrlContains: file.source,
+      });
     }
   });
 
   it("F10: same source captured at two versions produces two distinct notes", async () => {
     const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-capqual-src-"));
     const sourceFile = path.join(sourceDir, "versioned.md");
-    fs.writeFileSync(sourceFile, "# Versioned\n\nTAFFYLOOP-2201 body v1.\n");
+    fs.writeFileSync(sourceFile, "# Versioned\n\nTAFFYLOOP-2201 body ONLYINV1TOKEN.\n");
 
     const v1 = await runVaultCli([
       "capture",
@@ -524,7 +658,7 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     ]);
     expect(v1.code).toBe(0);
 
-    fs.writeFileSync(sourceFile, "# Versioned\n\nTAFFYLOOP-2201 body v2.\n");
+    fs.writeFileSync(sourceFile, "# Versioned\n\nTAFFYLOOP-2201 body ONLYINV2TOKEN.\n");
     const v2 = await runVaultCli([
       "capture",
       sourceFile,
@@ -538,15 +672,63 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     ]);
     expect(v2.code).toBe(0);
 
-    const path1 = (envelopeOf(v1).outcomes as Array<{ publication?: { path: string } }>)[0]
-      .publication?.path;
-    const path2 = (envelopeOf(v2).outcomes as Array<{ publication?: { path: string } }>)[0]
-      .publication?.path;
+    type Outcome = { publication?: { status: string; path: string; markdown: string; digest?: string } };
+    const outcome1 = (envelopeOf(v1).outcomes as Outcome[])[0];
+    const outcome2 = (envelopeOf(v2).outcomes as Outcome[])[0];
+    const path1 = outcome1.publication?.path;
+    const path2 = outcome2.publication?.path;
     expect(path1).toBeDefined();
     expect(path2).toBeDefined();
     expect(path1).not.toBe(path2);
-    expect(fs.readFileSync(path.join(sandbox, path1 ?? ""), "utf8")).toContain("body v1");
-    expect(fs.readFileSync(path.join(sandbox, path2 ?? ""), "utf8")).toContain("body v2");
+
+    // Full contract per version, including version-scoped search: v1's
+    // query must resolve under version "v1" and not leak into "v2", and
+    // vice versa.
+    await assertQualifiedNote({
+      outcome: outcome1,
+      facts: ["ONLYINV1TOKEN"],
+      query: "ONLYINV1TOKEN",
+      collection: "f10-versions",
+      version: "v1",
+      sourceUrlContains: "versioned.md",
+    });
+    await assertQualifiedNote({
+      outcome: outcome2,
+      facts: ["ONLYINV2TOKEN"],
+      query: "ONLYINV2TOKEN",
+      collection: "f10-versions",
+      version: "v2",
+      sourceUrlContains: "versioned.md",
+    });
+
+    // Cross-version isolation: v1's own version scope must not surface v2's
+    // unique token, and vice versa (distinct tokens per version, not just
+    // "v1"/"v2" substrings, so FTS partial-term scoring can't produce a
+    // false-positive hit the way it can on shared words like "body").
+    const crossed1 = await runVaultCli([
+      "search",
+      "ONLYINV2TOKEN",
+      "--collection",
+      "f10-versions",
+      "--version",
+      "v1",
+      "--state-dir",
+      stateDir,
+      "--json",
+    ]);
+    expect((envelopeOf(crossed1).results as unknown[]).length).toBe(0);
+    const crossed2 = await runVaultCli([
+      "search",
+      "ONLYINV1TOKEN",
+      "--collection",
+      "f10-versions",
+      "--version",
+      "v2",
+      "--state-dir",
+      stateDir,
+      "--json",
+    ]);
+    expect((envelopeOf(crossed2).results as unknown[]).length).toBe(0);
   });
 
   it("F11: a manually edited existing capture keeps the human edit on recapture", async () => {
@@ -638,8 +820,20 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect((outcomes[0].publication?.markdown ?? "").length).toBeGreaterThan(20);
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    // sample.pptx's actual slide 1 title/subtitle text, verified directly
+    // from the fixture's slide XML (test/fixtures/create-office-fixtures.ts
+    // is a stale generator that no longer matches the committed fixture).
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["Presentation Title Text", "Subtitle Text"],
+      query: "Presentation Title Text",
+      collection: "f13-pptx",
+      version: "",
+      sourceUrlContains: "sample.pptx",
+    });
   });
 
   it("F14: XLSX preserves its factual cell content", async () => {
@@ -654,8 +848,21 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect((outcomes[0].publication?.markdown ?? "").length).toBeGreaterThan(10);
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    // Exact cells read directly from the committed fixture's sheet XML
+    // (test/fixtures/create-office-fixtures.ts is a stale generator that no
+    // longer matches this file): header row X/Y (sharedStrings 0/1), and
+    // two distinctive data rows: A8/B8 = 7/34, A12/B12 = 11/21.
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["| X | Y |", "| 7 | 34 |", "| 11 | 21 |"],
+      query: "34",
+      collection: "f14-xlsx",
+      version: "",
+      sourceUrlContains: "sample.xlsx",
+    });
   });
 
   it("F15: ipynb preserves its factual content", async () => {
@@ -670,8 +877,21 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect((outcomes[0].publication?.markdown ?? "").length).toBeGreaterThan(10);
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    // Prose (markdown cell) AND code (code cell) from test/fixtures/sample.ipynb.
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: [
+        "This is a test notebook for document pipeline testing.",
+        "print('Hello from Jupyter!')",
+      ],
+      query: "Hello from Jupyter",
+      collection: "f15-ipynb",
+      version: "",
+      sourceUrlContains: "sample.ipynb",
+    });
   });
 
   it("F16: JSON is captured as a readable source", async () => {
@@ -686,10 +906,22 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
     const original = fs.readFileSync(path.join(fixturesDir, "json.json"), "utf8");
-    const firstKey = Object.keys(JSON.parse(original))[0];
-    expect(outcomes[0].publication?.markdown).toContain(firstKey);
+    const parsed = JSON.parse(original);
+    const firstKey = Object.keys(parsed)[0];
+    // A key AND its value: `firstKey` is "slideshow"; its nested title value
+    // "Wake up to WonderWidgets!" is the row's factual content proof.
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: [firstKey, parsed[firstKey].slides[0].title],
+      query: "WonderWidgets",
+      collection: "f16-json",
+      version: "",
+      sourceUrlContains: "json.json",
+    });
   });
 
   it("F17: XML is captured as a readable source", async () => {
@@ -704,8 +936,18 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect((outcomes[0].publication?.markdown ?? "").length).toBeGreaterThan(10);
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    // The title slide's text from test/fixtures/xml.xml.
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["Wake up to WonderWidgets!"],
+      query: "WonderWidgets",
+      collection: "f17-xml",
+      version: "",
+      sourceUrlContains: "xml.xml",
+    });
   });
 
   it("F18: plain text preserves its exact sentinel", async () => {
@@ -720,8 +962,17 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect(outcomes[0].publication?.markdown).toContain("FLUMPADOODLE-9182");
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["FLUMPADOODLE-9182"],
+      query: "FLUMPADOODLE-9182",
+      collection: "f18-plaintext",
+      version: "",
+      sourceUrlContains: "plain.txt",
+    });
   });
 
   it("F19: source code preserves its exact sentinel", async () => {
@@ -736,35 +987,131 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
       "--json",
     ]);
     expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-    expect(outcomes[0].publication?.markdown).toContain("QUAGGLE-4471");
-    expect(outcomes[0].publication?.markdown).toContain("quaggle_factor");
+    const outcomes = envelopeOf(run).outcomes as Array<{
+      publication?: { status: string; path: string; markdown: string; digest?: string };
+    }>;
+    await assertQualifiedNote({
+      outcome: outcomes[0],
+      facts: ["QUAGGLE-4471", "quaggle_factor"],
+      query: "QUAGGLE-4471",
+      collection: "f19-source-code",
+      version: "",
+      sourceUrlContains: "source-code.py",
+    });
   });
 
-  it("F20: ZIP archive expands each member into its own captured note", async () => {
-    const zipFixture = copyFixtureToTemp("archive.zip");
-    const run = await runVaultCli([
-      "capture",
-      zipFixture,
-      "--collection",
-      "f20-zip",
-      "--max-pages",
-      "20",
-      "--max-depth",
-      "2",
-      "--state-dir",
-      stateDir,
-      "--json",
-    ]);
-    expect(run.code).toBe(0);
-    const outcomes = envelopeOf(run).outcomes as Array<{
-      publication?: { status: string };
-      skipped?: string;
-    }>;
-    expect(outcomes.length).toBeGreaterThanOrEqual(5);
-    const published = outcomes.filter((o) => o.publication?.status === "published");
-    expect(published.length).toBeGreaterThanOrEqual(5);
-  });
+  it(
+    // MAJOR 4 (2026-09-13 Codex frontier review): all nine members of
+    // test/fixtures/archive.zip are frozen with an expected disposition
+    // (all nine publish here — confirmed by direct inspection of a real
+    // capture run; none is expected to be excluded), a fact proving real
+    // conversion (not a stub), and the full qualification contract per
+    // published member — not "at least five of nine, something published."
+    "F20: ZIP archive publishes exactly its nine frozen members, each qualified",
+    async () => {
+      const zipFixture = copyFixtureToTemp("archive.zip");
+      const run = await runVaultCli([
+        "capture",
+        zipFixture,
+        "--collection",
+        "f20-zip",
+        "--max-pages",
+        "20",
+        "--max-depth",
+        "2",
+        "--state-dir",
+        stateDir,
+        "--json",
+      ]);
+      expect(run.code).toBe(0);
+      const outcomes = envelopeOf(run).outcomes as Array<{
+        sourceUrl: string;
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>;
+
+      const expectedMembers: Array<{ member: string; facts: string[]; query: string }> = [
+        { member: "sample.pptx", facts: ["Presentation Title Text"], query: "Presentation Title Text" },
+        { member: "sample.xlsx", facts: ["| 7 | 34 |"], query: "34" },
+        { member: "sample.pdf", facts: ["IP over Avian Carriers"], query: "Avian Carriers" },
+        { member: "robots.txt", facts: ["Disallow: /deny"], query: "Disallow" },
+        { member: "sample.ipynb", facts: ["print('Hello from Jupyter!')"], query: "Hello from Jupyter" },
+        { member: "sample.docx", facts: ["Demonstration of DOCX support in calibre"], query: "calibre" },
+        { member: "json.json", facts: ["slideshow", "Wake up to WonderWidgets!"], query: "WonderWidgets" },
+        { member: "xml.xml", facts: ["Wake up to WonderWidgets!"], query: "WonderWidgets" },
+        { member: "html.html", facts: ["Herman Melville", "Moby-Dick"], query: "Moby-Dick" },
+      ];
+
+      // Exact outcome membership: exactly these nine, nothing more, nothing
+      // fewer.
+      expect(outcomes).toHaveLength(expectedMembers.length);
+      const actualMembers = outcomes.map((o) => o.sourceUrl.split("/").pop()).sort();
+      expect(actualMembers).toEqual(expectedMembers.map((m) => m.member).sort());
+
+      // Every member is expected to publish; assert that uniformly before
+      // the per-member qualification loop.
+      for (const outcome of outcomes) {
+        expect(
+          outcome.publication?.status,
+          `${outcome.sourceUrl} expected to publish`,
+        ).toBe("published");
+      }
+
+      // XML and JSON share the query "WonderWidgets" (both fixtures encode
+      // the same slideshow data in different formats): scope each search to
+      // its own note by also checking file identity, since a shared query
+      // resolves multiple notes in the same collection.
+      for (const expected of expectedMembers) {
+        const outcome = outcomes.find((o) => o.sourceUrl.endsWith(`/${expected.member}`));
+        expect(outcome, `outcome for ${expected.member}`).toBeDefined();
+        const notePath = outcome?.publication?.path ?? "";
+        const savedBytes = fs.readFileSync(path.join(sandbox, notePath), "utf8");
+        for (const fact of expected.facts) {
+          expect(savedBytes, `${expected.member} missing fact ${JSON.stringify(fact)}`).toContain(
+            fact,
+          );
+        }
+        expect(sha256(savedBytes)).toBe(outcome?.publication?.digest);
+
+        const moc = readMoc(path.dirname(notePath));
+        expect(
+          countOccurrences(moc, mocLinkTarget(notePath)),
+          `MOC link count for ${notePath}`,
+        ).toBe(1);
+
+        const readBack = await runVaultCli(["read", notePath]);
+        expect(readBack.code).toBe(0);
+        expect(readBack.stdout).toBe(`${savedBytes}\n`);
+      }
+
+      // Search identity, scoped per member (not via the shared helper here
+      // because two members legitimately share a query term).
+      const searchTargets = new Map(
+        outcomes.map((o) => [o.sourceUrl.split("/").pop() ?? "", o]),
+      );
+      for (const expected of expectedMembers) {
+        const outcome = searchTargets.get(expected.member);
+        const notePath = outcome?.publication?.path ?? "";
+        const found = await runVaultCli([
+          "search",
+          expected.query,
+          "--collection",
+          "f20-zip",
+          "--state-dir",
+          stateDir,
+          "--json",
+        ]);
+        expect(found.code, `search "${expected.query}"`).toBe(0);
+        const results =
+          (envelopeOf(found).results as Array<{ vault_path: string; digest: string }>) ?? [];
+        const match = results.find((r) => r.vault_path === notePath);
+        expect(
+          match,
+          `search "${expected.query}" should resolve ${notePath}; got ${JSON.stringify(results)}`,
+        ).toBeDefined();
+        expect(match?.digest).toBe(outcome?.publication?.digest);
+      }
+    },
+  );
 
   describe("C-rows: real-CLI first-capture directory bootstrapping", () => {
     /** Spins up a brand-new throwaway vault + state dir, verifies the override gate. */
@@ -793,12 +1140,21 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         });
         expect(run.code).toBe(0);
         const outcomes = envelopeOf(run).outcomes as Array<{
-          publication?: { path: string; status: string };
+          publication?: { path: string; status: string; markdown: string; digest?: string };
         }>;
-        expect(outcomes[0].publication?.status).toBe("published");
         const notePath = outcomes[0].publication?.path ?? "";
         expect(notePath.startsWith("00 Inbox/Source Captures/")).toBe(true);
-        expect(fs.existsSync(path.join(vaultPath, notePath))).toBe(true);
+        await assertQualifiedNote({
+          outcome: outcomes[0],
+          facts: ["C01-BOOTSTRAP-1001"],
+          query: "C01-BOOTSTRAP-1001",
+          collection: "inbox",
+          version: "",
+          sourceUrlContains: "c01.txt",
+          vaultPath,
+          stateDirOverride: statePath,
+          configFileOverride: configPath,
+        });
       } finally {
         fs.rmSync(vaultPath, { recursive: true, force: true });
         fs.rmSync(statePath, { recursive: true, force: true });
@@ -819,12 +1175,22 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         );
         expect(run.code).toBe(0);
         const outcomes = envelopeOf(run).outcomes as Array<{
-          publication?: { path: string; status: string };
+          publication?: { path: string; status: string; markdown: string; digest?: string };
         }>;
-        expect(outcomes[0].publication?.status).toBe("published");
         expect(
           fs.existsSync(path.join(vaultPath, "30 Tools-Models/Doc Sets/c02-brand-new/index.md")),
         ).toBe(true);
+        await assertQualifiedNote({
+          outcome: outcomes[0],
+          facts: ["C02-BOOTSTRAP-1002"],
+          query: "C02-BOOTSTRAP-1002",
+          collection: "c02-brand-new",
+          version: "",
+          sourceUrlContains: "c02.txt",
+          vaultPath,
+          stateDirOverride: statePath,
+          configFileOverride: configPath,
+        });
       } finally {
         fs.rmSync(vaultPath, { recursive: true, force: true });
         fs.rmSync(statePath, { recursive: true, force: true });
@@ -845,20 +1211,22 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         );
         expect(run.code).toBe(0);
         const outcomes = envelopeOf(run).outcomes as Array<{
-          publication?: { path: string; status: string };
+          publication?: { path: string; status: string; markdown: string; digest?: string };
         }>;
-        expect(outcomes[0].publication?.status).toBe("published");
         expect(
           fs.existsSync(path.join(vaultPath, "30 Tools-Models/Doc Sets", collection, "index.md")),
         ).toBe(true);
-
-        const found = await runVaultCli(
-          ["search", "C03-UNICODE-1003", "--collection", collection, "--state-dir", statePath, "--json"],
-          { vaultPath, configFile: configPath },
-        );
-        expect(found.code).toBe(0);
-        const results = (envelopeOf(found).results as Array<{ vault_path: string }>) ?? [];
-        expect(results).toHaveLength(1);
+        await assertQualifiedNote({
+          outcome: outcomes[0],
+          facts: ["C03-UNICODE-1003"],
+          query: "C03-UNICODE-1003",
+          collection,
+          version: "",
+          sourceUrlContains: "c03.txt",
+          vaultPath,
+          stateDirOverride: statePath,
+          configFileOverride: configPath,
+        });
       } finally {
         fs.rmSync(vaultPath, { recursive: true, force: true });
         fs.rmSync(statePath, { recursive: true, force: true });
@@ -989,6 +1357,124 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     });
+
+    /** Live pids of any process whose command line touches the cached Playwright browser. */
+    function playwrightPids(): string[] {
+      try {
+        return execFileSync("pgrep", ["-f", "ms-playwright"], { encoding: "utf8" })
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+      } catch {
+        return [];
+      }
+    }
+
+    /** Directories under the system temp root whose name looks like a Playwright browser profile. */
+    function playwrightProfileDirs(): string[] {
+      try {
+        return fs
+          .readdirSync(os.tmpdir())
+          .filter((name) => /playwright/i.test(name))
+          .map((name) => path.join(os.tmpdir(), name));
+      } catch {
+        return [];
+      }
+    }
+
+    it.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)(
+      // MAJOR 1 (2026-09-13 Codex frontier review): a real %s sent to a
+      // browser-rendered capture must not leak Chromium descendant
+      // processes or their temp profile directories — regardless of
+      // whether the CLI itself bridges that signal into cancellation
+      // (only SIGINT is bridged; SIGTERM/SIGHUP rely entirely on
+      // Playwright's own default handlers, deliberately left enabled in
+      // BrowserFetcher.launchBrowser for exactly this reason).
+      "%s during a browser-rendered capture leaves no Chromium descendants or leaked temp profile dirs",
+      async (signal) => {
+        const server = http.createServer((req, res) => {
+          // Short enough to keep this test's wall time bounded even when
+          // SIGTERM/SIGHUP don't cancel the run (only SIGINT does): the CLI
+          // simply finishes naturally a couple of seconds after signalling.
+          const delayMs = req.url === "/slow" ? 6000 : 0;
+          setTimeout(() => {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            if (req.url === "/") {
+              res.end(
+                `<html><body><h1>SIGCLEAN-ROOT</h1><a href="${baseUrl}/slow">Slow</a></body></html>`,
+              );
+              return;
+            }
+            res.end("<html><body><h1>SIGCLEAN-SLOW</h1></body></html>");
+          }, delayMs);
+        });
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address();
+        if (address === null || typeof address === "string") throw new Error("bind failed");
+        const baseUrl = `http://127.0.0.1:${address.port}`;
+
+        const profilesBefore = new Set(playwrightProfileDirs());
+        let pidsAtSignalTime: string[] = [];
+
+        try {
+          await runVaultCli(
+            [
+              "capture",
+              `${baseUrl}/`,
+              "--collection",
+              `sigclean-${signal.toLowerCase()}`,
+              "--max-pages",
+              "5",
+              "--max-depth",
+              "1",
+              "--state-dir",
+              stateDir,
+              "--json",
+            ],
+            {
+              onSpawn: (proc) => {
+                setTimeout(() => {
+                  // Chromium has launched and the root page has published by
+                  // now (same 4s window X03 uses); record the live pids
+                  // right before signaling so the post-signal check has an
+                  // exact set to prove is gone, rather than a fuzzy "no
+                  // playwright pids anywhere" check that could be fooled by
+                  // an unrelated concurrent test run.
+                  pidsAtSignalTime = playwrightPids();
+                  proc.kill(signal);
+                }, 4000);
+              },
+            },
+          );
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+
+        expect(
+          pidsAtSignalTime.length,
+          "expected Chromium to actually be running at signal time for this test to prove anything",
+        ).toBeGreaterThan(0);
+
+        // Grace period for Playwright's own cleanup handlers to reap the
+        // browser process tree.
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+
+        const stillAlive = pidsAtSignalTime.filter((pid) => playwrightPids().includes(pid));
+        expect(
+          stillAlive,
+          `Chromium descendants from signal time still alive after ${signal}: ${stillAlive.join(", ")}`,
+        ).toEqual([]);
+
+        const leakedProfiles = playwrightProfileDirs().filter(
+          (dir) => !profilesBefore.has(dir),
+        );
+        expect(
+          leakedProfiles,
+          `temp profile dirs leaked after ${signal}: ${leakedProfiles.join(", ")}`,
+        ).toEqual([]);
+      },
+      30_000,
+    );
   });
 
   describe("M-rows: subprocess/vault access measurements (accepted cost, no threshold)", () => {
@@ -1039,19 +1525,33 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
               .readFileSync(logFile, "utf8")
               .split("\n")
               .filter(Boolean)
-              .map((line) => JSON.parse(line) as { event: string })
+              .map(
+                (line) =>
+                  JSON.parse(line) as {
+                    event: string;
+                    ctx?: { category?: string };
+                  },
+              )
           : [];
         const lockAcquisitions = events.filter((e) => e.event === "lock.acquired").length;
         const indexUpserts = events.filter((e) => e.event === "index.upserted").length;
+        // MINOR 7 (2026-09-13 Codex frontier review): actual obsidian-cli
+        // subprocess counts, classified by category, distinct from the
+        // lock/upsert counts above.
+        const cliInvocations = events.filter((e) => e.event === "vault.cli_invoked");
+        const listCalls = cliInvocations.filter((e) => e.ctx?.category === "list").length;
+        const readCalls = cliInvocations.filter((e) => e.ctx?.category === "read").length;
+        const writeCalls = cliInvocations.filter((e) => e.ctx?.category === "write").length;
 
         // Recorded, not asserted against a threshold (no cache/threshold is
         // to be invented here per Task 6 6B): the accepted per-capture
         // full-collection vault scan is a measured cost.
         console.log(
-          `[M01] two-page site: elapsedMs=${elapsedMs.toFixed(0)} lockAcquisitions=${lockAcquisitions} indexUpserts=${indexUpserts}`,
+          `[M01] two-page site: elapsedMs=${elapsedMs.toFixed(0)} lockAcquisitions=${lockAcquisitions} indexUpserts=${indexUpserts} subprocessTotal=${cliInvocations.length} vaultList=${listCalls} vaultRead=${readCalls} vaultWrite=${writeCalls}`,
         );
         expect(lockAcquisitions).toBeGreaterThan(0);
         expect(indexUpserts).toBeGreaterThan(0);
+        expect(cliInvocations.length).toBeGreaterThan(0);
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         fs.rmSync(logDir, { recursive: true, force: true });
@@ -1088,16 +1588,27 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
               .readFileSync(logFile, "utf8")
               .split("\n")
               .filter(Boolean)
-              .map((line) => JSON.parse(line) as { event: string })
+              .map(
+                (line) =>
+                  JSON.parse(line) as {
+                    event: string;
+                    ctx?: { category?: string };
+                  },
+              )
           : [];
         const lockAcquisitions = events.filter((e) => e.event === "lock.acquired").length;
         const indexUpserts = events.filter((e) => e.event === "index.upserted").length;
+        const cliInvocations = events.filter((e) => e.event === "vault.cli_invoked");
+        const listCalls = cliInvocations.filter((e) => e.ctx?.category === "list").length;
+        const readCalls = cliInvocations.filter((e) => e.ctx?.category === "read").length;
+        const writeCalls = cliInvocations.filter((e) => e.ctx?.category === "write").length;
 
         console.log(
-          `[M02] mixed-dir (3 files): elapsedMs=${elapsedMs.toFixed(0)} lockAcquisitions=${lockAcquisitions} indexUpserts=${indexUpserts}`,
+          `[M02] mixed-dir (3 files): elapsedMs=${elapsedMs.toFixed(0)} lockAcquisitions=${lockAcquisitions} indexUpserts=${indexUpserts} subprocessTotal=${cliInvocations.length} vaultList=${listCalls} vaultRead=${readCalls} vaultWrite=${writeCalls}`,
         );
         expect(lockAcquisitions).toBeGreaterThan(0);
         expect(indexUpserts).toBeGreaterThanOrEqual(3);
+        expect(cliInvocations.length).toBeGreaterThan(0);
       } finally {
         fs.rmSync(path.dirname(mixedDir), { recursive: true, force: true });
         fs.rmSync(logDir, { recursive: true, force: true });
@@ -1117,39 +1628,64 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         "--json",
       ]);
       expect(run.code).toBe(0);
-      const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-      expect(outcomes[0].publication?.markdown).toContain("Avian Carriers");
+      const outcomes = envelopeOf(run).outcomes as Array<{
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>;
+      await assertQualifiedNote({
+        outcome: outcomes[0],
+        facts: ["Avian Carriers"],
+        query: "Avian Carriers",
+        collection: "f01-single-page",
+        version: "",
+        sourceUrlContains: "rfc2549.txt",
+      });
     });
 
     it("F02: GitHub README (arabold/docs-mcp-server) captures known project text", async () => {
-      // GitHubScraperStrategy's depth-0 fetch for a base repo URL only
-      // *discovers* the file/wiki link list (`item.depth === 0` returns
-      // `links`, never content); actual blob content is fetched only when
-      // that discovered link is subsequently crawled at depth > 0. Without
-      // `--max-depth 1` (the CLI default is 0), discovery runs and then the
-      // crawl stops, producing zero outcomes with exit 1 and no run_error.
+      // MAJOR 3 (2026-09-13 Codex frontier review): a base-repo-URL crawl
+      // with a small `--max-pages` does NOT reliably include README.md --
+      // GitHub's tree listing is not alphabetical, and a real run with
+      // `--max-pages 5` fetched five `.agent/skills/*` files and the wiki
+      // page, never README.md. Capturing the README's own blob URL directly
+      // (the same depth-0-is-discovery-only path F03 already exercises for
+      // package.json) deterministically proves README capture, pinned to
+      // text unique to README.md's own H1 rather than the generic package
+      // name string that also appears in package.json and elsewhere in the
+      // repo. GitHub revision captured: the `main` branch, dated 2026-09-13
+      // (live row; content may drift upstream over time).
       const run = await runVaultCli([
         "capture",
-        "https://github.com/arabold/docs-mcp-server",
+        "https://github.com/arabold/docs-mcp-server/blob/main/README.md",
         "--collection",
         "f02-github-readme",
         "--max-depth",
         "1",
         "--max-pages",
-        "5",
+        "2",
         "--state-dir",
         stateDir,
         "--json",
       ]);
       expect(run.code).toBe(0);
-      const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-      expect(outcomes[0].publication?.markdown.toLowerCase()).toContain("docs-mcp-server");
+      const outcomes = envelopeOf(run).outcomes as Array<{
+        sourceUrl: string;
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>;
+      await assertQualifiedNote({
+        outcome: outcomes[0],
+        facts: ["Grounded Docs: Your AI's Up-to-Date Documentation Expert"],
+        query: "Grounded Docs",
+        collection: "f02-github-readme",
+        version: "",
+        sourceUrlContains: "README.md",
+      });
     });
 
     it("F03: GitHub blob (package.json) captures the exact package name", async () => {
       // Same depth-0-is-discovery-only behavior as F02: even a direct blob
       // URL only self-discovers at depth 0 (GitHubScraperStrategy.ts:609-634)
-      // and is fetched as content when re-visited at depth 1.
+      // and is fetched as content when re-visited at depth 1. GitHub
+      // revision captured: the `main` branch, dated 2026-09-13.
       const run = await runVaultCli([
         "capture",
         "https://github.com/arabold/docs-mcp-server/blob/main/package.json",
@@ -1164,8 +1700,17 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         "--json",
       ]);
       expect(run.code).toBe(0);
-      const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-      expect(outcomes[0].publication?.markdown).toContain("docs-mcp-server");
+      const outcomes = envelopeOf(run).outcomes as Array<{
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>;
+      await assertQualifiedNote({
+        outcome: outcomes[0],
+        facts: ["docs-mcp-server"],
+        query: "docs-mcp-server",
+        collection: "f03-github-blob",
+        version: "",
+        sourceUrlContains: "package.json",
+      });
     });
 
     it("F05: JS-rendered page (quotes.toscrape.com/js/) captures JS-injected text", async () => {
@@ -1179,8 +1724,17 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
         "--json",
       ]);
       expect(run.code).toBe(0);
-      const outcomes = envelopeOf(run).outcomes as Array<{ publication?: { markdown: string } }>;
-      expect(outcomes[0].publication?.markdown.toLowerCase()).toContain("albert einstein");
+      const outcomes = envelopeOf(run).outcomes as Array<{
+        publication?: { status: string; path: string; markdown: string; digest?: string };
+      }>;
+      await assertQualifiedNote({
+        outcome: outcomes[0],
+        facts: ["Albert Einstein"],
+        query: "Albert Einstein",
+        collection: "f05-js-rendered",
+        version: "",
+        sourceUrlContains: "quotes.toscrape.com",
+      });
     });
   });
 
@@ -1208,16 +1762,33 @@ describe.skipIf(!cliAvailable)(
      * can never resolve to the operator's real
      * `~/Library/Preferences/docs-mcp-server/config.yaml`.
      */
+    /**
+     * `ObsidianCli`'s executable path is `$HOME/ai-stack/bin/obsidian-cli`,
+     * resolved from `process.env.HOME` (`src/vault/ObsidianCli.ts`). A
+     * sandboxed `HOME` therefore also relocates *that* lookup, not just
+     * `env-paths`' config resolution — so the sandbox needs its own
+     * `ai-stack/bin/obsidian-cli` symlinked to the real one, or every
+     * command here would fail with `ENOENT` before ever reaching
+     * `loadConfig()`.
+     */
+    function symlinkObsidianCliInto(home: string): void {
+      const binDir = path.join(home, "ai-stack", "bin");
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.symlinkSync(cliPath, path.join(binDir, "obsidian-cli"));
+    }
+
     async function runWithUnsetConfig(
       args: string[],
       env: { home: string; vaultPath: string; stateDir: string },
     ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+      symlinkObsidianCliInto(env.home);
       return await new Promise((resolve, reject) => {
         const proc = spawn(vaultCliEntry, args, {
           cwd: projectRoot,
           stdio: ["ignore", "pipe", "pipe"],
           env: {
             PATH: process.env.PATH,
+            USER: process.env.USER,
             HOME: env.home,
             XDG_CONFIG_HOME: path.join(env.home, ".config"),
             OBSIDIAN_VAULT: env.vaultPath,
@@ -1258,8 +1829,20 @@ describe.skipIf(!cliAvailable)(
       }
     });
 
+    // MINOR 8 (2026-09-13 Codex frontier review): confirmed findings from a
+    // direct run of this exact probe, asserted explicitly rather than only
+    // logged — this documents the current defect, it is not a guarantee of
+    // desired behavior. If Task 7's config-containment fix lands, these
+    // expectations flip and must be updated, not left silently green.
+    const EXPECTED_CONFIG_CREATED: Record<string, boolean> = {
+      search: true,
+      read: false,
+      reindex: true,
+      capture: true,
+    };
+
     for (const command of ["search", "read", "reindex", "capture"] as const) {
-      it(`D03: "${command}" with DOCS_MCP_CONFIG unset — records whether the sandboxed default config is created`, async () => {
+      it(`D03: "${command}" with DOCS_MCP_CONFIG unset — confirmed config-creation finding`, async () => {
         const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-home-"));
         const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-vault-"));
         const localStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-state-"));
@@ -1280,20 +1863,32 @@ describe.skipIf(!cliAvailable)(
               "--json",
             ],
           };
-          await runWithUnsetConfig(commandArgs[command], {
+          const result = await runWithUnsetConfig(commandArgs[command], {
             home,
             vaultPath,
             stateDir: localStateDir,
           });
 
-          // Recorded as a fact either way — this is the finding, not an
-          // assertion of desired behavior. `loadConfig()` is not fixed in
-          // this packet; Task 7 must ship a read-only-loading fix or an
-          // enforced explicit config on every installed entry point.
+          // Proves each process actually reached its command handler
+          // (loadConfig() runs as part of that handler) rather than dying
+          // on an argument-parsing error before ever touching config: every
+          // command here produces either a JSON envelope on stdout (the
+          // `--json` cases) or, for `read` (no `--json` in its real usage),
+          // a specific "note not found"-shaped message rather than yargs'
+          // own "Unknown argument"/"Not enough non-option arguments" usage
+          // text.
+          if (command === "read") {
+            expect(result.stderr).not.toMatch(/Unknown argument|not enough non-option/i);
+          } else {
+            const line = result.stdout.split("\n").find((l) => l.startsWith("{"));
+            expect(line, `expected a JSON envelope on stdout: ${result.stdout}\n${result.stderr}`).toBeDefined();
+          }
+
           const created = fs.existsSync(configPath);
           console.log(
             `[D03] ${command}: sandboxed default config ${created ? "WAS" : "was NOT"} created at ${configPath}`,
           );
+          expect(created).toBe(EXPECTED_CONFIG_CREATED[command]);
           // The vault used here is never the operator's; the sandboxed HOME
           // used here is never the operator's real home directory either.
           expect(home).not.toBe(os.homedir());
