@@ -123,7 +123,8 @@ export function createSearchCommand(deps: SearchDeps = {}): CommandModule {
 
       // Same forcing as capture: FTS only, no telemetry, whatever the ambient
       // environment offers.
-      const appConfig = deps.appConfig ?? loadConfig();
+      // Task 6 row D03: vault commands never write the default system config.
+      const appConfig = deps.appConfig ?? loadConfig({}, { readOnly: true });
       appConfig.app.embeddingModel = "";
       appConfig.app.telemetryEnabled = false;
 

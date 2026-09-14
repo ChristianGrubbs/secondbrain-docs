@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { collectionPath, notePath, sha256, sourceId } from "./identity";
@@ -66,6 +67,8 @@ class FakeObsidianCliProcess {
   readonly setextNotes = new Set<string>();
   /** Folders that exist without holding a note directly. */
   readonly folders = new Set<string>();
+  /** Binary assets landed by `attach`, vault path -> local source path. */
+  readonly attachments = new Map<string, string>();
 
   /** Bumped per note to invalidate an anchor without changing any bytes. */
   private readonly anchorSalt = new Map<string, number>();
@@ -182,6 +185,26 @@ class FakeObsidianCliProcess {
         return { code: 1, stdout: "", stderr: `obsidian-cli: not a directory: ${dir}` };
       }
       return { code: 0, stdout: `${[...entries].sort().join("\n")}\n`, stderr: "" };
+    }
+
+    if (command === "attach") {
+      const [, localPath, vaultPath] = args;
+      if (!fs.existsSync(localPath)) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: `obsidian-cli: attach: no such file: ${localPath}`,
+        };
+      }
+      if (/\.md$/i.test(vaultPath)) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "obsidian-cli: attach: refuses Markdown targets",
+        };
+      }
+      this.attachments.set(vaultPath, localPath);
+      return { code: 0, stdout: `attached ${vaultPath} sha256:fake\n`, stderr: "" };
     }
 
     return { code: 2, stdout: "", stderr: `unknown subcommand: ${command}` };
@@ -1990,5 +2013,136 @@ describe("VaultPublisher candidate integrity", () => {
     });
 
     expect((await publisher.publish(changed)).conflictReason).toBe("candidate-modified");
+  });
+});
+
+describe("local asset preservation (row F06)", () => {
+  function localMarkdownDocument(): { input: SourceDocument; dir: string } {
+    const dir = makeTempDir("sb-docs-f06-");
+    fs.writeFileSync(path.join(dir, "pixel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const file = path.join(dir, "local-notes.md");
+    const markdown = "# Notes\n\nSee ![pixel](./pixel.png)\n";
+    fs.writeFileSync(file, markdown);
+    const input = makeDocument({
+      sourceUrl: pathToFileURL(file).href,
+      requestedUrl: file,
+      collection: "f06",
+      markdown,
+      sourceContentType: "text/markdown",
+    });
+    return { input, dir };
+  }
+
+  it("attaches the asset before creating the note and links the note to it", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const publisher = makePublisher(cli);
+    const { input } = localMarkdownDocument();
+
+    const publication = await publisher.publish(input);
+
+    expect(publication.status).toBe("published");
+    const [vaultPath] = [...cli.attachments.keys()];
+    expect(vaultPath).toMatch(
+      /^_attachments\/30 Tools-Models\/Doc Sets\/f06\/[0-9a-f]{12}\/pixel\.png$/,
+    );
+    expect(publication.attachments).toEqual([vaultPath]);
+    const hash = vaultPath.split("/")[4];
+    expect(publication.markdown).toContain(
+      `![pixel](_attachments/30%20Tools-Models/Doc%20Sets/f06/${hash}/pixel.png)`,
+    );
+    expect(publication.markdown).not.toContain("./pixel.png");
+    const order = cli.invocations.map((call) => call.args[0]);
+    expect(order.indexOf("attach")).toBeLessThan(order.indexOf("create"));
+  });
+
+  it("never runs attach for an embed target that is not a regular file", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const publisher = makePublisher(cli);
+    const { input, dir } = localMarkdownDocument();
+    fs.rmSync(path.join(dir, "pixel.png"));
+    fs.mkdirSync(path.join(dir, "pixel.png"));
+    const result = await publisher.publish(input);
+    expect(result.status).toBe("published");
+    expect(result.attachments).toBeUndefined();
+    expect(result.markdown).toContain("./pixel.png");
+    expect(cli.invocations.some((call) => call.args[0] === "attach")).toBe(false);
+  });
+
+  it("fails the publication loudly when attach fails, before any note write", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const { input, dir } = localMarkdownDocument();
+    // localizeLocalAssets sees the file; it vanishes before the CLI copies it.
+    const original = cli.run;
+    cli.run = async (args, stdin) => {
+      if (args[0] === "attach") fs.rmSync(path.join(dir, "pixel.png"), { force: true });
+      return original(args, stdin);
+    };
+    const publisher = makePublisher(cli);
+    await expect(publisher.publish(input)).rejects.toThrow(/attach failed/);
+    expect(cli.notes.size).toBe(0);
+  });
+
+  it("re-lands a deleted attachment on an unchanged recapture", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const publisher = makePublisher(cli);
+    const { input } = localMarkdownDocument();
+    const first = await publisher.publish(input);
+    expect(first.status).toBe("published");
+    // The attachment disappears (Obsidian's unlinked-attachment sweep, a
+    // hand delete); the note itself is untouched.
+    cli.attachments.clear();
+
+    const again = await publisher.publish(input);
+
+    expect(again.status).toBe("unchanged");
+    expect(again.attachments).toEqual(first.attachments);
+    expect([...cli.attachments.keys()]).toEqual(first.attachments);
+  });
+
+  it("attaches on the replace path even when the first CAS write loses a race", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const { input } = localMarkdownDocument();
+    // Burn the anchor once so the first `write --if-match` fails with exit 3
+    // and the publisher re-reads and retries against the fresh anchor. The
+    // override is installed before the publisher captures `cli.run`; the
+    // first publication only ever issues `create`, so it is unaffected.
+    const original = cli.run;
+    let burnt = false;
+    cli.run = async (args, stdin) => {
+      if (args[0] === "write" && !burnt) {
+        burnt = true;
+        cli.bumpAnchor(args[1]);
+      }
+      return original(args, stdin);
+    };
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(input);
+    expect(first.status).toBe("published");
+    cli.attachments.clear();
+
+    const replaced = await publisher.publish({
+      ...input,
+      markdown: `${input.markdown}\nmore\n`,
+    });
+
+    expect(replaced.status).toBe("replaced");
+    expect(cli.invocations.filter((call) => call.args[0] === "write")).toHaveLength(2);
+    expect(replaced.attachments).toEqual(first.attachments);
+    expect([...cli.attachments.keys()]).toEqual(first.attachments);
+  });
+
+  it("re-attaches on replace and reports the asset again", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const publisher = makePublisher(cli);
+    const { input } = localMarkdownDocument();
+    await publisher.publish(input);
+    cli.attachments.clear();
+    const replaced = await publisher.publish({
+      ...input,
+      markdown: `${input.markdown}\nmore\n`,
+    });
+    expect(replaced.status).toBe("replaced");
+    expect(cli.attachments.size).toBe(1);
+    expect(replaced.attachments).toEqual([...cli.attachments.keys()]);
   });
 });

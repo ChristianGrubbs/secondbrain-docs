@@ -64,6 +64,36 @@ describe("Configuration Loading", () => {
   });
 
   describe("Integration & E2E Scenarios", () => {
+    it("readOnly: does NOT create the default system config when none exists", () => {
+      const systemConfig = path.join(process.cwd(), ".vitest-config-mock", "config.yaml");
+      const config = loadConfig({}, { readOnly: true });
+      expect(config.server.host).toBe("127.0.0.1");
+      expect(fs.existsSync(systemConfig)).toBe(false);
+    });
+
+    it("readOnly: preserves an existing default system config byte-for-byte", () => {
+      const systemDir = path.join(process.cwd(), ".vitest-config-mock");
+      fs.mkdirSync(systemDir, { recursive: true });
+      const systemConfig = path.join(systemDir, "config.yaml");
+      const original = "# user-owned\nserver:\n  host: file-host\n";
+      fs.writeFileSync(systemConfig, original, "utf8");
+      const config = loadConfig({}, { readOnly: true });
+      expect(config.server.host).toBe("file-host");
+      expect(fs.readFileSync(systemConfig, "utf8")).toBe(original);
+    });
+
+    it("readOnly: leaves an invalid-shape default config in place instead of quarantining it", () => {
+      const systemDir = path.join(process.cwd(), ".vitest-config-mock");
+      fs.mkdirSync(systemDir, { recursive: true });
+      const systemConfig = path.join(systemDir, "config.yaml");
+      const broken = "scraper:\n  skipKnownTrackers: notabool\n";
+      fs.writeFileSync(systemConfig, broken, "utf8");
+      const config = loadConfig({}, { readOnly: true });
+      expect(config.scraper.skipKnownTrackers).toBe(defaults.scraper.skipKnownTrackers);
+      expect(fs.readFileSync(systemConfig, "utf8")).toBe(broken);
+      expect(fs.readdirSync(systemDir)).toEqual(["config.yaml"]);
+    });
+
     it("should load system defaults and WRITE back when no config provided", () => {
       const config = loadConfig({}, {}); // No args -> Default System Path
 

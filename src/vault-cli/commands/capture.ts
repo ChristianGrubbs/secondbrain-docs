@@ -157,7 +157,8 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
       // After upstream config load, force these two fields off: this fork
       // starts with FTS and no embedding credential, and never phones home,
       // regardless of ambient credentials or telemetry env defaults.
-      const appConfig = deps.appConfig ?? loadConfig();
+      // Task 6 row D03: vault commands never write the default system config.
+      const appConfig = deps.appConfig ?? loadConfig({}, { readOnly: true });
       appConfig.app.embeddingModel = "";
       appConfig.app.telemetryEnabled = false;
 

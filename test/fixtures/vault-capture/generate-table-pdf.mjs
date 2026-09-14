@@ -3,9 +3,10 @@
 // Hand-built, uncompressed single-page PDF (no external PDF dependency —
 // nothing suitable for generating a real table was already vendored in
 // node_modules; a raw PDF with an explicit content stream needs no library).
-// Draws a small text table (2 columns x 4 rows, tab-aligned via absolute
-// text positioning) plus a heading, so extraction pipelines that infer table
-// structure from column-aligned text have real column geometry to detect.
+// Draws a small ruled text table (2 columns x 4 rows: absolute text
+// positioning plus stroked cell borders) and a heading. xberg's PDF table
+// detector only recognizes ruled grids; borderless column-aligned text is a
+// recorded converter limit (probed 1.0.14 and 1.1.5 on 2026-09-14).
 import fs from "node:fs";
 import path from "node:path";
 
@@ -20,15 +21,26 @@ function escapePdfText(text) {
   return text.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
 
+const columnX = [72, 250, 430];
+const rowHeight = 24;
+const top = 684;
+
 const lines = [];
 lines.push("BT /F1 18 Tf 72 720 Td (Orbital Period Table) Tj ET");
-let y = 660;
-for (const [col1, col2] of rows) {
+rows.forEach(([col1, col2], index) => {
+  const baseline = top - index * rowHeight - 16;
   lines.push(
-    `BT /F1 12 Tf 72 ${y} Td (${escapePdfText(col1)}) Tj ET`,
-    `BT /F1 12 Tf 250 ${y} Td (${escapePdfText(col2)}) Tj ET`,
+    `BT /F1 12 Tf ${columnX[0] + 4} ${baseline} Td (${escapePdfText(col1)}) Tj ET`,
+    `BT /F1 12 Tf ${columnX[1] + 4} ${baseline} Td (${escapePdfText(col2)}) Tj ET`,
   );
-  y -= 24;
+});
+lines.push("0.8 w");
+for (let i = 0; i <= rows.length; i++) {
+  const y = top - i * rowHeight;
+  lines.push(`${columnX[0]} ${y} m ${columnX[2]} ${y} l S`);
+}
+for (const x of columnX) {
+  lines.push(`${x} ${top} m ${x} ${top - rows.length * rowHeight} l S`);
 }
 const content = lines.join("\n");
 const contentBytes = Buffer.from(content, "latin1");
