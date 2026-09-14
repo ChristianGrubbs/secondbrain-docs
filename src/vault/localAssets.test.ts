@@ -245,6 +245,34 @@ describe("localizeLocalAssets", () => {
     expect(definitions).toEqual([`${prefixOf(input)}/pixel.png`]);
   });
 
+  it("keeps a definition label that ends in a literal backslash (even run) resolvable", () => {
+    const dir = sourceDir();
+    fs.writeFileSync(path.join(dir, "pixel.png"), "x");
+    // `[fig \\\\]` is the label `fig \\` (an even backslash run leaves the
+    // closing bracket unescaped); an odd run would escape it instead.
+    const markdown = "![p][fig \\\\]\n\n[fig \\\\]: ./pixel.png\n";
+    const input = doc(dir, markdown);
+    const { input: localized, assets } = localizeLocalAssets(input, FOLDER);
+    expect(assets).toHaveLength(1);
+    expect(localized.markdown).toBe(
+      `![p][fig \\\\]\n\n[fig \\\\]: ${encodedPrefixOf(input)}/pixel.png\n`,
+    );
+    const tree = unified().use(remarkParse).parse(localized.markdown) as Root;
+    const identifiers: string[] = [];
+    let definitionUrl = "";
+    walkTree(tree, (node) => {
+      if (node.type === "imageReference" || node.type === "definition") {
+        identifiers.push((node as unknown as { identifier: string }).identifier);
+      }
+      if (node.type === "definition") {
+        definitionUrl = decodeURIComponent((node as unknown as { url: string }).url);
+      }
+    });
+    expect(identifiers).toHaveLength(2);
+    expect(identifiers[0]).toBe(identifiers[1]);
+    expect(definitionUrl).toBe(`${prefixOf(input)}/pixel.png`);
+  });
+
   it("rewrites only the first definition of a duplicated label, as CommonMark resolves it", () => {
     const dir = sourceDir();
     fs.writeFileSync(path.join(dir, "pixel.png"), "x");
