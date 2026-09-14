@@ -282,6 +282,10 @@ export class VaultPublisher implements Publisher {
       return this.replaceNote(context, snapshot, currentDigest ?? "");
     }
     if (decision === "unchanged" && snapshot !== null && currentDigest !== null) {
+      // The note is already right, but an attachment can have been removed
+      // independently of it; re-landing the same bytes is idempotent and keeps
+      // the saved links resolvable (2026-09-14 Codex review of row F06).
+      const attachments = await this.attachAssets(context.assets);
       this.journal.writeOwnership({ sourceId: id, path, digest: currentDigest });
       const moc = await this.linkFromCollectionIndex(input.title, folder, path);
       return {
@@ -290,6 +294,7 @@ export class VaultPublisher implements Publisher {
         markdown: snapshot.markdown,
         digest: currentDigest,
         moc,
+        ...(attachments.length > 0 ? { attachments } : {}),
       };
     }
 

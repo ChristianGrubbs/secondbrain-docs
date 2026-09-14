@@ -461,7 +461,15 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     );
     const encodedLink = attachments[0].split("/").map(encodeURIComponent).join("/");
     expect(savedBytes).toContain(`![pixel](${encodedLink})`);
-    expect(savedBytes).not.toContain("./pixel.png");
+    // The saved body is the source body byte-for-byte with exactly one
+    // change: the real embed. The image-looking text inside the fenced
+    // code block is NOT rewritten, and the fence delimiters survive.
+    const sourceBody = fs.readFileSync(sourceFile, "utf8");
+    const savedBody = savedBytes.replace(/^---\n[\s\S]*?\n---\n/, "");
+    expect(savedBody).toBe(
+      sourceBody.replace("![pixel](./pixel.png)", `![pixel](${encodedLink})`),
+    );
+    expect(savedBody).toContain('```bash\necho "wibbleflux"\necho "![not-an-image](./pixel.png)"\n```');
   });
 
   it("F07: text PDF with a ruled table preserves cell text AND table structure", async () => {

@@ -6,6 +6,7 @@ character (café, naïve, 日本語), and a relative link to a local image asset
 
 ```bash
 echo "wibbleflux"
+echo "![not-an-image](./pixel.png)"
 ```
 
 See the reference diagram: ![pixel](./pixel.png)

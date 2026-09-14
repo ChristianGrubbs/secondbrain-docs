@@ -2082,6 +2082,55 @@ describe("local asset preservation (row F06)", () => {
     expect(cli.notes.size).toBe(0);
   });
 
+  it("re-lands a deleted attachment on an unchanged recapture", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const publisher = makePublisher(cli);
+    const { input } = localMarkdownDocument();
+    const first = await publisher.publish(input);
+    expect(first.status).toBe("published");
+    // The attachment disappears (Obsidian's unlinked-attachment sweep, a
+    // hand delete); the note itself is untouched.
+    cli.attachments.clear();
+
+    const again = await publisher.publish(input);
+
+    expect(again.status).toBe("unchanged");
+    expect(again.attachments).toEqual(first.attachments);
+    expect([...cli.attachments.keys()]).toEqual(first.attachments);
+  });
+
+  it("attaches on the replace path even when the first CAS write loses a race", async () => {
+    const cli = new FakeObsidianCliProcess();
+    const { input } = localMarkdownDocument();
+    // Burn the anchor once so the first `write --if-match` fails with exit 3
+    // and the publisher re-reads and retries against the fresh anchor. The
+    // override is installed before the publisher captures `cli.run`; the
+    // first publication only ever issues `create`, so it is unaffected.
+    const original = cli.run;
+    let burnt = false;
+    cli.run = async (args, stdin) => {
+      if (args[0] === "write" && !burnt) {
+        burnt = true;
+        cli.bumpAnchor(args[1]);
+      }
+      return original(args, stdin);
+    };
+    const publisher = makePublisher(cli);
+    const first = await publisher.publish(input);
+    expect(first.status).toBe("published");
+    cli.attachments.clear();
+
+    const replaced = await publisher.publish({
+      ...input,
+      markdown: `${input.markdown}\nmore\n`,
+    });
+
+    expect(replaced.status).toBe("replaced");
+    expect(cli.invocations.filter((call) => call.args[0] === "write")).toHaveLength(2);
+    expect(replaced.attachments).toEqual(first.attachments);
+    expect([...cli.attachments.keys()]).toEqual(first.attachments);
+  });
+
   it("re-attaches on replace and reports the asset again", async () => {
     const cli = new FakeObsidianCliProcess();
     const publisher = makePublisher(cli);
