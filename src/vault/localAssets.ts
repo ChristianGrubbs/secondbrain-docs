@@ -61,8 +61,37 @@ const isImageReference = (node: Node): node is ImageReference =>
   node.type === "imageReference";
 const isDefinition = (node: Node): node is Definition => node.type === "definition";
 
+/**
+ * Percent-encodes one vault path for a bare Markdown destination. Beyond
+ * `encodeURIComponent`, parentheses are encoded too: a bare destination ends
+ * at the first unbalanced `)`, so a filename or collection segment with an
+ * unmatched parenthesis would otherwise truncate the link (2026-09-14 Codex
+ * scoped re-review).
+ */
 const encodeLinkPath = (vaultPath: string): string =>
-  vaultPath.split("/").map(encodeURIComponent).join("/");
+  vaultPath
+    .split("/")
+    .map((segment) =>
+      encodeURIComponent(segment).replace(/\(/g, "%28").replace(/\)/g, "%29"),
+    )
+    .join("/");
+
+/**
+ * Returns the original `[label]` bytes of a definition, so the rewrite never
+ * has to re-escape a decoded label (an escaped `]` or backslash in the label
+ * would otherwise be emitted raw and break the reference).
+ */
+function originalLabel(source: string): string {
+  for (let index = 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "\\") {
+      index += 1;
+    } else if (char === "]") {
+      return source.slice(0, index + 1);
+    }
+  }
+  return source;
+}
 
 /** Resolves an embed target to a regular file beside the source, or null. */
 function resolveLocalFile(target: string, sourceDir: string): string | null {
@@ -150,11 +179,14 @@ export function localizeLocalAssets(
 
   // Reference-style images resolve through a definition; only definitions an
   // image actually uses are rewritten, so a plain `[text][ref]` link to a
-  // local file is never turned into an attachment.
+  // local file is never turned into an attachment. CommonMark resolves a
+  // duplicated label to its FIRST definition, so later duplicates are left
+  // alone rather than rewritten and attached for nothing.
   const imageDefinitions = new Set<string>();
   walk(tree, (node) => {
     if (isImageReference(node)) imageDefinitions.add(node.identifier);
   });
+  const rewrittenDefinitions = new Set<string>();
 
   walk(tree, (node) => {
     const start = node.position?.start.offset;
@@ -169,13 +201,12 @@ export function localizeLocalAssets(
         text: `![${escapeAlt(node.alt ?? "")}](${link}${renderTitle(node.title)})`,
       });
     } else if (isDefinition(node) && imageDefinitions.has(node.identifier)) {
+      if (rewrittenDefinitions.has(node.identifier)) return;
+      rewrittenDefinitions.add(node.identifier);
       const link = localize(node.url);
       if (link === null) return;
-      rewrites.push({
-        start,
-        end,
-        text: `[${node.label ?? node.identifier}]: ${link}${renderTitle(node.title)}`,
-      });
+      const label = originalLabel(input.markdown.slice(start, end));
+      rewrites.push({ start, end, text: `${label}: ${link}${renderTitle(node.title)}` });
     }
   });
 

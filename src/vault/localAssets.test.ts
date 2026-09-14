@@ -2,6 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import type { Node, Parent, Root } from "mdast";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 import { afterEach, describe, expect, it } from "vitest";
 import { sha256, sourceId } from "./identity";
 import { ATTACHMENTS_ROOT, localizeLocalAssets } from "./localAssets";
@@ -31,6 +34,12 @@ function doc(dir: string, markdown: string): SourceDocument {
     sourceContentType: "text/markdown",
     capturedAt: "2026-09-14T00:00:00.000Z",
   };
+}
+
+function walkTree(node: Node, visitor: (node: Node) => void): void {
+  visitor(node);
+  const children = (node as Partial<Parent>).children;
+  if (Array.isArray(children)) for (const child of children) walkTree(child, visitor);
 }
 
 const FOLDER = "30 Tools-Models/Doc Sets/Local Notes";
@@ -149,7 +158,7 @@ describe("localizeLocalAssets", () => {
       },
     ]);
     expect(localized.markdown).toBe(
-      `See ![a shot](${encodedPrefixOf(input)}/shot%20(1).png "The title") here.\n`,
+      `See ![a shot](${encodedPrefixOf(input)}/shot%20%281%29.png "The title") here.\n`,
     );
   });
 
@@ -179,6 +188,84 @@ describe("localizeLocalAssets", () => {
         "[fig]: ./pixel.png",
         `[fig]: ${encodedPrefixOf(input)}/pixel.png`,
       ),
+    );
+  });
+
+  it("percent-encodes an unmatched parenthesis so the bare destination cannot truncate", () => {
+    const dir = sourceDir();
+    fs.writeFileSync(path.join(dir, "shot (1.png"), "x");
+    const input = doc(
+      dir,
+      "![s](<./shot (1.png>) and ![t][ref]\n\n[ref]: <./shot (1.png>\n",
+    );
+    const { input: localized, assets } = localizeLocalAssets(
+      input,
+      "30 Tools-Models/Doc Sets/Acme (Corp)",
+    );
+    const prefix = `${ATTACHMENTS_ROOT}/30 Tools-Models/Doc Sets/Acme (Corp)/${sourceId(input).slice(0, 12)}`;
+    expect(assets).toEqual([
+      { localPath: path.join(dir, "shot (1.png"), vaultPath: `${prefix}/shot (1.png` },
+    ]);
+    const encoded = `${ATTACHMENTS_ROOT}/30%20Tools-Models/Doc%20Sets/Acme%20%28Corp%29/${sourceId(input).slice(0, 12)}/shot%20%281.png`;
+    expect(localized.markdown).toBe(
+      `![s](${encoded}) and ![t][ref]\n\n[ref]: ${encoded}\n`,
+    );
+    // Reparse: both the inline image and the definition resolve to the
+    // vault path (remark keeps destinations percent-encoded, so decode), and
+    // the reference is still a reference.
+    const tree = unified().use(remarkParse).parse(localized.markdown) as Root;
+    const urls: string[] = [];
+    let references = 0;
+    walkTree(tree, (node) => {
+      if (node.type === "image" || node.type === "definition") {
+        urls.push(decodeURIComponent((node as unknown as { url: string }).url));
+      }
+      if (node.type === "imageReference") references += 1;
+    });
+    expect(urls).toEqual([`${prefix}/shot (1.png`, `${prefix}/shot (1.png`]);
+    expect(references).toBe(1);
+  });
+
+  it("keeps a definition label's original escapes when rewriting its destination", () => {
+    const dir = sourceDir();
+    fs.writeFileSync(path.join(dir, "pixel.png"), "x");
+    const markdown = "![p][fig \\] one]\n\n[fig \\] one]: ./pixel.png\n";
+    const input = doc(dir, markdown);
+    const { input: localized, assets } = localizeLocalAssets(input, FOLDER);
+    expect(assets).toHaveLength(1);
+    expect(localized.markdown).toBe(
+      `![p][fig \\] one]\n\n[fig \\] one]: ${encodedPrefixOf(input)}/pixel.png\n`,
+    );
+    const tree = unified().use(remarkParse).parse(localized.markdown) as Root;
+    const definitions: string[] = [];
+    walkTree(tree, (node) => {
+      if (node.type === "definition")
+        definitions.push(decodeURIComponent((node as unknown as { url: string }).url));
+    });
+    expect(definitions).toEqual([`${prefixOf(input)}/pixel.png`]);
+  });
+
+  it("rewrites only the first definition of a duplicated label, as CommonMark resolves it", () => {
+    const dir = sourceDir();
+    fs.writeFileSync(path.join(dir, "pixel.png"), "x");
+    fs.writeFileSync(path.join(dir, "other.png"), "y");
+    const remoteFirst =
+      "![p][fig]\n\n[fig]: https://example.com/a.png\n[fig]: ./pixel.png\n";
+    const remote = localizeLocalAssets(doc(dir, remoteFirst), FOLDER);
+    expect(remote.assets).toEqual([]);
+    expect(remote.input.markdown).toBe(remoteFirst);
+
+    const localFirst = "![p][fig]\n\n[fig]: ./pixel.png\n[fig]: ./other.png\n";
+    const input = doc(dir, localFirst);
+    const local = localizeLocalAssets(input, FOLDER);
+    expect(local.assets).toEqual([
+      {
+        localPath: path.join(dir, "pixel.png"),
+        vaultPath: `${prefixOf(input)}/pixel.png`,
+      },
+    ]);
+    expect(local.input.markdown).toBe(
+      `![p][fig]\n\n[fig]: ${encodedPrefixOf(input)}/pixel.png\n[fig]: ./other.png\n`,
     );
   });
 
