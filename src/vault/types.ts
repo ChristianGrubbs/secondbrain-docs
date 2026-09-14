@@ -53,6 +53,11 @@ export type Publication = {
   /** SHA-256 of those whole-note bytes. */
   digest: string;
   moc: "linked" | "pending";
+  /**
+   * Vault-relative paths of document-local assets copied for this note via
+   * `obsidian-cli attach` (row F06). Absent when the source had none.
+   */
+  attachments?: string[];
   /** Preserved incoming note written beside a conflict, when one was written. */
   candidatePath?: string;
   /** Set whenever `status` is `conflict`. */

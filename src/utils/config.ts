@@ -485,6 +485,13 @@ const configMappings: ConfigMapping[] = [
 export interface LoadConfigOptions {
   configPath?: string; // Explicit config path
   searchDir?: string; // Search directory (store path)
+  /**
+   * Fork-local (secondbrain-docs): never write, quarantine or create any
+   * config file, even on the default system path. The vault commands pass
+   * this so `sb-docs search|capture|reindex` can never rewrite an operator's
+   * `config.yaml` (Task 6 row D03).
+   */
+  readOnly?: boolean;
 }
 
 // System-specific paths
@@ -508,7 +515,8 @@ export function loadConfig(
   } else {
     // Default: strict system config path
     configPath = path.join(systemPaths.config, "config.yaml");
-    isReadOnlyConfig = false; // Auto-update default config
+    // Auto-update the default config unless the caller opted out of writes.
+    isReadOnlyConfig = options.readOnly === true;
   }
 
   logger.debug(`Using config file: ${configPath}`);

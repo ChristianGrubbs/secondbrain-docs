@@ -234,3 +234,58 @@ describe(// MINOR 7 (2026-09-13 Codex frontier review): one JSONL
     ]);
   });
 });
+
+describe("ObsidianCli.attachFile", () => {
+  it("runs attach with --force and no stdin", async () => {
+    const calls: { args: string[]; stdin: string | null }[] = [];
+    const cli = new ObsidianCli(async (args, stdin) => {
+      calls.push({ args, stdin });
+      return { code: 0, stdout: "attached -> sha256:abc\n", stderr: "" };
+    });
+    await cli.attachFile("/tmp/pixel.png", "_attachments/Doc Sets/x/pixel.png");
+    expect(calls).toEqual([
+      {
+        args: [
+          "attach",
+          "/tmp/pixel.png",
+          "_attachments/Doc Sets/x/pixel.png",
+          "--force",
+        ],
+        stdin: null,
+      },
+    ]);
+  });
+
+  it("refuses a Markdown target before spawning", async () => {
+    const cli = new ObsidianCli(async () => {
+      throw new Error("must not spawn");
+    });
+    await expect(cli.attachFile("/tmp/a.md", "00 Inbox/a.md")).rejects.toThrow(
+      /refusing to attach a Markdown note/,
+    );
+  });
+
+  it("refuses a vault path that climbs out of the vault", async () => {
+    const cli = new ObsidianCli(async () => {
+      throw new Error("must not spawn");
+    });
+    await expect(cli.attachFile("/tmp/pixel.png", "../pixel.png")).rejects.toThrow(
+      /must be relative and contained/,
+    );
+  });
+
+  it("surfaces a nonzero exit as a typed error", async () => {
+    const cli = new ObsidianCli(async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "obsidian-cli: attach: source is empty",
+    }));
+    await expect(cli.attachFile("/tmp/empty.png", "_attachments/e.png")).rejects.toThrow(
+      ObsidianCliError,
+    );
+  });
+
+  it("classifies attach as a write", () => {
+    expect(classifyObsidianCliSubcommand("attach")).toBe("write");
+  });
+});

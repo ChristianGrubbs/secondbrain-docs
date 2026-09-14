@@ -26,6 +26,7 @@ import {
   sanitizeSegment,
   sha256,
 } from "./identity";
+import { type LocalAsset, localizeLocalAssets } from "./localAssets";
 import { hasLinkTo } from "./markdownLinks.mjs";
 import {
   CasConflictError,
@@ -165,18 +166,22 @@ export class VaultPublisher implements Publisher {
     return result;
   }
 
-  private async publishSerially(input: SourceDocument): Promise<Publication> {
-    if (input.markdown.trim().length === 0) {
-      throw new Error(`refusing to publish empty markdown for ${input.sourceUrl}`);
+  private async publishSerially(raw: SourceDocument): Promise<Publication> {
+    if (raw.markdown.trim().length === 0) {
+      throw new Error(`refusing to publish empty markdown for ${raw.sourceUrl}`);
     }
 
-    const folder = await this.resolveCollectionFolder(input.collection);
+    const folder = await this.resolveCollectionFolder(raw.collection);
+    // Row F06: relative image embeds of a file:// source are pointed at their
+    // vault attachment path before rendering, so digests, ownership and the
+    // saved bytes all describe the linked note, never the on-disk original.
+    const { input, assets } = localizeLocalAssets(raw, folder);
     const rendered = renderSourceNote(input, this.options);
 
     // Everything from here to the ownership write is one critical section, so
     // another process cannot allocate a second path for this same source.
     return this.journal.withLock(rendered.sourceId, () =>
-      this.capture(input, folder, rendered),
+      this.capture(input, folder, rendered, assets),
     );
   }
 
@@ -185,6 +190,7 @@ export class VaultPublisher implements Publisher {
     input: SourceDocument,
     folder: string,
     rendered: RenderedNote,
+    assets: LocalAsset[],
   ): Promise<Publication> {
     const id = rendered.sourceId;
     const ownership = this.journal.readOwnership(id);
@@ -231,7 +237,16 @@ export class VaultPublisher implements Publisher {
       }
     }
 
-    return this.settle({ input, folder, rendered, path, snapshot, computed, attempt: 0 });
+    return this.settle({
+      input,
+      folder,
+      rendered,
+      path,
+      snapshot,
+      computed,
+      assets,
+      attempt: 0,
+    });
   }
 
   /** Applies {@link updateDecision} at an already-resolved path. */
@@ -242,6 +257,7 @@ export class VaultPublisher implements Publisher {
     path: string;
     snapshot: Snapshot | null;
     computed: boolean;
+    assets: LocalAsset[];
     attempt: number;
   }): Promise<Publication> {
     const { input, folder, rendered, path, snapshot } = context;
@@ -327,6 +343,27 @@ export class VaultPublisher implements Publisher {
     return null;
   }
 
+  /**
+   * Copies every document-local asset into the vault before the note that
+   * links to it is written, so a published link never dangles.
+   *
+   * @returns Vault-relative paths landed, in embed order.
+   */
+  private async attachAssets(assets: LocalAsset[]): Promise<string[]> {
+    const landed: string[] = [];
+    for (const asset of assets) {
+      await this.cli.attachFile(asset.localPath, asset.vaultPath);
+      this.logger({
+        level: "info",
+        event: "capture.asset_attached",
+        loc: "VaultPublisher.attachAssets",
+        ctx: { localPath: asset.localPath, vaultPath: asset.vaultPath },
+      });
+      landed.push(asset.vaultPath);
+    }
+    return landed;
+  }
+
   /** Create path of the write protocol. */
   private async createNote(context: {
     input: SourceDocument;
@@ -334,6 +371,7 @@ export class VaultPublisher implements Publisher {
     rendered: RenderedNote;
     path: string;
     computed: boolean;
+    assets: LocalAsset[];
     attempt: number;
   }): Promise<Publication> {
     const { input, folder, rendered, path } = context;
@@ -346,6 +384,8 @@ export class VaultPublisher implements Publisher {
       proposedWholeNoteDigest: rendered.digest,
       bytes: rendered.markdown,
     });
+
+    const attachments = await this.attachAssets(context.assets);
 
     try {
       await this.cli.createNote(path, rendered.markdown);
@@ -375,6 +415,7 @@ export class VaultPublisher implements Publisher {
       markdown: rendered.markdown,
       digest: rendered.digest,
       moc,
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
   }
 
@@ -424,6 +465,7 @@ export class VaultPublisher implements Publisher {
       rendered: RenderedNote;
       path: string;
       computed: boolean;
+      assets: LocalAsset[];
       attempt: number;
     },
     error: CasConflictError,
@@ -467,6 +509,7 @@ export class VaultPublisher implements Publisher {
       rendered: RenderedNote;
       path: string;
       computed: boolean;
+      assets: LocalAsset[];
       attempt: number;
     },
     snapshot: Snapshot,
@@ -482,6 +525,8 @@ export class VaultPublisher implements Publisher {
       proposedWholeNoteDigest: rendered.digest,
       bytes: rendered.markdown,
     });
+
+    const attachments = await this.attachAssets(context.assets);
 
     let anchor = snapshot.anchor;
     let written = false;
@@ -536,6 +581,7 @@ export class VaultPublisher implements Publisher {
       markdown: rendered.markdown,
       digest: rendered.digest,
       moc,
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
   }
 

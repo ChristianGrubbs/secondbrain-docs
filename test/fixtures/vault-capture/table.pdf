@@ -9,17 +9,26 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
 endobj
 4 0 obj
-<< /Length 374 >>
+<< /Length 549 >>
 stream
 BT /F1 18 Tf 72 720 Td (Orbital Period Table) Tj ET
-BT /F1 12 Tf 72 660 Td (Planet) Tj ET
-BT /F1 12 Tf 250 660 Td (Orbital Period \(days\)) Tj ET
-BT /F1 12 Tf 72 636 Td (Mercury) Tj ET
-BT /F1 12 Tf 250 636 Td (87.97) Tj ET
-BT /F1 12 Tf 72 612 Td (Venus) Tj ET
-BT /F1 12 Tf 250 612 Td (224.70) Tj ET
-BT /F1 12 Tf 72 588 Td (Earth) Tj ET
-BT /F1 12 Tf 250 588 Td (365.26) Tj ET
+BT /F1 12 Tf 76 668 Td (Planet) Tj ET
+BT /F1 12 Tf 254 668 Td (Orbital Period \(days\)) Tj ET
+BT /F1 12 Tf 76 644 Td (Mercury) Tj ET
+BT /F1 12 Tf 254 644 Td (87.97) Tj ET
+BT /F1 12 Tf 76 620 Td (Venus) Tj ET
+BT /F1 12 Tf 254 620 Td (224.70) Tj ET
+BT /F1 12 Tf 76 596 Td (Earth) Tj ET
+BT /F1 12 Tf 254 596 Td (365.26) Tj ET
+0.8 w
+72 684 m 430 684 l S
+72 660 m 430 660 l S
+72 636 m 430 636 l S
+72 612 m 430 612 l S
+72 588 m 430 588 l S
+72 684 m 72 588 l S
+250 684 m 250 588 l S
+430 684 m 430 588 l S
 endstream
 endobj
 5 0 obj
@@ -32,9 +41,9 @@ xref
 0000000058 00000 n 
 0000000115 00000 n 
 0000000241 00000 n 
-0000000666 00000 n 
+0000000841 00000 n 
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-736
+911
 %%EOF

@@ -102,7 +102,8 @@ export function createReindexCommand(deps: ReindexDeps = {}): CommandModule {
         ? args.inventory.map((entry) => String(entry))
         : [];
 
-      const appConfig = deps.appConfig ?? loadConfig();
+      // Task 6 row D03: vault commands never write the default system config.
+      const appConfig = deps.appConfig ?? loadConfig({}, { readOnly: true });
       appConfig.app.embeddingModel = "";
       appConfig.app.telemetryEnabled = false;
 

@@ -29,9 +29,15 @@ export function classifyObsidianCliSubcommand(
   if (subcommand === "list") return "list";
   if (subcommand === "read") return "read";
   if (
-    ["create", "write", "append", "section-insert", "move", "redirect-sweep"].includes(
-      subcommand,
-    )
+    [
+      "create",
+      "write",
+      "append",
+      "section-insert",
+      "move",
+      "attach",
+      "redirect-sweep",
+    ].includes(subcommand)
   ) {
     return "write";
   }
@@ -321,5 +327,27 @@ export class ObsidianCli {
     assertVaultRelative(path);
     const result = await this.run(["section-insert", path, heading], content);
     if (result.code !== 0) throw toError("section-insert", path, result);
+  }
+
+  /**
+   * Copies a non-Markdown asset from a local path into the vault.
+   *
+   * `attach` is the CLI's one sanctioned binary write: it runs under the
+   * vault mutation lock, byte-verifies the copy and lands it atomically.
+   * `--force` is passed because every target this publisher chooses lives
+   * under its own deterministic `_attachments/...` namespace, so replacing
+   * an earlier copy of the same source asset is the intended outcome.
+   *
+   * @param localPath Absolute path of the asset on the local filesystem.
+   * @param vaultPath Vault-relative destination; never a `.md` note.
+   * @throws ObsidianCliError when the CLI refuses or fails the copy.
+   */
+  async attachFile(localPath: string, vaultPath: string): Promise<void> {
+    assertVaultRelative(vaultPath);
+    if (/\.(md|markdown)$/i.test(vaultPath)) {
+      throw new Error(`refusing to attach a Markdown note as an asset: ${vaultPath}`);
+    }
+    const result = await this.run(["attach", localPath, vaultPath, "--force"], null);
+    if (result.code !== 0) throw toError("attach", vaultPath, result);
   }
 }

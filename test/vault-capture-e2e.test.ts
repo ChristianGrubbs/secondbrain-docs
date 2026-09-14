@@ -397,7 +397,7 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     });
   });
 
-  it("F06: local Markdown preserves body/code fence/Unicode, but FAILS the row's local-asset-preservation requirement", async () => {
+  it("F06: local Markdown preserves body/code fence/Unicode AND copies+links its local image asset", async () => {
     const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-capqual-src-"));
     fs.copyFileSync(
       path.join(fixturesDir, "vault-capture", "local-notes.md"),
@@ -445,26 +445,26 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     expect(readBack.stdout).toBe(`${savedBytes}\n`);
     expect(savedBytes).toContain("WIBBLEFLUX-3390");
 
-    // RECORDED FAIL (row F06 per docs/migration-qualification.md, per the
-    // plan's 6A requirement that "required document-local assets must be
-    // copied and linked before that row qualifies"): VaultCaptureService has
-    // no local-asset copy/link step, so the relative `./pixel.png` reference
-    // is preserved as literal text but the image itself is never copied
-    // beside the saved note, and the link is not rewritten to a resolvable
-    // vault path. This assertion documents the current (failing) truth; it
-    // does not weaken the row's requirement. Fixing this by writing the
-    // binary asset straight to the vault filesystem would violate the "all
-    // vault access uses obsidian-cli" invariant, because obsidian-cli has no
-    // binary/attachment write command (`obsidian-cli help` lists
-    // create/write/append/section-insert/move for Markdown only). See the
-    // "Decisions needed" section of docs/migration-qualification.md.
-    const assetCopied = fs.existsSync(
-      path.join(sandbox, path.dirname(outcomes[0].publication?.path ?? ""), "pixel.png"),
+    // Row F06 (fixed 2026-09-14): the relative `./pixel.png` embed is
+    // rewritten to a vault attachment path and the bytes are landed through
+    // `obsidian-cli attach` (ai-stack #638) before the note is written.
+    const attachments =
+      (outcomes[0].publication as { attachments?: string[] } | undefined)?.attachments ?? [];
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatch(
+      /^_attachments\/30 Tools-Models\/Doc Sets\/f06-local-markdown\/[0-9a-f]{12}\/pixel\.png$/,
     );
-    expect(assetCopied).toBe(false);
+    const landed = path.join(sandbox, attachments[0]);
+    expect(fs.existsSync(landed)).toBe(true);
+    expect(fs.readFileSync(landed)).toEqual(
+      fs.readFileSync(path.join(fixturesDir, "vault-capture", "pixel.png")),
+    );
+    const encodedLink = attachments[0].split("/").map(encodeURIComponent).join("/");
+    expect(savedBytes).toContain(`![pixel](${encodedLink})`);
+    expect(savedBytes).not.toContain("./pixel.png");
   });
 
-  it("F07: text PDF with a table preserves cell text, but FAILS the row's table-structure requirement (converter limit)", async () => {
+  it("F07: text PDF with a ruled table preserves cell text AND table structure", async () => {
     // Copied into the allowed-roots temp dir like every other single-file
     // row: the sandbox config's `allowedRoots` only covers `os.tmpdir()`, so
     // referencing the fixture at its real repo path fails as
@@ -490,19 +490,16 @@ describe.skipIf(!cliAvailable)("sb-docs capture format/behavior qualification", 
     expect(markdown).toContain("87.97");
     expect(markdown).toContain("Earth");
     expect(markdown).toContain("365.26");
-    // RECORDED FAIL (row F07 per docs/migration-qualification.md, per the
-    // plan's 6B table-assertion requirement): extraction flattens the
-    // two-column layout into a single prose line rather than a Markdown
-    // table (`| ... | ... |` / pipe row). Probed directly against
-    // `@xberg-io/xberg`'s `extract()` with both default options and
-    // `pdfOptions: { extractTables: true, allowSingleColumnTables: true }`:
-    // both calls returned `document.tables === []` for this fixture — the
-    // PDF table extractor's grid/heuristic detector does not recognize this
-    // fixture's column-aligned text as a table at all, so there is no
-    // structured table data in the extraction result for DocumentPipeline to
-    // prefer over flattened prose. This is an external converter limit, not
-    // a defect in this fork's pipeline code; no scoped fix is available here.
-    expect(markdown).not.toMatch(/\|.*Mercury.*\|/);
+    // Row F07 (fixed 2026-09-14): the fixture is a ruled table (drawn cell
+    // borders, as every Word/LaTeX/Docs export produces). xberg 1.0.14's
+    // native grid detector emits it as a Markdown table in `content`, which
+    // DocumentPipeline.extractContent already prefers. Borderless,
+    // column-aligned text is a recorded xberg limit (probed 1.0.14 and
+    // 1.1.5 on 2026-09-14: `tables: []`), not something this fork can fix.
+    expect(markdown).toMatch(/^\| Planet \| Orbital Period \(days\) \|$/m);
+    expect(markdown).toMatch(/^\| --- \| --- \|$/m);
+    expect(markdown).toMatch(/^\| Mercury \| 87\.97 \|$/m);
+    expect(markdown).toMatch(/^\| Earth \| 365\.26 \|$/m);
   });
 
   it("F08: DOCX preserves its factual body", async () => {
@@ -2025,20 +2022,21 @@ describe.skipIf(!cliAvailable)(
       }
     });
 
-    // MINOR 8 (2026-09-13 Codex frontier review): confirmed findings from a
-    // direct run of this exact probe, asserted explicitly rather than only
-    // logged — this documents the current defect, it is not a guarantee of
-    // desired behavior. If Task 7's config-containment fix lands, these
-    // expectations flip and must be updated, not left silently green.
+    // Task 6 row D03 (fixed 2026-09-14): every vault command loads config
+    // read-only (`loadConfig({}, { readOnly: true })`), so with
+    // DOCS_MCP_CONFIG unset NO command creates the default system config.
+    // Asserted per command so a regression to upstream's auto-write is
+    // caught by name. (MINOR 8, 2026-09-13 Codex frontier review, asked
+    // for explicit per-command assertions rather than logs.)
     const EXPECTED_CONFIG_CREATED: Record<string, boolean> = {
-      search: true,
+      search: false,
       read: false,
-      reindex: true,
-      capture: true,
+      reindex: false,
+      capture: false,
     };
 
     for (const command of ["search", "read", "reindex", "capture"] as const) {
-      it(`D03: "${command}" with DOCS_MCP_CONFIG unset — confirmed config-creation finding`, async () => {
+      it(`D03: "${command}" with DOCS_MCP_CONFIG unset does not create the default config`, async () => {
         const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-home-"));
         const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-vault-"));
         const localStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-state-"));
@@ -2183,13 +2181,11 @@ describe.skipIf(!cliAvailable)(
       // to "assert its bytes are preserved" as the desired outcome, but the
       // measured reality is that `loadConfig()`'s default-system-path branch
       // rewrites the file it finds (merging in every default key) regardless
-      // of which vault command ran. This is the exact D03 finding — recorded
-      // here, not fixed, per this packet's explicit instruction not to touch
-      // `loadConfig()`. The assertion documents the current (bad) truth so
-      // this stays a real regression trigger: if Task 7's containment fix
-      // lands, this test starts failing in the other direction and must be
-      // updated, not silently left green either way.
-      "D03: an existing user config's bytes are OVERWRITTEN when DOCS_MCP_CONFIG is unset (recorded finding, not fixed here)",
+      // of which vault command ran. That was the exact D03 finding; fixed on
+      // 2026-09-14 by read-only config loading in every vault command. The
+      // assertion now pins the byte-for-byte preservation so a regression to
+      // upstream's auto-write fails here by name.
+      "D03: an existing user config's bytes are PRESERVED when DOCS_MCP_CONFIG is unset",
       async () => {
         const home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-home-"));
         const vaultPath = fs.mkdtempSync(path.join(os.tmpdir(), "sb-docs-d03-vault-"));
@@ -2207,13 +2203,10 @@ describe.skipIf(!cliAvailable)(
           );
 
           const afterBytes = fs.readFileSync(configPath, "utf8");
-          const preserved = afterBytes === existingBytes;
           console.log(
-            `[D03] existing-config preservation: bytes ${preserved ? "UNCHANGED" : "CHANGED"} (finding: NOT preserved for "search" with DOCS_MCP_CONFIG unset)`,
+            `[D03] existing-config preservation: bytes ${afterBytes === existingBytes ? "UNCHANGED" : "CHANGED"}`,
           );
-          // Confirmed finding: the pre-existing config is NOT preserved.
-          expect(preserved).toBe(false);
-          expect(afterBytes).not.toBe(existingBytes);
+          expect(afterBytes).toBe(existingBytes);
         } finally {
           fs.rmSync(home, { recursive: true, force: true });
           fs.rmSync(vaultPath, { recursive: true, force: true });
