@@ -206,4 +206,49 @@ describe("MarkdownMetadataExtractorMiddleware", () => {
     expect(context.title).toBe("Backup Title");
     expect(context.errors).toHaveLength(0);
   });
+
+  describe("title recovery from unparseable frontmatter (fork, 2026-09-15)", () => {
+    // higgsfield.ai serves text/markdown whose frontmatter has an unquoted
+    // `title:` containing a colon — invalid YAML, so gray-matter throws — and
+    // no H1 in the body. The raw `title:` line is still unambiguous.
+    it("recovers a colon-bearing title from the raw block when YAML fails and no H1 exists", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown =
+        "---\ndescription: GPT Image 2.5 is now here\ntitle: Higgsfield Meets GPT Image 2.5: How It Works and What You Get\nimage: https://cdn.example/x.png\n---\n\nBody paragraph.\n\n## What Is GPT Image 2.5?";
+      const context = createMockContext(markdown);
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(context.title).toBe(
+        "Higgsfield Meets GPT Image 2.5: How It Works and What You Get",
+      );
+      expect(context.errors).toHaveLength(0);
+    });
+
+    it("strips matching quotes from a recovered title", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown = '---\ntitle: "Quoted: Title"\nbad: : yaml\n---\nBody';
+      const context = createMockContext(markdown);
+      await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+      expect(context.title).toBe("Quoted: Title");
+    });
+
+    it("still prefers an H1 over the raw block when both exist", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown = "---\ntitle: Raw: Title\nbad: : yaml\n---\n# Heading Title";
+      const context = createMockContext(markdown);
+      await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+      // The existing contract: malformed frontmatter falls back to H1 first.
+      expect(context.title).toBe("Heading Title");
+    });
+
+    it("stays Untitled when the raw block has no title line and there is no H1", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown = "---\nbad: : yaml\n---\nBody only";
+      const context = createMockContext(markdown);
+      await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+      expect(context.title).toBe("Untitled");
+    });
+  });
 });
