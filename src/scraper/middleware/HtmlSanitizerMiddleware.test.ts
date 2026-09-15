@@ -323,4 +323,53 @@ describe("HtmlSanitizerMiddleware", () => {
     expect(context.content).toBe("<script>alert(1)</script>"); // Content unchanged
     expect(context.errors).toHaveLength(0);
   });
+
+  describe("excludeSelectors survive the empty-page safety net", () => {
+    it("never restores explicitly excluded content, even when it was the whole page", async () => {
+      // The safety net exists to undo an over-eager *default* removal. A
+      // user-supplied exclusion is an explicit instruction and must hold
+      // even when nothing else is left (2026-09-15 Codex review finding 1).
+      const middleware = new HtmlSanitizerMiddleware();
+      const html = `<html><body><div class="loadingIndicator">Loading</div></body></html>`;
+      const context = createMockContext(html, undefined, {
+        excludeSelectors: [".loadingIndicator"],
+      });
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      if (!context.dom) throw new Error("DOM not defined");
+      expect(context.dom("body").text()).not.toContain("Loading");
+      expect(context.errors).toHaveLength(0);
+    });
+
+    it("still restores the page when only default selectors emptied it", async () => {
+      const middleware = new HtmlSanitizerMiddleware();
+      const html = `<html><body><nav>Only navigation here</nav></body></html>`;
+      const context = createMockContext(html);
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      if (!context.dom) throw new Error("DOM not defined");
+      expect(context.dom("body").text()).toContain("Only navigation here");
+    });
+
+    it("keeps the exclusion while restoring default removals on an otherwise empty page", async () => {
+      const middleware = new HtmlSanitizerMiddleware();
+      const html = `<html><body><nav>Navigation</nav><div class="empty">No topics yet.</div></body></html>`;
+      const context = createMockContext(html, undefined, {
+        excludeSelectors: [".empty"],
+      });
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      if (!context.dom) throw new Error("DOM not defined");
+      const text = context.dom("body").text();
+      expect(text).not.toContain("No topics yet.");
+      expect(text).toContain("Navigation");
+    });
+  });
 });

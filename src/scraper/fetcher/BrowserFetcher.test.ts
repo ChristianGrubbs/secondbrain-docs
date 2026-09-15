@@ -332,4 +332,22 @@ describe("BrowserFetcher", () => {
     expect(requestOptions.headers).toEqual(pageHeaders);
     expect(requestOptions.headers).toEqual(expect.objectContaining({ "X-Test": "1" }));
   });
+
+  it("never navigates with a mobile user agent (desktop-only fingerprint default)", async () => {
+    // The browser fetcher draws its own fingerprint, independent of
+    // HttpFetcher, so the desktop-only default has to hold here too
+    // (2026-09-15 Codex review finding 2).
+    const { page } = mockBrowser();
+    const fetcher = new BrowserFetcher(loadConfig().scraper);
+
+    for (let i = 0; i < 40; i += 1) {
+      await fetcher.fetch("https://example.com");
+    }
+
+    for (const [headers] of page.setExtraHTTPHeaders.mock.calls) {
+      expect((headers as Record<string, string>)["user-agent"]).not.toMatch(
+        /Mobile|Android|iPhone|iPad|iPod/i,
+      );
+    }
+  });
 });

@@ -58,6 +58,15 @@ export class HtmlDefuddleMiddleware implements ContentProcessorMiddleware {
       return;
     }
 
+    // Apply user-supplied excludeSelectors to the source Cheerio DOM before
+    // anything else reads it. Defuddle standardises markup (e.g. unwrapping
+    // divs into <p>), which strips the class/id hooks the user supplied — so
+    // post-extraction removal often misses. Filtering the context DOM itself
+    // (fork change, 2026-09-15) also means every fallback below — low
+    // retention, empty output, or an extraction exception — hands back a DOM
+    // that already honours the exclusions instead of resurrecting them.
+    this.applyExcludeToSourceDom($, context);
+
     try {
       const originalHtml = $.html();
       // Measure *visible* text, excluding script/style content. SPA pages
@@ -69,13 +78,6 @@ export class HtmlDefuddleMiddleware implements ContentProcessorMiddleware {
       const textLengthBefore = $bodyClone("body").text().trim().length;
 
       const { document } = parseHTML(originalHtml);
-
-      // Apply user-supplied excludeSelectors *before* Defuddle. Defuddle
-      // standardises markup (e.g. unwrapping divs into <p>), which strips the
-      // class/id hooks the user supplied — so post-extraction removal often
-      // misses. Filtering on the source DOM matches the user's mental model
-      // (same as the Cheerio sanitiser path).
-      this.applyExcludePreDefuddle(document, context);
 
       // Defuddle's `standardize` step unwraps the language-bearing ancestor
       // divs that highlighters like Pygments/Sphinx and GitHub use (e.g.
@@ -224,18 +226,21 @@ export class HtmlDefuddleMiddleware implements ContentProcessorMiddleware {
     }
   }
 
-  private applyExcludePreDefuddle(document: Document, context: MiddlewareContext): void {
+  private applyExcludeToSourceDom(
+    $: cheerio.CheerioAPI,
+    context: MiddlewareContext,
+  ): void {
     const selectors = context.options.excludeSelectors ?? [];
     if (selectors.length === 0) return;
 
     for (const selector of selectors) {
       try {
-        const matches = document.querySelectorAll(selector);
-        for (const node of Array.from(matches)) {
-          const tag = node.tagName?.toLowerCase();
-          if (tag === "html" || tag === "body") continue;
-          node.remove();
-        }
+        $(selector)
+          .filter(function () {
+            const tag = $(this).prop("tagName")?.toLowerCase();
+            return tag !== "html" && tag !== "body";
+          })
+          .remove();
       } catch (selectorError) {
         logger.warn(
           `⚠️  Invalid excludeSelector "${selector}" before Defuddle: ${selectorError}`,

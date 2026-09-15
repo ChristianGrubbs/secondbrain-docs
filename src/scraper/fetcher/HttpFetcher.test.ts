@@ -375,6 +375,25 @@ describe("HttpFetcher", () => {
     );
   });
 
+  it("never sends a mobile user agent (desktop-only fingerprint default)", async () => {
+    const fetcher = createFetcher();
+    mockedAxios.get.mockResolvedValue({
+      data: Buffer.from("<html><body>ok</body></html>", "utf-8"),
+      headers: { "content-type": "text/html" },
+    });
+
+    for (let i = 0; i < 40; i += 1) {
+      await fetcher.fetch("https://example.com");
+    }
+
+    for (const [, options] of mockedAxios.get.mock.calls) {
+      const userAgent = (options as { headers: Record<string, string> }).headers[
+        "user-agent"
+      ];
+      expect(userAgent).not.toMatch(/Mobile|Android|iPhone|iPad|iPod/i);
+    }
+  });
+
   it("should respect custom headers", async () => {
     const fetcher = createFetcher();
     const mockResponse = {

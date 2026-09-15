@@ -12,11 +12,17 @@ export class FingerprintGenerator {
    * @param options Optional configuration for the header generator.
    */
   constructor(options?: Partial<HeaderGeneratorOptions>) {
-    // Default options for a broad range of realistic headers
+    // Default options for a broad range of realistic *desktop* headers.
+    // Fork change (2026-09-15): mobile devices and OSes are no longer in the
+    // pool. Both HttpFetcher and BrowserFetcher draw from this generator, and
+    // a randomly drawn mobile user agent made Salesforce Experience Cloud
+    // serve a mobile (`formFactor: SMALL`) bootstrap that never rendered in
+    // headless desktop Chromium, so the raw shell became the captured page.
+    // Callers can still opt into mobile explicitly via `options`.
     const defaultOptions: Partial<HeaderGeneratorOptions> = {
       browsers: [{ name: "chrome", minVersion: 100 }, "firefox", "safari"],
-      devices: ["desktop", "mobile"],
-      operatingSystems: ["windows", "linux", "macos", "android", "ios"],
+      devices: ["desktop"],
+      operatingSystems: ["windows", "linux", "macos"],
       locales: ["en-US", "en"],
       httpVersion: "2",
     };

@@ -131,6 +131,13 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
           default: false,
           describe: "Publish into the vault without touching the search index",
         })
+        .option("exclude-selector", {
+          type: "string",
+          array: true,
+          requiresArg: true,
+          describe:
+            "CSS selector whose matches are dropped from every captured page before conversion; repeat the flag for more than one. Content-only and per-invocation: crawl links are collected first, and nothing is remembered for the collection",
+        })
         .strict(),
 
     handler: async (args) => {
@@ -207,6 +214,12 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
               }
           : deps.indexer;
 
+      // Each `--exclude-selector` value is one selector, forwarded verbatim:
+      // a comma inside it is CSS grouping syntax, never a list separator.
+      const excludeSelectors = (
+        Array.isArray(args["exclude-selector"]) ? args["exclude-selector"] : []
+      ).filter((selector): selector is string => typeof selector === "string");
+
       const options: ScraperOptions = {
         url: requestedUrl,
         library,
@@ -214,6 +227,7 @@ export function createCaptureCommand(deps: CaptureDeps = {}): CommandModule {
         maxPages,
         maxDepth,
         scrapeMode: ScrapeMode.Auto,
+        ...(excludeSelectors.length > 0 ? { excludeSelectors } : {}),
       };
 
       // Command-scoped cancellation: a SIGINT during this capture aborts it
