@@ -27,10 +27,21 @@ export class FingerprintGenerator {
       httpVersion: "2",
     };
 
-    this.headerGenerator = new HeaderGenerator({
-      ...defaultOptions,
-      ...options,
-    });
+    // `devices` and `operatingSystems` are a coupled pair in header-generator:
+    // `{ devices: ["mobile"] }` combined with the desktop OS default (or an
+    // Android/iOS override combined with the desktop device default) has no
+    // matching headers and throws. When a caller overrides only one half,
+    // widen the paired half back to the full upstream pool so every
+    // previously supported single-field override keeps working.
+    const merged: Partial<HeaderGeneratorOptions> = { ...defaultOptions, ...options };
+    if (options?.devices !== undefined && options.operatingSystems === undefined) {
+      merged.operatingSystems = ["windows", "linux", "macos", "android", "ios"];
+    }
+    if (options?.operatingSystems !== undefined && options.devices === undefined) {
+      merged.devices = ["desktop", "mobile"];
+    }
+
+    this.headerGenerator = new HeaderGenerator(merged);
   }
 
   /**

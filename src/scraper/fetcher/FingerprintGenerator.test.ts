@@ -69,6 +69,38 @@ describe("FingerprintGenerator", () => {
       expect(options?.operatingSystems).toEqual(["android"]);
     });
 
+    it("a devices-only override still generates headers (paired OS default dropped)", () => {
+      // Codex diff review (rev 3, major): `{ devices: ["mobile"] }` merged
+      // with the desktop OS default made header-generator throw.
+      vi.mocked(HeaderGenerator).mockClear();
+      const generator = new FingerprintGenerator({ devices: ["mobile"] });
+      const [options] = vi.mocked(HeaderGenerator).mock.calls[0];
+      expect(options?.devices).toEqual(["mobile"]);
+      expect(options?.operatingSystems).toEqual(
+        expect.arrayContaining(["android", "ios"]),
+      );
+      expect(generator.generateHeaders()["user-agent"]).toMatch(MOBILE_UA);
+    });
+
+    it("an operatingSystems-only override still generates headers (paired device default dropped)", () => {
+      vi.mocked(HeaderGenerator).mockClear();
+      const generator = new FingerprintGenerator({ operatingSystems: ["android"] });
+      const [options] = vi.mocked(HeaderGenerator).mock.calls[0];
+      expect(options?.operatingSystems).toEqual(["android"]);
+      expect(options?.devices).toEqual(expect.arrayContaining(["mobile"]));
+      expect(generator.generateHeaders()["user-agent"]).toMatch(/Android/i);
+    });
+
+    it("a desktop-only OS override still yields desktop user agents", () => {
+      vi.mocked(HeaderGenerator).mockClear();
+      const generator = new FingerprintGenerator({ operatingSystems: ["macos"] });
+      for (let i = 0; i < 20; i += 1) {
+        const ua = generator.generateHeaders()["user-agent"];
+        expect(ua).toMatch(/Macintosh|Mac OS X/i);
+        expect(ua).not.toMatch(MOBILE_UA);
+      }
+    });
+
     it("never draws a mobile user agent by default", () => {
       const generator = new FingerprintGenerator();
       for (let i = 0; i < 100; i += 1) {
