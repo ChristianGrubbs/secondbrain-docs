@@ -1,0 +1,3 @@
+v22.23.2
+127
+461e45e5b143c31831c0d0614143b6dfc2b984115133275c71cb213b3760b9bb  /Volumes/3M/github-repos/secondbrain-docs/dist/vault-cli.js
