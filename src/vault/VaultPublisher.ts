@@ -15,6 +15,7 @@
 
 import { scanSources } from "./discovery";
 import {
+  candidateFilename,
   collectionIndexPath,
   DOC_SETS_ROOT,
   INBOX_COLLECTION,
@@ -52,9 +53,6 @@ import type { ConflictReason, Publication, Publisher, SourceDocument } from "./t
 
 /** Full identity length, used when a short filename is already taken. */
 const FULL_HASH_LENGTH = 64;
-
-/** Identity characters used in a candidate's content-addressed filename. */
-const CANDIDATE_HASH_LENGTH = 12;
 
 /** Collection that preserved incoming versions are written to. */
 export const SOURCE_UPDATES_PATH = "00 Inbox/Source Capture Updates";
@@ -648,16 +646,21 @@ export class VaultPublisher implements Publisher {
   /**
    * Writes — or reuses — the preserved incoming version of a source.
    *
-   * The filename is content addressed by source identity plus semantic content
-   * digest, so recapturing the same unchanged conflict reuses one candidate
-   * rather than accumulating one per run. A candidate whose content no longer
-   * matches its own address was edited by a human and is never overwritten.
+   * The filename is the sanitized title followed by a content address — source
+   * identity plus semantic content digest — so recapturing the same unchanged
+   * conflict reuses one candidate rather than accumulating one per run. A
+   * candidate whose content no longer matches its own address was edited by a
+   * human and is never overwritten.
    */
   private async writeCandidate(
     input: SourceDocument,
     rendered: RenderedNote,
   ): Promise<{ path: string; moc: "linked" | "pending"; modified: boolean }> {
-    const name = `${rendered.sourceId.slice(0, CANDIDATE_HASH_LENGTH)}-${rendered.semanticDigest.slice(0, CANDIDATE_HASH_LENGTH)}.md`;
+    const name = candidateFilename({
+      title: input.title,
+      sourceId: rendered.sourceId,
+      semanticDigest: rendered.semanticDigest,
+    });
     const path = `${SOURCE_UPDATES_PATH}/${name}`;
 
     /**
