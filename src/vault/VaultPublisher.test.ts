@@ -485,6 +485,58 @@ describe("VaultPublisher", () => {
     expect(notePaths).toHaveLength(1);
   });
 
+  it("rewrites the MOC alias when a replaced note's title changed", async () => {
+    const first = await publisher.publish(makeDocument({ title: "Untitled" }));
+    const retitled = await publisher.publish(
+      makeDocument({
+        title: "Working on Projects with uv",
+        markdown: `${SOURCE_MARKDOWN}\nRewritten.\n`,
+      }),
+    );
+
+    expect(retitled.status).toBe("replaced");
+    const target = first.path.replace(/\.md$/, "");
+    const index = cli.notes.get("00 Inbox/Source Captures/index.md") ?? "";
+    expect(index).toContain(`- [[${target}|Working on Projects with uv]]`);
+    expect(index).not.toContain("|Untitled]]");
+    expect(linksTo(index, target)).toHaveLength(1);
+  });
+
+  it("leaves the MOC bytes untouched when a replaced note keeps its title", async () => {
+    await publisher.publish(makeDocument());
+    const before = cli.notes.get("00 Inbox/Source Captures/index.md");
+    const writesBefore = cli.invocations.length;
+
+    const replaced = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nRewritten.\n` }),
+    );
+
+    expect(replaced.status).toBe("replaced");
+    expect(cli.notes.get("00 Inbox/Source Captures/index.md")).toBe(before);
+    const indexWrites = cli.invocations
+      .slice(writesBefore)
+      .filter((call) => call.args[0] === "write" && call.args[1].endsWith("index.md"));
+    expect(indexWrites).toHaveLength(0);
+  });
+
+  it("leaves a human-edited MOC alias alone when the title is unchanged", async () => {
+    const first = await publisher.publish(makeDocument());
+    const indexPath = "00 Inbox/Source Captures/index.md";
+    const target = first.path.replace(/\.md$/, "");
+    const edited = (cli.notes.get(indexPath) ?? "").replace(
+      `[[${target}|Working on Projects with uv]]`,
+      `[[${target}|My hand-picked alias]]`,
+    );
+    cli.notes.set(indexPath, edited);
+
+    const replaced = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nRewritten.\n` }),
+    );
+
+    expect(replaced.status).toBe("replaced");
+    expect(cli.notes.get(indexPath)).toBe(edited);
+  });
+
   it("gives two same-title sources distinct paths and two MOC links", async () => {
     const first = await publisher.publish(makeDocument({ title: "Shared Title" }));
     const second = await publisher.publish(
