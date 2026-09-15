@@ -1,8 +1,16 @@
 import * as cheerio from "cheerio";
+import { Defuddle } from "defuddle/node";
 import { describe, expect, it, vi } from "vitest";
 import type { ScraperOptions } from "../types";
 import { HtmlDefuddleMiddleware } from "./HtmlDefuddleMiddleware";
 import type { MiddlewareContext } from "./types";
+
+// Pass-through spy so one test can force Defuddle's empty-output branch
+// without touching the real extraction for every other test.
+vi.mock("defuddle/node", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("defuddle/node")>();
+  return { ...actual, Defuddle: vi.fn(actual.Defuddle) };
+});
 
 const createMockScraperOptions = (
   url = "http://example.com",
@@ -211,5 +219,85 @@ describe("HtmlDefuddleMiddleware", () => {
     // language onto <code> so it survives.
     const codeClass = $("pre code").attr("class") ?? "";
     expect(codeClass).toMatch(/language-python3/);
+  });
+
+  describe("excludeSelectors survive every fallback", () => {
+    it("keeps exclusions when low retention falls back to the original DOM", async () => {
+      // 2026-09-15 Codex review finding 1: the fallback used to hand back
+      // the unfiltered context DOM, resurrecting explicitly excluded blocks.
+      const middleware = new HtmlDefuddleMiddleware({ minTextRetentionRatio: 0.99 });
+      const context = createMockContext(
+        articleHtml('<div class="emptyListContent">No topics yet.</div>'),
+        undefined,
+        { excludeSelectors: [".emptyListContent"] },
+      );
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      const $ = context.dom;
+      if (!$) throw new Error("DOM not defined");
+      // Fallback path: boilerplate is back, the exclusion is not.
+      expect($("nav").length).toBeGreaterThan(0);
+      expect($("body").text()).not.toContain("No topics yet.");
+      expect($("body").text()).toContain("Lorem ipsum");
+    });
+
+    it("keeps exclusions when extraction throws", async () => {
+      const middleware = new HtmlDefuddleMiddleware();
+      const context = createMockContext(
+        articleHtml('<div class="emptyListContent">No topics yet.</div>'),
+        undefined,
+        { excludeSelectors: [".emptyListContent"] },
+      );
+      // Force the extraction path to throw after the source DOM is read: a
+      // context whose `dom.html()` explodes cannot be extracted, but the
+      // exclusion applied to the Cheerio DOM must already have happened.
+      const $ = context.dom;
+      if (!$) throw new Error("DOM not defined");
+      const original = $.html.bind($);
+      let calls = 0;
+      $.html = ((...args: unknown[]) => {
+        calls += 1;
+        if (calls === 1) throw new Error("synthetic extraction failure");
+        return (original as (...a: unknown[]) => string)(...args);
+      }) as typeof $.html;
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      expect(context.errors.map((e) => e.message)).toContain(
+        "synthetic extraction failure",
+      );
+      expect($("body").text()).not.toContain("No topics yet.");
+      expect($("body").text()).toContain("Lorem ipsum");
+    });
+
+    it("keeps exclusions when Defuddle returns empty output", async () => {
+      // Codex diff review (rev 3, minor): the empty-output condition shares
+      // the fallback branch with low retention but deserves its own fixture.
+      vi.mocked(Defuddle).mockResolvedValueOnce({
+        content: "",
+        title: "",
+      } as Awaited<ReturnType<typeof Defuddle>>);
+      const middleware = new HtmlDefuddleMiddleware();
+      const context = createMockContext(
+        articleHtml('<div class="emptyListContent">No topics yet.</div>'),
+        undefined,
+        { excludeSelectors: [".emptyListContent"] },
+      );
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await middleware.process(context, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      const $ = context.dom;
+      if (!$) throw new Error("DOM not defined");
+      expect($("nav").length).toBeGreaterThan(0);
+      expect($("body").text()).not.toContain("No topics yet.");
+      expect($("body").text()).toContain("Lorem ipsum");
+    });
   });
 });

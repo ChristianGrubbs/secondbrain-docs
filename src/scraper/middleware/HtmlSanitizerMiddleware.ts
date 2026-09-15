@@ -179,46 +179,55 @@ export class HtmlSanitizerMiddleware implements ContentProcessorMiddleware {
     }
 
     try {
+      const removeMatching = (selectors: string[], phase: string): number => {
+        let removedCount = 0;
+        for (const selector of selectors) {
+          try {
+            const elements = $(selector); // Use Cheerio selector
+            // Filter out html and body tags to prevent removing them or their entire content
+            const filteredElements = elements.filter(function () {
+              const tagName = $(this).prop("tagName")?.toLowerCase();
+              return tagName !== "html" && tagName !== "body";
+            });
+            const count = filteredElements.length;
+            if (count > 0) {
+              filteredElements.remove(); // Use Cheerio remove
+              removedCount += count;
+            }
+          } catch (selectorError) {
+            // Log invalid selectors but continue with others
+            // Cheerio is generally more tolerant of invalid selectors than querySelectorAll
+            logger.warn(
+              `⚠️  Potentially invalid selector "${selector}" during ${phase} element removal: ${selectorError}`,
+            );
+            context.errors.push(
+              new Error(`Invalid selector "${selector}": ${selectorError}`),
+            );
+          }
+        }
+        return removedCount;
+      };
+
+      // Fork change (2026-09-15): user-supplied exclusions are an explicit
+      // instruction, so they are applied *before* the safety-net snapshot is
+      // taken. The empty-page revert below can then only bring back the
+      // default boilerplate removals, never an excluded element.
+      const userSelectors = context.options.excludeSelectors ?? [];
+      const excludedCount = removeMatching(userSelectors, "excludeSelectors");
+
       // Capture the body content before sanitization for safety net
       const bodyBeforeSanitization = $("body").html() || "";
       const textLengthBefore = $("body").text().trim().length;
 
-      // Remove unwanted elements using Cheerio
-      const selectorsToRemove = [
-        ...(context.options.excludeSelectors || []), // Use options from the context
-        ...this.defaultSelectorsToRemove,
-      ];
       logger.debug(
-        `Removing elements matching ${selectorsToRemove.length} selectors for ${context.source}`,
+        `Removing elements matching ${this.defaultSelectorsToRemove.length} default selectors for ${context.source}`,
       );
-      let removedCount = 0;
-      for (const selector of selectorsToRemove) {
-        try {
-          const elements = $(selector); // Use Cheerio selector
-          // Filter out html and body tags to prevent removing them or their entire content
-          const filteredElements = elements.filter(function () {
-            const tagName = $(this).prop("tagName")?.toLowerCase();
-            return tagName !== "html" && tagName !== "body";
-          });
-          const count = filteredElements.length;
-          if (count > 0) {
-            filteredElements.remove(); // Use Cheerio remove
-            removedCount += count;
-          }
-        } catch (selectorError) {
-          // Log invalid selectors but continue with others
-          // Cheerio is generally more tolerant of invalid selectors than querySelectorAll
-          logger.warn(
-            `⚠️  Potentially invalid selector "${selector}" during element removal: ${selectorError}`,
-          );
-          context.errors.push(
-            new Error(`Invalid selector "${selector}": ${selectorError}`),
-          );
-        }
-      }
-      logger.debug(`Removed ${removedCount} elements for ${context.source}`);
+      const removedCount = removeMatching(this.defaultSelectorsToRemove, "default");
+      logger.debug(
+        `Removed ${excludedCount} excluded + ${removedCount} default elements for ${context.source}`,
+      );
 
-      // Safety net: Check if sanitization removed all content
+      // Safety net: Check if default sanitization removed all remaining content
       const textLengthAfter = $("body").text().trim().length;
       if (textLengthBefore > 0 && textLengthAfter === 0) {
         logger.warn(

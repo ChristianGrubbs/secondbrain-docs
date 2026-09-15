@@ -806,3 +806,104 @@ describe("sb-docs capture: command-scoped cancellation", () => {
     process.exitCode = 0;
   });
 });
+
+describe("sb-docs capture: --exclude-selector", () => {
+  it("forwards each repeated --exclude-selector verbatim, commas included", async () => {
+    let seen: ScraperOptions | undefined;
+    const scraperService = fakeScraperServiceCapturingOptions((options) => {
+      seen = options;
+    });
+    const publisher: Publisher = { publish: async () => seededPublication(vault) };
+
+    await runCapture(
+      [
+        "https://example.com/",
+        "--exclude-selector",
+        ".emptyListContent, .loadingIndicator",
+        "--exclude-selector",
+        "#promo",
+        "--json",
+      ],
+      { scraperService, publisher },
+    );
+
+    // Two flags, two selectors: the comma inside the first one is CSS
+    // grouping syntax, never a list separator for the CLI to split on.
+    expect(seen?.excludeSelectors).toEqual([
+      ".emptyListContent, .loadingIndicator",
+      "#promo",
+    ]);
+    process.exitCode = 0;
+  });
+
+  it("leaves excludeSelectors undefined when the flag is omitted", async () => {
+    let seen: ScraperOptions | undefined;
+    const scraperService = fakeScraperServiceCapturingOptions((options) => {
+      seen = options;
+    });
+    const publisher: Publisher = { publish: async () => seededPublication(vault) };
+
+    await runCapture(["https://example.com/", "--json"], { scraperService, publisher });
+
+    expect(seen?.excludeSelectors).toBeUndefined();
+    process.exitCode = 0;
+  });
+
+  it("rejects a bare --exclude-selector with no value", async () => {
+    await expect(
+      runCapture(["https://example.com/", "--exclude-selector"]),
+    ).rejects.toThrow(/exclude-selector/);
+  });
+
+  for (const extractor of ["cheerio", "defuddle"] as const) {
+    it(`drops hidden placeholder blocks and keeps article links through a real capture (${extractor})`, async () => {
+      // Regression for the AudienceView capture (2026-09-15 evidence note):
+      // `display:none` empty/loading-state siblings survive extraction and
+      // land in the note as `No topics yet.` / `Loading` lines. A per-capture
+      // exclude selector must remove them under either extractor without
+      // dropping the article links next to them.
+      const base = `https://sb-docs-exclude-${extractor}.test`;
+      const prose =
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+      nock(base)
+        .get("/")
+        .reply(
+          200,
+          `<html><head><title>Knowledge base</title></head><body>
+             <main><article>
+               <h1>Knowledge base</h1>
+               <p>${prose.repeat(30)}</p>
+               <section class="topic">
+                 <div class="emptyListContent" style="display:none">No topics yet.</div>
+                 <div class="loadingIndicator" style="display:none">Loading</div>
+                 <ul><li><a href="${base}/article/how-to-refund">How to refund an order</a></li></ul>
+               </section>
+             </article></main>
+           </body></html>`,
+          { "Content-Type": "text/html" },
+        );
+
+      const appConfig = AppConfigSchema.parse({
+        ...unrestrictedConfig(),
+        scraper: { ...unrestrictedConfig().scraper, htmlExtractor: extractor },
+      });
+      await runCapture(
+        [
+          `${base}/`,
+          "--exclude-selector",
+          ".emptyListContent, .loadingIndicator",
+          "--json",
+        ],
+        { appConfig },
+      );
+
+      const report = envelope();
+      expect(report.exitCode).toBe(0);
+      const markdown = report.outcomes[0]?.publication?.markdown ?? "";
+      expect(markdown).not.toContain("No topics yet.");
+      expect(markdown).not.toContain("Loading");
+      expect(markdown).toContain("How to refund an order");
+      process.exitCode = 0;
+    });
+  }
+});
