@@ -4,7 +4,7 @@ Updated 2026-09-15. This is the Task 7 record: how both agents reach the qualifi
 
 ## How agents reach the CLI
 
-Both agents are meant to load one shared skill, `sb-docs`, from the stack catalog (`~/ai-stack/skills/sb-docs`), assigned global through `skill-scope`. The skill, its wrapper and the attic move of the old `sb-capture` tripwire are merged in ai-stack ([PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) `590c5ab4`, [PR #653](https://github.com/ChristianGrubbs/ai-stack/pull/653) `978212b2`); the `skill-scope` assignment and the fresh-session proof for both agents are still pending (see "Live evidence"). The skill invokes one executable wrapper:
+Both agents are meant to load one shared skill, `sb-docs`, from the stack catalog (`~/ai-stack/skills/sb-docs`), assigned global through `skill-scope`. The skill, its wrapper and the attic move of the old `sb-capture` tripwire are merged in ai-stack ([PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) `590c5ab4`, [PR #653](https://github.com/ChristianGrubbs/ai-stack/pull/653) `978212b2`, [PR #654](https://github.com/ChristianGrubbs/ai-stack/pull/654) `0100534e` — the last carries the Codex review fixes); the `skill-scope` assignment and the fresh-session proof for both agents are still pending (see "Live evidence"). The skill invokes one executable wrapper:
 
 ```text
 ~/ai-stack/bin/sb-docs <command> [options]
@@ -26,8 +26,9 @@ Runtime state (publication journals, ownership records, per-source locks, index 
 | Field | Value |
 | --- | --- |
 | Repository | `/Volumes/3M/github-repos/secondbrain-docs` (`ChristianGrubbs/secondbrain-docs`) |
-| Qualified SHA (R2) | `fccabebb2a833119968704db309879c3fb2562d1` (PR #10, Task 6 packet 15) |
+| Qualified SHA (R2) | `fccabebb2a833119968704db309879c3fb2562d1` (PR #10, Task 6 packet 15) — the release all live evidence below was produced on |
 | Previous qualified SHA (R1) | `89e3a5652cc1295e6890b60d234ccb16331b1985` (PR #9) |
+| Candidate R3 | the squash of [PR #11](https://github.com/ChristianGrubbs/secondbrain-docs/pull/11): R2 plus one CLI fix — `capture --no-index` was rejected by yargs' boolean negation ("Unknown argument: index"); `createVaultCli` now sets `parserConfiguration({ "boolean-negation": false })` and `capture.test.ts` invokes the literal flag (publication, `index: not-attempted`, exit 0, no index root created). Activate R3 with the two-stage recipe below once merged; the R2 evidence stands for R2 |
 | Toolchain | Node v22.23.2 (`/opt/homebrew/opt/node@22/bin`), native ABI `process.versions.modules` = 127, arm64; `better-sqlite3` built for that ABI (loaded successfully by every `search`/`reindex` in the evidence below); Playwright Chromium from `npx playwright install chromium` |
 | Executable | `dist/vault-cli.js`, produced by `npm run build` |
 
@@ -48,17 +49,19 @@ SB_DOCS_DIST=/Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha>/dist/vault
 
 A candidate whose `doctor` cannot read the shared state directory, or whose `search` cannot serve the existing notes, is not compatible: stop here, keep the current release, and fix forward. Nothing has changed yet.
 
-**Stage 2 — activate the validated SHA in the live checkout.** Record the current SHA first (`git -C /Volumes/3M/github-repos/secondbrain-docs rev-parse HEAD`) so activation can be undone.
+**Stage 2 — activate the validated SHA in the live checkout.** Record the current SHA first (`git -C /Volumes/3M/github-repos/secondbrain-docs rev-parse HEAD`) so activation can be undone. `dist/` is gitignored, so switching SHAs does not touch the old build: remove it explicitly before building, so that a failed `npm ci` or build leaves no executable behind and the wrapper refuses to run (its missing-executable path is tested in ai-stack) instead of serving the previous release under the new SHA.
 
 ```bash
 export PATH=/opt/homebrew/opt/node@22/bin:$PATH
 git -C /Volumes/3M/github-repos/secondbrain-docs switch --detach <validated-sha>
+rm -rf /Volumes/3M/github-repos/secondbrain-docs/dist
 npm ci --prefix /Volumes/3M/github-repos/secondbrain-docs
 npm run build --prefix /Volumes/3M/github-repos/secondbrain-docs
+shasum -a 256 /Volumes/3M/github-repos/secondbrain-docs/dist/vault-cli.js /Volumes/3M/ai-stack-wt/secondbrain-docs/<validated-sha>/dist/vault-cli.js
 ~/ai-stack/bin/sb-docs doctor --json
 ```
 
-If stage 2 fails part-way (a failed `npm ci` or build leaves the live checkout without a usable `dist/vault-cli.js`), recover by re-running stage 2 with the recorded prior SHA; the wrapper refuses to run until `dist/vault-cli.js` exists again, so a half-built checkout cannot serve captures. Then record the SHA, `node --version`, `process.versions.modules`, and the `doctor` output in this file. Rollback is the same two stages with the previous qualified SHA. There are no per-release directories, installers or pointer files; the checkout is the release.
+The two `shasum` lines must match: the live executable is then byte-identical to the one stage 1 validated, which is the identity check that the running artifact belongs to the selected SHA. If stage 2 fails part-way, re-run stage 2 with the recorded prior SHA. Then record the SHA, the executable's sha256, `node --version`, `process.versions.modules`, and the `doctor` output in this file. Rollback is the same two stages with the previous qualified SHA. There are no per-release directories, installers or pointer files; the checkout is the release.
 
 ## Local files: allowed roots
 
@@ -70,7 +73,7 @@ Every entry names the SHA, the Node version, the command, the exit code, and whe
 
 ### 2026-09-15 — R2 `fccabebb2a833119968704db309879c3fb2562d1`, Node v22.23.2, arm64
 
-Wrapper: the `bin/sb-docs` shipped in ai-stack [PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) (squash `590c5ab4`), run from its byte-identical pre-merge copy because `~/ai-stack` was held by another session's lease at the time. Operator-designated URLs. Every command ran through the wrapper; `capture`, `search`, `reindex` and `doctor` with `--json`, `read` as raw Markdown (it has no `--json`). Raw stdout, stderr and exit code of every run below are committed under [`docs/evidence/2026-09-15-task7/`](evidence/2026-09-15-task7/) (`<step>.out`, `<step>.err`, `<step>.exit`; the three capture envelopes as `capture-*.json`; `node-abi.txt`).
+Wrapper: the `bin/sb-docs` shipped in ai-stack [PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) (squash `590c5ab4`), run from its byte-identical pre-merge copy because `~/ai-stack` was held by another session's lease at the time. Operator-designated URLs. Every command ran through the wrapper; `capture`, `search`, `reindex` and `doctor` with `--json`, `read` as raw Markdown (it has no `--json`). Raw stdout, stderr and exit code of every run below are committed under [`docs/evidence/2026-09-15-task7/`](evidence/2026-09-15-task7/) as `<step>.out`, `<step>.err`, `<step>.exit` (its `README.txt` maps the capture files to their inputs). For the three successful captures the `.out`/`.err` files are the original run's stdout and stderr and the `.exit` files hold the exit code observed in the session transcript (0); the refused capture (`capture-local-outside-roots.*`) was re-run to record its full triplet; `node-abi.txt` holds the Node/ABI line.
 
 | Step | Command | Exit | Result |
 | --- | --- | --- | --- |

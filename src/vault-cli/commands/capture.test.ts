@@ -423,6 +423,34 @@ describe("sb-docs capture: exit codes", () => {
     process.exitCode = 0;
   });
 
+  it("publishes with the literal --no-index flag, reports not-attempted and leaves no index behind", async () => {
+    // Regression for a 2026-09-15 Task 7 review finding: yargs treats
+    // `--no-<name>` as boolean negation of an undeclared `<name>` option, so
+    // the declared `no-index` flag was rejected as "Unknown argument: index"
+    // by the strict parser. The service-level test exercises the
+    // `indexer === undefined` path directly and never saw the parser.
+    const scraperService = fakeScraperService([
+      { currentUrl: "https://example.com/", depth: 0 },
+    ]);
+    const publication = seededPublication(vault);
+    const publisher: Publisher = { publish: async () => publication };
+
+    await runCapture(["https://example.com/", "--no-index", "--json"], {
+      scraperService,
+      publisher,
+    });
+
+    expect(process.exitCode).toBe(0);
+    const report = envelope();
+    expect(report.exitCode).toBe(0);
+    expect(report.outcomes).toHaveLength(1);
+    expect(report.outcomes[0].publication?.status).toBe("published");
+    expect(report.outcomes[0].index).toBe("not-attempted");
+    // Nothing touched the derived index: no index root was created at all.
+    expect(fs.existsSync(path.join(stateDir, "index"))).toBe(false);
+    process.exitCode = 0;
+  });
+
   it("reports indexing pending when the saved note is renamed before it is indexed", async () => {
     const scraperService = fakeScraperService([
       { currentUrl: "https://example.com/", depth: 0 },
