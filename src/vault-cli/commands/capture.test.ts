@@ -907,3 +907,41 @@ describe("sb-docs capture: --exclude-selector", () => {
     });
   }
 });
+
+describe("sb-docs capture: markdown source with its own frontmatter", () => {
+  it("titles the note from an unparseable served frontmatter and keeps one frontmatter block", async () => {
+    // Regression for the 2026-09-15 skill test: higgsfield.ai serves
+    // text/markdown whose frontmatter has an unquoted colon-bearing `title:`
+    // (invalid YAML) and no H1. The note came out as "Untitled" with the
+    // served block sitting verbatim under the publisher's own frontmatter.
+    const base = "https://sb-docs-served-frontmatter.test";
+    nock(base)
+      .get("/post")
+      .reply(
+        200,
+        "---\ndescription: GPT Image 2.5 is now on the platform\ntitle: Platform Meets GPT Image 2.5: How It Works and What You Get\nimage: https://cdn.example/hero.png\n---\n\n![hero](https://cdn.example/hero.png)\n\nGPT Image 2.5 is now available. This guide covers what changed.\n\n## What Is GPT Image 2.5?\n\nBody text.\n",
+        { "Content-Type": "text/markdown; charset=utf-8" },
+      );
+
+    await runCapture([`${base}/post`, "--json"]);
+
+    const report = envelope();
+    expect(report.exitCode).toBe(0);
+    const publication = report.outcomes[0]?.publication;
+    expect(publication?.status).toBe("published");
+    expect(publication?.path).toContain(
+      "Platform Meets GPT Image 2.5 How It Works and What You Get",
+    );
+    const markdown = publication?.markdown ?? "";
+    expect(markdown).toMatch(
+      /^---\ntype: source\ntitle: ['"]?Platform Meets GPT Image 2\.5: How It Works and What You Get['"]?\n/,
+    );
+    // Exactly one frontmatter block: the served one is gone from the body.
+    const body = markdown.replace(/^---\n[\s\S]*?\n---\n/, "");
+    expect(body.startsWith("---")).toBe(false);
+    expect(body).not.toContain("description: GPT Image 2.5");
+    expect(body).toContain("![hero](https://cdn.example/hero.png)");
+    expect(body).toContain("## What Is GPT Image 2.5?");
+    process.exitCode = 0;
+  });
+});

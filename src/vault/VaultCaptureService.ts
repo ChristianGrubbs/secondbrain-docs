@@ -17,6 +17,7 @@
 import { CancellationError } from "../pipeline/errors";
 import type { ScraperService } from "../scraper/ScraperService";
 import type { ScraperOptions, ScraperProgressEvent } from "../scraper/types";
+import { isMarkdownContentType, stripLeadingFrontmatter } from "./sourceBody";
 import type { Publication, Publisher, SourceDocument } from "./types";
 import { IndexContentError, type IndexEntry } from "./VaultIndex";
 
@@ -363,7 +364,11 @@ export async function capture(
             collection: options.library,
             version: options.version ?? "",
             title: result.title,
-            markdown: result.textContent,
+            // A Markdown source's own frontmatter block would sit under the
+            // publisher's frontmatter as body noise; drop it (2026-09-15).
+            markdown: isMarkdownContentType(result.sourceContentType)
+              ? stripLeadingFrontmatter(result.textContent)
+              : result.textContent,
             sourceContentType: result.sourceContentType,
             capturedAt: new Date().toISOString(),
           };
