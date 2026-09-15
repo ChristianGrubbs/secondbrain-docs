@@ -426,7 +426,7 @@ describe.skipIf(!cliAvailable)("vault publication E2E", () => {
       const candidatesFor = () =>
         fs
           .readdirSync(path.join(sandbox, SOURCE_UPDATES_PATH))
-          .filter((name) => name.startsWith(mine));
+          .filter((name) => name.includes(` ${mine}-`));
 
       const candidates = candidatesFor();
       expect(candidates).toHaveLength(1);
