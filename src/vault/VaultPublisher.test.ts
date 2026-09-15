@@ -586,6 +586,36 @@ describe("VaultPublisher", () => {
     ).toHaveLength(1);
   });
 
+  it("names a conflict candidate by sanitized title plus source id and semantic digest", async () => {
+    const first = await publisher.publish(makeDocument());
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+
+    const second = await publisher.publish(
+      makeDocument({ markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    const basename = (second.candidatePath ?? "").split("/").pop() ?? "";
+    const sourceIdPrefix = first.path.match(/ ([0-9a-f]{12})\.md$/)?.[1] ?? "";
+    expect(sourceIdPrefix).toHaveLength(12);
+    expect(basename).toMatch(
+      new RegExp(`^Working on Projects with uv ${sourceIdPrefix}-[0-9a-f]{12}\\.md$`),
+    );
+  });
+
+  it("keeps a long multibyte candidate basename within the filesystem byte limit", async () => {
+    const title = "漢".repeat(120);
+    const first = await publisher.publish(makeDocument({ title }));
+    cli.notes.set(first.path, "# Hand edited by a human\n");
+
+    const second = await publisher.publish(
+      makeDocument({ title, markdown: `${SOURCE_MARKDOWN}\nUpstream changed.\n` }),
+    );
+
+    const basename = (second.candidatePath ?? "").split("/").pop() ?? "";
+    expect(Buffer.byteLength(basename, "utf8")).toBeLessThanOrEqual(255);
+    expect(basename).toMatch(/^漢+ [0-9a-f]{12}-[0-9a-f]{12}\.md$/);
+  });
+
   it("catches a human frontmatter edit through the whole-note digest", async () => {
     const first = await publisher.publish(makeDocument());
     // Semantically identical: only the capture timestamp line moved.

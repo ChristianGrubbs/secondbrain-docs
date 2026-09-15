@@ -140,6 +140,30 @@ export function noteFilename(
 }
 
 /**
+ * Builds the filename for a preserved conflict candidate.
+ *
+ * The name stays content addressed — source identity plus semantic content
+ * digest — so an unchanged conflict reuses one candidate; the sanitized title
+ * in front only makes it readable to a human browsing the inbox.
+ *
+ * @param options.title Source title, sanitized and truncated to fit.
+ * @param options.sourceId Full source identity hash.
+ * @param options.semanticDigest Full semantic content digest.
+ * @returns A basename within the filesystem's byte limit.
+ */
+export function candidateFilename(options: {
+  title: string;
+  sourceId: string;
+  semanticDigest: string;
+}): string {
+  const suffix = ` ${options.sourceId.slice(0, SHORT_HASH_LENGTH)}-${options.semanticDigest.slice(0, SHORT_HASH_LENGTH)}.md`;
+  const budget = MAX_BASENAME_BYTES - Buffer.byteLength(suffix, "utf8");
+  const title = truncateToBytes(sanitizeSegment(options.title), budget).trimEnd();
+
+  return `${title.length > 0 ? title : "untitled"}${suffix}`;
+}
+
+/**
  * Computes the vault path for a source document.
  *
  * @param input The source document.
