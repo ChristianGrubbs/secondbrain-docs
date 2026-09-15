@@ -33,17 +33,24 @@ export interface VaultCliDeps {
  * @returns The configured yargs program, unparsed.
  */
 export function createVaultCli(argv: string[], deps: VaultCliDeps = {}): Argv {
-  return yargs(argv)
-    .scriptName("sb-docs")
-    .usage("Usage: $0 <command> [options]")
-    .version(__APP_VERSION__)
-    .command(createCaptureCommand(deps.capture))
-    .command(createSearchCommand(deps.search))
-    .command(createReadCommand(deps.read))
-    .command(createReindexCommand(deps.reindex))
-    .command(createDoctorCommand(deps.doctor))
-    .strict()
-    .help()
-    .alias("help", "h")
-    .demandCommand(1, "Choose capture, search, read, reindex, or doctor");
+  return (
+    yargs(argv)
+      .scriptName("sb-docs")
+      // `capture --no-index` is a declared flag, not the negation of an `index`
+      // option; with yargs' default boolean negation the strict parser rejected
+      // it as "Unknown argument: index" (Task 7 review, 2026-09-15). No vault
+      // command relies on `--no-<flag>` negation.
+      .parserConfiguration({ "boolean-negation": false })
+      .usage("Usage: $0 <command> [options]")
+      .version(__APP_VERSION__)
+      .command(createCaptureCommand(deps.capture))
+      .command(createSearchCommand(deps.search))
+      .command(createReadCommand(deps.read))
+      .command(createReindexCommand(deps.reindex))
+      .command(createDoctorCommand(deps.doctor))
+      .strict()
+      .help()
+      .alias("help", "h")
+      .demandCommand(1, "Choose capture, search, read, reindex, or doctor")
+  );
 }

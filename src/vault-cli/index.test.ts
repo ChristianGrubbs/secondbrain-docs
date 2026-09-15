@@ -44,4 +44,24 @@ describe("createVaultCli", () => {
     // registered, which `doctor` now is.
     await expect(parseVaultCli(["bogus"])).rejects.toThrow(/Unknown argument: bogus/);
   });
+
+  // Boolean negation is disabled program-wide so that the declared
+  // `capture --no-index` flag parses (2026-09-15). The deliberate consequence
+  // is that the never-documented `--no-<flag>` forms are unknown arguments on
+  // every command; `--json` itself defaults to false, so nothing is lost.
+  it.each([
+    ["capture", ["capture", "https://example.com/"]],
+    ["search", ["search", "phrase"]],
+    ["reindex", ["reindex"]],
+    ["doctor", ["doctor"]],
+  ])(
+    "%s still lists --json but rejects the negated --no-json form",
+    async (_name, argv) => {
+      const help = await createVaultCli(argv).getHelp();
+      expect(help).toContain("--json");
+      await expect(parseVaultCli([...argv, "--no-json"])).rejects.toThrow(
+        /Unknown arguments?: no-json/,
+      );
+    },
+  );
 });
