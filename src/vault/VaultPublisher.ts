@@ -440,10 +440,11 @@ export class VaultPublisher implements Publisher {
     folder: string,
     path: string,
     digest: string,
+    priorTitle?: string,
   ): Promise<"linked" | "pending"> {
     this.journal.writeOwnership({ sourceId, path, digest });
 
-    const moc = await this.linkFromCollectionIndex(title, folder, path);
+    const moc = await this.linkFromCollectionIndex(title, folder, path, priorTitle);
     if (moc === "pending") {
       this.logger({
         level: "warn",
@@ -572,12 +573,14 @@ export class VaultPublisher implements Publisher {
       return this.conflictAt(input, rendered, path, "manual-edit");
     }
 
+    const priorTitle = parseNoteFrontmatter(snapshot.markdown)?.data.title;
     const moc = await this.finishPublication(
       id,
       input.title,
       folder,
       path,
       rendered.digest,
+      typeof priorTitle === "string" ? priorTitle : undefined,
     );
 
     return {
@@ -918,17 +921,24 @@ export class VaultPublisher implements Publisher {
     return folder;
   }
 
-  /** Ensures a collection index carries exactly one link to the note. */
+  /**
+   * Ensures a collection index carries exactly one link to the note.
+   *
+   * @param priorTitle The title the note carried before a replace; when it
+   *   differs from `title`, the existing MOC line's alias is rewritten.
+   */
   private linkFromCollectionIndex(
     title: string,
     folder: string,
     path: string,
+    priorTitle?: string,
   ): Promise<"linked" | "pending"> {
     return this.linkFromIndex(
       `${folder}/index.md`,
       folder.split("/").pop() ?? folder,
       path,
       title,
+      priorTitle,
     );
   }
 
@@ -947,9 +957,11 @@ export class VaultPublisher implements Publisher {
     indexTitle: string,
     path: string,
     title: string,
+    priorTitle?: string,
   ): Promise<"linked" | "pending"> {
     const target = path.replace(/\.md$/, "");
     const link = `- [[${target}|${sanitizeLinkAlias(title)}]]`;
+    const retitled = priorTitle !== undefined && priorTitle !== title;
 
     let index = await this.cli.readNote(indexPath);
 
@@ -967,7 +979,10 @@ export class VaultPublisher implements Publisher {
 
     if (index !== null) {
       if (!index.split("\n").includes(SOURCES_HEADING)) return "pending";
-      if (hasLinkTo({ markdown: index, target })) return "linked";
+      if (hasLinkTo({ markdown: index, target })) {
+        if (retitled) await this.retitleIndexLink(indexPath, target, link);
+        return "linked";
+      }
     }
 
     try {
@@ -979,6 +994,47 @@ export class VaultPublisher implements Publisher {
       }
       throw error;
     }
+  }
+
+  /**
+   * Rewrites the one MOC line that links `target` so its alias matches the
+   * note's new title, under compare-and-swap, touching no other line.
+   *
+   * Only a publisher-shaped line (`- [[target]]` or `- [[target|alias]]`) is
+   * rewritten; a line that already carries the new alias leaves the index
+   * bytes untouched. A CAS conflict is retried once against a fresh anchor
+   * and then logged and skipped — the link itself is already present, so a
+   * stale alias never fails the publication.
+   */
+  private async retitleIndexLink(
+    indexPath: string,
+    target: string,
+    link: string,
+  ): Promise<void> {
+    const lineMatches = (line: string): boolean =>
+      line === `- [[${target}]]` ||
+      (line.startsWith(`- [[${target}|`) && line.endsWith("]]"));
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const fresh = await this.cli.readNoteWithAnchor(indexPath);
+      if (fresh === null) return;
+      const lines = fresh.markdown.split("\n");
+      const at = lines.findIndex(lineMatches);
+      if (at === -1 || lines[at] === link) return;
+      lines[at] = link;
+      try {
+        await this.cli.replaceNote(indexPath, lines.join("\n"), fresh.anchor);
+        return;
+      } catch (error) {
+        if (!(error instanceof CasConflictError)) throw error;
+      }
+    }
+    this.logger({
+      level: "warn",
+      event: "capture.alias_retitle_skipped",
+      loc: "VaultPublisher.retitleIndexLink",
+      ctx: { indexPath, target },
+    });
   }
 }
 
