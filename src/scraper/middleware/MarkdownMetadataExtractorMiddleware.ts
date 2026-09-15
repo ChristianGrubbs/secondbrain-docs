@@ -41,6 +41,7 @@ export class MarkdownMetadataExtractorMiddleware implements ContentProcessorMidd
     try {
       let title = "Untitled";
       let frontmatterTitle: string | undefined;
+      let frontmatterRejected = false;
 
       // 1. Try to extract title from YAML frontmatter
       try {
@@ -50,6 +51,7 @@ export class MarkdownMetadataExtractorMiddleware implements ContentProcessorMidd
           frontmatterTitle = String(file.data.title).trim();
         }
       } catch (err) {
+        frontmatterRejected = true;
         // Log warning but continue - don't crash the pipeline for bad frontmatter
         logger.warn(
           `Failed to parse markdown frontmatter: ${err instanceof Error ? err.message : String(err)}`,
@@ -63,11 +65,12 @@ export class MarkdownMetadataExtractorMiddleware implements ContentProcessorMidd
         const match = context.content.match(/^#\s+(.*)$/m);
         if (match?.[1]) {
           title = match[1].trim();
-        } else {
+        } else if (frontmatterRejected) {
           // 3. Fork fallback (2026-09-15): the frontmatter block exists but
-          // is not valid YAML (an unquoted `title:` containing a colon is the
-          // common case, e.g. higgsfield.ai's served Markdown) and the body
-          // has no H1. The raw `title:` line is still unambiguous.
+          // the YAML parser rejected it (an unquoted `title:` containing a
+          // colon is the common case, e.g. higgsfield.ai's served Markdown)
+          // and the body has no H1. The raw `title:` line is still
+          // unambiguous. Valid YAML with an empty/null title stays Untitled.
           const recovered = recoverTitleFromRawFrontmatter(context.content);
           if (recovered !== null) {
             title = recovered;

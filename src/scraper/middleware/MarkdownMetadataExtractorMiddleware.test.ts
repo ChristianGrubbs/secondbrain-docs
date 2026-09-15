@@ -226,12 +226,37 @@ describe("MarkdownMetadataExtractorMiddleware", () => {
       expect(context.errors).toHaveLength(0);
     });
 
-    it("strips matching quotes from a recovered title", async () => {
+    it("strips matching double quotes from a recovered title", async () => {
       const middleware = new MarkdownMetadataExtractorMiddleware();
       const markdown = '---\ntitle: "Quoted: Title"\nbad: : yaml\n---\nBody';
       const context = createMockContext(markdown);
       await middleware.process(context, vi.fn().mockResolvedValue(undefined));
       expect(context.title).toBe("Quoted: Title");
+    });
+
+    it("strips matching single quotes from a recovered title", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown = "---\ntitle: 'Quoted: Title'\nbad: : yaml\n---\nBody";
+      const context = createMockContext(markdown);
+      await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+      expect(context.title).toBe("Quoted: Title");
+    });
+
+    it("keeps mismatched quotes as literal characters", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      const markdown = "---\ntitle: \"Half: quoted'\nbad: : yaml\n---\nBody";
+      const context = createMockContext(markdown);
+      await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+      expect(context.title).toBe("\"Half: quoted'");
+    });
+
+    it("does not run raw recovery on valid YAML with a null title (Codex r1, major)", async () => {
+      const middleware = new MarkdownMetadataExtractorMiddleware();
+      for (const value of ["null", "~", "[]"]) {
+        const context = createMockContext(`---\ntitle: ${value}\n---\nBody only`);
+        await middleware.process(context, vi.fn().mockResolvedValue(undefined));
+        expect(context.title).toBe("Untitled");
+      }
     });
 
     it("still prefers an H1 over the raw block when both exist", async () => {

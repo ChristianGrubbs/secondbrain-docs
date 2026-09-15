@@ -30,6 +30,27 @@ describe("stripLeadingFrontmatter", () => {
     expect(stripLeadingFrontmatter(body)).toBe(body);
   });
 
+  it("does not let a later thematic break close a leading one (Codex r1, major)", () => {
+    const body = "---\n\nIntro\n\n---\n\nTail";
+    expect(stripLeadingFrontmatter(body)).toBe(body);
+  });
+
+  it("does not let a --- inside a later code fence close a leading rule (Codex r1, major)", () => {
+    const body = "---\n\nIntro\n\n```yaml\n---\nkey: v\n```\n\nTail";
+    expect(stripLeadingFrontmatter(body)).toBe(body);
+  });
+
+  it("leaves a leading rule followed directly by prose alone", () => {
+    // No `key:` line between the delimiters: not frontmatter.
+    const body = "---\nJust a sentence\n---\nTail";
+    expect(stripLeadingFrontmatter(body)).toBe(body);
+  });
+
+  it("removes exactly one of two consecutive frontmatter-shaped blocks", () => {
+    const body = "---\ntitle: A\n---\n---\ntitle: B\n---\nBody";
+    expect(stripLeadingFrontmatter(body)).toBe("---\ntitle: B\n---\nBody");
+  });
+
   it("leaves an unclosed block alone", () => {
     const body = "---\ntitle: T\nBody without a closing fence";
     expect(stripLeadingFrontmatter(body)).toBe(body);
@@ -41,11 +62,13 @@ describe("stripLeadingFrontmatter", () => {
 });
 
 describe("isMarkdownContentType", () => {
-  it("matches text/markdown and text/x-markdown with parameters", () => {
+  it("matches every repository Markdown type, with parameters and any case", () => {
     expect(isMarkdownContentType("text/markdown")).toBe(true);
     expect(isMarkdownContentType("text/markdown; charset=utf-8")).toBe(true);
     expect(isMarkdownContentType("text/x-markdown")).toBe(true);
     expect(isMarkdownContentType("TEXT/MARKDOWN")).toBe(true);
+    expect(isMarkdownContentType("text/mdx; charset=utf-8")).toBe(true);
+    expect(isMarkdownContentType("Text/X-GFM")).toBe(true);
   });
 
   it("rejects HTML, plain text and undefined", () => {
