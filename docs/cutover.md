@@ -4,7 +4,7 @@ Updated 2026-09-15. This is the Task 7 record: how both agents reach the qualifi
 
 ## How agents reach the CLI
 
-Both agents load one shared skill, `sb-docs`, from the stack catalog (`~/ai-stack/skills/sb-docs`, assigned global through `skill-scope`). The skill invokes one executable wrapper:
+Both agents are meant to load one shared skill, `sb-docs`, from the stack catalog (`~/ai-stack/skills/sb-docs`), assigned global through `skill-scope`. The skill, its wrapper and the attic move of the old `sb-capture` tripwire are merged in ai-stack ([PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) `590c5ab4`, [PR #653](https://github.com/ChristianGrubbs/ai-stack/pull/653) `978212b2`); the `skill-scope` assignment and the fresh-session proof for both agents are still pending (see "Live evidence"). The skill invokes one executable wrapper:
 
 ```text
 ~/ai-stack/bin/sb-docs <command> [options]
@@ -28,25 +28,37 @@ Runtime state (publication journals, ownership records, per-source locks, index 
 | Repository | `/Volumes/3M/github-repos/secondbrain-docs` (`ChristianGrubbs/secondbrain-docs`) |
 | Qualified SHA (R2) | `fccabebb2a833119968704db309879c3fb2562d1` (PR #10, Task 6 packet 15) |
 | Previous qualified SHA (R1) | `89e3a5652cc1295e6890b60d234ccb16331b1985` (PR #9) |
-| Toolchain | Node 22 (`/opt/homebrew/opt/node@22/bin`), `better-sqlite3` rebuilt for the Node 22 ABI, Playwright Chromium from `npx playwright install chromium` |
+| Toolchain | Node v22.23.2 (`/opt/homebrew/opt/node@22/bin`), native ABI `process.versions.modules` = 127, arm64; `better-sqlite3` built for that ABI (loaded successfully by every `search`/`reindex` in the evidence below); Playwright Chromium from `npx playwright install chromium` |
 | Executable | `dist/vault-cli.js`, produced by `npm run build` |
 
 ## Switching to a compatible release
 
-One recipe, for forward switches and rollbacks alike. Run every step with Node 22 first on `PATH`.
+One recipe, for forward switches and rollbacks alike, in two stages so the live checkout is never replaced by an unvalidated build. Run every step with Node 22 first on `PATH`.
+
+**Stage 1 — validate the candidate without touching the live checkout.** Build it in a linked worktree and exercise it through the wrapper's override against the real shared state:
 
 ```bash
-cd /Volumes/3M/github-repos/secondbrain-docs
 export PATH=/opt/homebrew/opt/node@22/bin:$PATH
-git switch --detach <qualified-sha>
-npm ci
-npm run build
-~/ai-stack/bin/sb-docs doctor
+git -C /Volumes/3M/github-repos/secondbrain-docs worktree add --detach /Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha> <candidate-sha>
+npm ci --prefix /Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha>
+npm run build --prefix /Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha>
+SB_DOCS_DIST=/Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha>/dist/vault-cli.js ~/ai-stack/bin/sb-docs doctor --json
+SB_DOCS_DIST=/Volumes/3M/ai-stack-wt/secondbrain-docs/<candidate-sha>/dist/vault-cli.js ~/ai-stack/bin/sb-docs search "<a phrase from an existing note>" --collection <collection> --json
 ```
 
-Then record the SHA, `node --version`, and the `doctor` output in this file. Rollback is the same recipe with the previous qualified SHA. There are no per-release directories, installers or pointer files; the checkout is the release. A release whose `doctor` cannot read the shared state directory is not compatible: do not switch to it, keep the current release, and fix forward.
+A candidate whose `doctor` cannot read the shared state directory, or whose `search` cannot serve the existing notes, is not compatible: stop here, keep the current release, and fix forward. Nothing has changed yet.
 
-Rehearsing without touching the working checkout: build the other SHA in a linked worktree and point `SB_DOCS_DIST` at its `dist/vault-cli.js`.
+**Stage 2 — activate the validated SHA in the live checkout.** Record the current SHA first (`git -C /Volumes/3M/github-repos/secondbrain-docs rev-parse HEAD`) so activation can be undone.
+
+```bash
+export PATH=/opt/homebrew/opt/node@22/bin:$PATH
+git -C /Volumes/3M/github-repos/secondbrain-docs switch --detach <validated-sha>
+npm ci --prefix /Volumes/3M/github-repos/secondbrain-docs
+npm run build --prefix /Volumes/3M/github-repos/secondbrain-docs
+~/ai-stack/bin/sb-docs doctor --json
+```
+
+If stage 2 fails part-way (a failed `npm ci` or build leaves the live checkout without a usable `dist/vault-cli.js`), recover by re-running stage 2 with the recorded prior SHA; the wrapper refuses to run until `dist/vault-cli.js` exists again, so a half-built checkout cannot serve captures. Then record the SHA, `node --version`, `process.versions.modules`, and the `doctor` output in this file. Rollback is the same two stages with the previous qualified SHA. There are no per-release directories, installers or pointer files; the checkout is the release.
 
 ## Local files: allowed roots
 
@@ -58,7 +70,7 @@ Every entry names the SHA, the Node version, the command, the exit code, and whe
 
 ### 2026-09-15 — R2 `fccabebb2a833119968704db309879c3fb2562d1`, Node v22.23.2, arm64
 
-Wrapper: the `bin/sb-docs` shipped in ai-stack [PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) (squash `590c5ab4`), run from its pre-merge copy because `~/ai-stack` was held by another session's lease at the time. Operator-designated URLs. All commands through the wrapper with `--json`.
+Wrapper: the `bin/sb-docs` shipped in ai-stack [PR #652](https://github.com/ChristianGrubbs/ai-stack/pull/652) (squash `590c5ab4`), run from its byte-identical pre-merge copy because `~/ai-stack` was held by another session's lease at the time. Operator-designated URLs. Every command ran through the wrapper; `capture`, `search`, `reindex` and `doctor` with `--json`, `read` as raw Markdown (it has no `--json`). Raw stdout, stderr and exit code of every run below are committed under [`docs/evidence/2026-09-15-task7/`](evidence/2026-09-15-task7/) (`<step>.out`, `<step>.err`, `<step>.exit`; the three capture envelopes as `capture-*.json`; `node-abi.txt`).
 
 | Step | Command | Exit | Result |
 | --- | --- | --- | --- |
@@ -68,8 +80,11 @@ Wrapper: the `bin/sb-docs` shipped in ai-stack [PR #652](https://github.com/Chri
 | Same, with `DOCS_MCP_SCRAPER_SECURITY_FILE_ACCESS_ALLOWED_ROOTS` naming that folder | same command | 0 | `published`, `index: indexed`, `moc: linked`; `sourceUrl` is the percent-encoded `file://` form of the exact path; note `Task 7 live proof — local file with spaces and Unicode 9cb24be00195.md`; `content_sha256 9065528c04ec50f00a0acc751e9509e08d5743f890820933c4bfed5581469475`, publication digest `471529d9ef00ca872ab9624a5376ff8bfe7681e19f12118820a04aa4d843b2a4` |
 | Search body phrase | `search "sternenklare Prüfung siebzehn" --collection AudienceView` | 0 | `status: ok`, 1 result (the local note), `omitted: []`, `refreshed: 0` |
 | Search across the URL notes | `search "Events API show information client" --collection AudienceView` | 0 | `status: ok`, 6 excerpts across both URL notes, `omitted: []` |
-| Read | `read "30 Tools-Models/Doc Sets/audienceview/Task 7 live proof — local file with spaces and Unicode 9cb24be00195.md"` | 0 | complete note with frontmatter (`source_id 9cb24be0…`, `collection: audienceview`, `publisher_version: 3.1.0`) |
-| Doctor (R2) | `doctor` | 0 | `stateDir ~/Library/Application Support/SecondBrainDocs`, `pending: []`, `ownershipCount: 3`, three per-source locks plus the index lock, none busy |
+| Read | `read "30 Tools-Models/Doc Sets/audienceview/Task 7 live proof — local file with spaces and Unicode 9cb24be00195.md"` | 0 | complete note with frontmatter (`source_id 9cb24be0…`, `collection: audienceview`, `publisher_version: 3.1.0`), raw Markdown on stdout (`r2-read-local.out`) |
+| Reindex | `reindex --collection AudienceView --json` | 0 | `status: rebuilt`, generation `gen-2026-09-15T10-29-22-434Z-0`, 3 notes discovered / 3 indexed / 1 skipped (the collection MOC), 14 chunks, 1 directory scan, 4 note reads, 180 ms, embeddings disabled (`r2-reindex.out`) |
+| Search after reindex | `search "sternenklare Prüfung siebzehn" --collection AudienceView --json` | 0 | `status: ok`, 1 result, `omitted: []` — the rebuilt generation serves the same hit (`r2-search-after-reindex.out`) |
+| Doctor (R2) | `doctor --json` | 0 | `stateDir ~/Library/Application Support/SecondBrainDocs`, `pending: []`, `ownershipCount: 3`, three per-source locks plus the index lock, none busy (`r2-doctor.out`) |
+| Node / native ABI | `node -p process.version + process.versions.modules` through the wrapper's Node | 0 | `node v22.23.2 abi 127 arch arm64` (`node-abi.txt`); every `search`/`reindex` above loaded `better-sqlite3` against that ABI |
 
 ### Rollback rehearsal R2 → R1 → R2 (same day)
 
@@ -77,13 +92,18 @@ R1 `89e3a5652cc1295e6890b60d234ccb16331b1985` was built in a linked worktree (`g
 
 | Step | Release | Exit | Result |
 | --- | --- | --- | --- |
-| `doctor` | R1 | 0 | same `stateDir`, `ownershipCount: 3`, the same three source locks and the index lock, none busy — R1 reads R2's durable state without migration |
-| `search "sternenklare Prüfung siebzehn"` | R1 | 0 | `status: ok`, 1 result, `omitted: []` — R1 serves R2's index generation without a rebuild |
-| `read` of the local note | R1 | 0 | complete note |
-| `search` (same query) | R2 | 0 | identical result |
-| `doctor` | R2 | 0 | identical report |
+| `doctor --json` | R1 | 0 | same `stateDir`, `ownershipCount: 3`, the same three source locks and the index lock, none busy — R1 reads R2's durable state without migration (`r1-doctor.out`) |
+| `search "sternenklare Prüfung siebzehn" --json` | R1 | 0 | `status: ok`, 1 result, `omitted: []` — R1 serves the generation R2's `reindex` built, without a rebuild (`r1-search-local.out`) |
+| `read` of the local note | R1 | 0 | complete note (`r1-read-local.out`) |
+| `search` (same query) | R2 | 0 | identical result after R1 ran (`r2-search-after-r1.out`) |
+| `doctor --json` | R2 | 0 | identical report (`r2-doctor-after-r1.out`) |
 
-Verdict: R1 and R2 are compatible over the shared durable state in both directions; rollback to R1 is available. Not exercised: capturing under R1, which was kept read-only so the live collection holds notes from one publisher version only.
+Verdict, deliberately narrow: R1 can read R2-created durable state and R2-built index generations (`doctor`, `search`, `read`), and R2 still serves the same state after R1 has run over it. That is **read-only R2 → R1 → R2 compatibility**. Not proven: any R1 write (capture, reindex, adopt) against R2 state, or R2 consuming R1-written state — R1 was kept read-only so the live collection holds notes from one publisher version only. A rollback that must also capture under R1 needs that write-side rehearsal first.
+
+### Pending acceptance items
+
+- `skill-scope assign sb-docs --global` (and `remove sb-capture`) on this Mac, blocked on the `~/ai-stack` write lease held by another session at the time of writing.
+- Fresh Claude Code and Codex sessions resolving the installed global skill and running all five commands through `~/ai-stack/bin/sb-docs` with a non-interactive `PATH`; until recorded here, the two-agent criterion of Task 7 is unproven and the evidence above stands for the wrapper and CLI only.
 
 ## Residual limitations carried from Task 6
 

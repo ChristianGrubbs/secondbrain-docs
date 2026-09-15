@@ -96,4 +96,4 @@ Revised 2026-09-15 under the operator directive of 2026-09-14 ("it just needs to
 
 ## Continuation and completion
 
-Resume at Task 7A using this file; do not restart completed Tasks 1–6 or the deleted-engine backlog. Completion of the migration requires the accepted Task 6 report, the shipped skill and wrapper visible to both agents, the cutover record, and complete saved-note retrieval through the skill. A shipped slice or a green test total does not prove whole-project acceptance.
+Resume at Task 7A using this file; do not restart the shipped Tasks 1–5, the qualified-but-not-yet-accepted Task 6, or the deleted-engine backlog. Completion of the migration requires the accepted Task 6 report, the shipped skill and wrapper visible to both agents, the cutover record, and complete saved-note retrieval through the skill. A shipped slice or a green test total does not prove whole-project acceptance.

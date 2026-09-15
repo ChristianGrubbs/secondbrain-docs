@@ -1,0 +1,26 @@
+---
+type: source
+title: Task 7 live proof — local file with spaces and Unicode
+source_url: file:///private/tmp/claude-501/-Volumes-3M-github-repos-secondbrain-docs/f9051db3-8716-417f-bd2b-e0188dc0008b/scratchpad/T%C3%A1sk%207%20Pr%C3%BCfung%20%E2%80%94%20live%20proof/L%C3%B6cal%20n%C3%B6te%20with%20spaces%20%E2%9C%93.md
+requested_url: file:///private/tmp/claude-501/-Volumes-3M-github-repos-secondbrain-docs/f9051db3-8716-417f-bd2b-e0188dc0008b/scratchpad/T%C3%A1sk%207%20Pr%C3%BCfung%20%E2%80%94%20live%20proof/L%C3%B6cal%20n%C3%B6te%20with%20spaces%20%E2%9C%93.md
+source_id: 9cb24be0019561e6aa8061255e90a9e9d4e0d9a63484b04f61d1fa188bd187ac
+collection: audienceview
+version: ""
+captured_at: 2026-09-15T10:21:55.092Z
+source_content_type: text/markdown
+content_sha256: 9065528c04ec50f00a0acc751e9509e08d5743f890820933c4bfed5581469475
+publisher: secondbrain-docs
+publisher_version: 3.1.0
+---
+# Task 7 live proof — local file with spaces and Unicode
+
+This Markdown file exists only to prove that `~/ai-stack/bin/sb-docs capture` accepts a local
+path whose directory and filename contain spaces, non-ASCII letters (á ü ö) and a symbol (✓),
+passes it through the wrapper byte-for-byte, and publishes it into the vault.
+
+Retrieval phrase for the search step: **sternenklare Prüfung siebzehn**.
+
+| Column A | Column B |
+| --- | --- |
+| ruled | table |
+
